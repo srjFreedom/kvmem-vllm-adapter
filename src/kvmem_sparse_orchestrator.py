@@ -492,6 +492,11 @@ class SparseOrchestrator:
             selected = kept_pages
             self.slots = kept_slots
         elif slots is not None:
+            # `slots` may be a callable(needed) so the caller reserves exactly as many device
+            # slots as this selection needs instead of the whole budget (the old behaviour
+            # reserved budget_pages()+1 per request, which nearly drained the pool).
+            if callable(slots):
+                slots = slots(len(selected))
             if len(slots) < len(selected):
                 raise ValueError("not enough device slots for the selection")
             self.slots = list(slots[:len(selected)])

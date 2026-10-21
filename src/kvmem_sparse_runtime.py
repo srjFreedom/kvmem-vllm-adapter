@@ -215,9 +215,17 @@ class VllmSparseRuntime:
 
     def release(self, req):
         """Drop a finished request and give its H share back to the shared pool."""
+        st = self._state.get(req)
+        row = getattr(st, "row_index", None) if st is not None else None
         orch = self._orch.pop(req, None)
         self._retrieval.pop(req, None)
         self._state.pop(req, None)
+        # The attention seq_lens override is indexed by BATCH ROW, not by request: if it outlives
+        # the request, the next request reusing that row inherits the old compacted length while
+        # it is still prefilling (row empty -> before_step returns early and never rewrites it).
+        # Measured: the second request on a warmed engine answered with noise from its first token.
+        if row is not None:
+            self._seq_override.pop(int(row), None)
         # Free the device slots as well: dropping only `_owned_slots` left `_slot_owner` entries
         # pointing at dead requests, so a later request could never reuse them (the slot pool
         # silently shrinks to exhaustion) and the stale owner table outlived the request.
@@ -554,12 +562,20 @@ class VllmSparseRuntime:
         for slot in self._owned_slots[req]:
             self._slot_owner.pop(slot, None)
         self._owned_slots[req] = set()
-        want = self.selector.budget_pages() + 1
-        slots = self._take_slots(req, want)
-        stats = orch.reselect(slots=slots, prefill_pressure=prefill_pressure)
+        # Reserve exactly what the selection needs (+1 spare for the next token page). Asking for
+        # the whole budget (budget_pages()+1 = 3329 pages at B=53248) drained the pool for every
+        # request and left later requests reading pages they did not own.
+        taken = {}
+
+        def _take(needed):
+            slots = self._take_slots(req, int(needed) + 1)
+            taken["slots"] = slots
+            return slots[:-1]
+
+        stats = orch.reselect(slots=_take, prefill_pressure=prefill_pressure)
         selected = list(orch.last_view.row_pages)
-        used = orch.slots[:len(selected)]
-        spare = slots[-1] if slots[-1] not in used else self._take_slots(req, 1)[0]
+        used = list(orch.slots[:len(selected)])
+        spare = taken["slots"][-1]
         st.row = tuple(used) + (spare,)
         st.logical = tuple(selected) + (None,)
         st.spare = spare
@@ -618,6 +634,30 @@ class VllmSparseRuntime:
         return out
 
     # --- page allocation ----------------------------------------------------------------
+    def _engine_pages(self, req):
+        """Page ids the ENGINE still references in any block-table row (ours excluded).
+
+        The runtime installs a compacted view into its own device slots, but the engine keeps
+        allocating blocks from the same pool bottom-up. Taking a slot that the engine still owns
+        makes a batched page move copy onto its own source (or onto another request's live page):
+        measured as a 53K-token prompt hanging with the GPU idle.
+        """
+        st = self._state.get(req)
+        mine = getattr(st, "row_index", None) if st is not None else None
+        used = set()
+        try:
+            for table in self.view.block_table_rows():
+                rows = table.tolist()
+                for row_index, row in enumerate(rows):
+                    if mine is not None and row_index == mine:
+                        continue
+                    for value in row:
+                        if value:
+                            used.add(int(value))
+        except Exception:
+            return set()
+        return used
+
     def _take_slots(self, req, count):
         # Allocate DOWNWARD from the top of the pool: the engine allocates its own blocks
         # bottom-up, so scanning up (the old behaviour) handed us pages the engine was still
@@ -625,11 +665,12 @@ class VllmSparseRuntime:
         # destination sets and clobbered pages before they were read - measured as the second
         # line of a repeated word turning into noise on the very first reselect.
         slots = []
+        avoid = self._engine_pages(req)
         candidate = self.view.num_blocks() - 1
         while len(slots) < count:
             if candidate < self.first_page:
                 raise RuntimeError("device slot pool exhausted")
-            if candidate not in self._slot_owner:
+            if candidate not in self._slot_owner and candidate not in avoid:
                 self._slot_owner[candidate] = req
                 self._owned_slots[req].add(candidate)
                 slots.append(candidate)

@@ -1090,3 +1090,21 @@ worker `--kvmem-capture-tokens`、启动脚本 `CAPTURE_TOKENS=`、落盘 `kvmem
 本轮其余修复：规划器按排名裁到预算内；V2 runner 补 `prepare_inputs` 视图安装；
 positions 基准改为 `seq_len - n`；压缩只在 decode 步触发；槽位从池顶向下分配；
 新增 KVMEM_NO_ROW/NO_SEQ/NO_POS 活体隔离开关。
+
+### Route A 第四轮：跨请求泄漏修好，短上下文全通；长上下文暴露架构级限制
+
+**修好的**（活引擎 4 连发，各跨一次 R 节拍，全部干净）：
+- `_seq_override` 按 batch row 索引，请求结束不清 → 下一个复用同 row 的请求在 prefill 阶段
+  沿用旧 seq_len（实测：第 2 个请求从第一个 token 起就是噪声）。`release()` 现在清掉它
+- `_take_slots` 改为按选中页数按需取槽（原来一次预留 `budget_pages()+1`，B=53248 时 3329 页）
+- 取槽时排除引擎 block table 仍在引用的页
+- orchestrator 接受 `slots=callable(needed)`，由调用方决定取多少
+
+**新暴露的架构级限制（未修）**：
+- 53K prompt（B=53248）请求在首次重选后卡死，GPU 0%、worker 95% CPU 空转
+- 原因：运行时把可见集「另存」到自己从池里取的槽（3323 页），而引擎已为同一请求占了 3371 页；
+  池总共 3456 页（max_model_len=55296）→ 需要 2 倍池容量，物理上不可能
+- 结论：ninfer 对等的正确做法是**原地重排**（复用引擎已分配页 + RoPE 重打），不是另存副本；
+  当前的「副本 + 独立槽池」模型只在 B 远小于池时可行（小 prompt 场景已全通）
+
+短上下文（900 行/2820 token/跨一次重选）四连发全干净，说明压缩、对账、节拍、跨请求释放都正确。
