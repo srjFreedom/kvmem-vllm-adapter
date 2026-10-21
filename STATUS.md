@@ -1251,3 +1251,21 @@ LEMON，其余退化成 `w`/`le` 碎片——压缩后 RoPE 重打或页搬运�
 mandatory（与 prompt 页同等对待）。
 
 剩余：最后 3 行（max_tokens 边界处）模型自己跑偏，属预算尾部现象。
+
+## Route A 活引擎验证矩阵（2026-10-22，实测）
+
+双开关：`KVMEM_ENTRY_INREQUEST_COMPACTION=1` + `--kvmem-inrequest-compaction`；压缩开强制同步调度。
+
+| # | 项 | 配置 | 结果 |
+|---|---|---|---|
+| ① | 压缩后召回（密钥在长历史开头，压缩两次后回写） | B=8192 R=2048 recency | ✅ `secret_present=true`，43.6s，finish=stop |
+| ② | N=2 并发，两条请求各自跨 R 节拍压缩 | B=8192 R=2048 N=2 | ✅ 两条都完成，各 1033/1034 行正确，33.8s |
+| ③ | prefix-cache 不污染 | B=8192 R=2048 N=1 | ✅ 同一 prompt 第二次 `cached_tokens=4848`，5.7s → 2.3s（2.5×） |
+| ④ | MTP 长生成不崩 | B=8192 R=2048 MTP=4 | ✅ 6750 token 生成、多次截断、无崩溃 |
+| ⑤ | 5050 复现 | B=256 R=128 recency | ✅ 1..200 连续 + SECRET 正确，3 次压缩，7.0s |
+
+已知边界（诚实记录）：
+- 检索模式下，新生成块的分数是 `-inf`；已在 reselect 里把最近 `recent_tokens` 的页设为 mandatory，
+  长上下文从 849/2415 提升到 1889/1892 行
+- 输出长度接近 `max_tokens` 时模型自身会跑偏（与压缩无关）
+- 压缩期间 `st.seq_len` 不能低于 prompt（vLLM 由 `num_tokens - prompt_len` 推导输出长度）
