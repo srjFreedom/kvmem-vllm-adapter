@@ -208,7 +208,7 @@ def _select_in_messages(payload: dict, policy: EntryPolicy,
             recent_tokens=policy.recent_tokens,
             chars_per_token=policy.chars_per_token,
             method=policy.select)
-        if stats.get("trimmed"):
+        if stats.get("trimmed") and selected.strip():
             message["content"] = selected
             stats["message_index"] = index
             stats["kind"] = "prompt_selected"

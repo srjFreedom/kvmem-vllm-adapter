@@ -2,6 +2,8 @@
 """Entry-layer selection: long histories shrink, asked-about records survive."""
 import json
 import os
+import random
+import string
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -53,5 +55,29 @@ def main():
     return 0 if all(checks) else 1
 
 
+def test_oversized_single_block_never_empties_the_prompt():
+    """A pasted file / one minified line is a single huge block.
+
+    Regression: the sink/recent loops used to break on that block and return "", which made the
+    entry policy replace the whole prompt with an empty string (engine saw only the question).
+    """
+    rng = random.Random(11)
+    blob = " ".join("".join(rng.choices(string.ascii_lowercase, k=9)) for _ in range(20000))
+    text = blob + "\n\n只输出：OK"
+    selected, stats = select_history(text, "只输出：OK", 53248, sink_tokens=8192, recent_tokens=2048,
+                                     chars_per_token=2.0, method="retrieval")
+    assert selected.strip(), "selection must never be empty"
+    assert selected.rstrip().endswith("只输出：OK"), "question tail must survive"
+    assert len(selected) <= 53248 * 2.0 * 1.02, f"budget exceeded: {len(selected)} chars"
+    assert stats["trimmed"] is True
+    # the blob is chunked so the middle is rankable and the budget is actually used
+    assert len(selected) > 53248 * 2.0 * 0.8, f"budget under-used: {len(selected)} chars"
+    print("ok   oversized single block keeps tail and uses budget")
+
+
+test_oversized_single_block_never_empties_the_prompt()
+
+
 if __name__ == "__main__":
     raise SystemExit(main())
+
