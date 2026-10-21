@@ -9,24 +9,25 @@
 # ============================================================================
 
 # ---------------- 参数区（改这里）--------------------------------------------
-B=65536                 # 历史预算：每次发给引擎的历史 token 上限
-R=32768                 # 生成上限：max_tokens 会被夹到 R（也是驻留 B+R 的一半）
+B=36864                 # 历史预算：每次发给引擎的历史 token 上限（36K）
+R=16384                 # 生成上限：max_tokens 会被夹到 R（16K）
 CTX=524288              # kvmem 逻辑上下文上限（512K），与引擎窗口无关
 SINK=8192               # 永远保留的开头 token 数
 RECENT=2048             # 永远保留的结尾 token 数
 SESSIONS=4              # H 池按并发会话数平分的份数
 HOST_MIB=49152          # H 层（主机内存）预算 MiB
-N=2                     # 并发请求数；引擎窗口 = N x (B + R)，自动算
+N=1                     # 并发请求数（默认 1）；引擎窗口 = N x (B + R)，自动算
 PORT=18200              # kvmem 官方端口
 CAPTURE_TOKENS=512      # 每步为检索捕获的 query token 数（官方 query_max_tokens 默认 512）
 
 # ---- 引擎/硬件（换卡、换机器时需要调）----
-GPU_UTIL=0.98           # vLLM 显存占用比例；22GB 卡用 0.98，小卡适当降低，OOM 时先降这个
+GPU_UTIL=0.97           # vLLM 显存占用比例；22GB 卡用 0.97，小卡适当降低，OOM 时先降这个
 MAX_BATCHED_TOKENS=4096 # 单步 prefill 的 token 上限；调大可减 chunk 数，但吃显存
 SPECULATIVE_TOKENS=4    # MTP 投机 token 数；0 = 关闭投机（显存/速度之间取舍）
 MESSAGE_TYPE=text+image # text | text+image，是否启用视觉塔
 MM_IMAGE_LIMIT=64       # 每个 prompt 允许的图片数
 SERVICE_SCOPE=lan       # lan = 监听 0.0.0.0；local = 只监听 127.0.0.1
+THINKING_BUDGET=        # 思考 token 上限；空 = 无上限（默认），填数字才限制推理长度
 
 # ---- 权重（改这里换模型）----
 MODEL=/home/srj/models/Coder390/FP8-fp8mtp

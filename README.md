@@ -103,8 +103,8 @@ Every runtime knob lives in `run-current.sh`; the full reference is
 **[docs/PARAMETERS.md](docs/PARAMETERS.md)** (Chinese).
 
 ```bash
-B=65536 R=32768 CTX=524288 SINK=8192 RECENT=2048 N=2 PORT=18200
-CAPTURE_TOKENS=512 GPU_UTIL=0.98 MAX_BATCHED_TOKENS=4096
+B=36864 R=16384 CTX=524288 SINK=8192 RECENT=2048 N=1 PORT=18200
+CAPTURE_TOKENS=512 GPU_UTIL=0.97 MAX_BATCHED_TOKENS=4096 THINKING_BUDGET=
 MODEL=/home/srj/models/Coder390/FP8-fp8mtp
 CHAT_TEMPLATE_FILE=.../chat_template.jinja
 PROFILE=2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env
@@ -112,7 +112,11 @@ KVMEM_UI_DIR=/home/srj/local-model-console
 ```
 
 The constraint that bites: **engine window = `N × (B + R)` must fit the KV pool** (210,651 tokens on
-this box). With `N=2, B+R=98,304` the window is 196,608 — just enough; `N=4` needs B near 26K.
+this box). Defaults (`N=1, B+R=53,248`) leave a large margin; `N=2` → 106,496, `N=3` → 159,744,
+`N=4` → 212,992 which needs a smaller B (≈26K) or R.
+
+`THINKING_BUDGET` is empty by default, i.e. **no cap on reasoning tokens**; set a number only if you
+want to bound it.
 
 Changes take effect on `sudo systemctl restart kvmem-vllm` (no hot reload); `kvmem-params.env`
 records what is actually in force.
@@ -134,7 +138,7 @@ block/character counts of `prompt_selected`).
 
 | Item | Result |
 |---|---|
-| Logical context | 486,605-token history → `prompt_tokens=89,066`, both needles found (106 s) |
+| Logical context | 486,605-token history → `prompt_tokens=89,066`, both needles found (106 s; measured with B=65536) |
 | R contract | `max_tokens=100000` → `applied=32768` (only `max_completion_tokens` written) |
 | CTX | 747,614 tokens → `400 history is ~747614 tokens, above kvmem CTX=524288` |
 | Streaming | 30 SSE events, first at 0.07 s, last at 1.43 s, monotonic |

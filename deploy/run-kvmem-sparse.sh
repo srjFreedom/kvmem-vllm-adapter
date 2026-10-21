@@ -52,13 +52,15 @@ export VLLM_LOG_STATS_INTERVAL=3   # 周期速度统计 3s 一输出(nvfp4 同�
 export PATH="$HOME/.local/bin:$PATH"
 # 前缀缓存：默认开启。仅当启用 --kvmem-inrequest-compaction（稀疏视图会改写块表）时必须关掉。
 export DISABLE_PREFIX_CACHING=${DISABLE_PREFIX_CACHING:-0}
+# 思考 token 上限：未设置 = 无上限（默认）。设了才会限制推理长度。
+if [ -n "${THINKING_BUDGET:-}" ]; then export REASONING_BUDGET="$THINKING_BUDGET"; fi
 export KVMEM_PLUGIN_CONFIG=/tmp/kvmem_plugin.json
 exec ./launcher.sh \
   --model-dir "${MODEL:-/home/srj/models/Coder390/FP8-fp8mtp}" \
   --profile "${PROFILE:-2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env}" \
   --mode fast --gpu-devices 0,1 --tp-size 2 --pp-size 1 \
   --set MAX_MODEL_LEN=204800 \
-  --set GPU_UTIL="${GPU_UTIL:-0.98}" \
+  --set GPU_UTIL="${GPU_UTIL:-0.97}" \
   --set MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-4096}" \
   --set MAX_NUM_SEQS=${MAX_NUM_SEQS:-1} \
   --set SERVED_NAME=KVMEM-SPARSE \

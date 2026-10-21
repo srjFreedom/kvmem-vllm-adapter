@@ -95,8 +95,8 @@ VLLM_ROOT=/path/to/fork KVMA_SRC=/path/to/kvmem PY=/path/to/venv/bin/python ./in
 所有运行时参数集中在 `run-current.sh`，完整说明见 **[docs/PARAMETERS.md](docs/PARAMETERS.md)**。
 
 ```bash
-B=65536 R=32768 CTX=524288 SINK=8192 RECENT=2048 N=2 PORT=18200
-CAPTURE_TOKENS=512 GPU_UTIL=0.98 MAX_BATCHED_TOKENS=4096
+B=36864 R=16384 CTX=524288 SINK=8192 RECENT=2048 N=1 PORT=18200
+CAPTURE_TOKENS=512 GPU_UTIL=0.97 MAX_BATCHED_TOKENS=4096 THINKING_BUDGET=
 MODEL=/home/srj/models/Coder390/FP8-fp8mtp
 CHAT_TEMPLATE_FILE=.../chat_template.jinja
 PROFILE=2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env
@@ -104,7 +104,9 @@ KVMEM_UI_DIR=/home/srj/local-model-console
 ```
 
 关键约束：**引擎窗口 = `N × (B + R)` 必须装进 KV 池**（本机 210,651 token）。
-当前 `N=2, B+R=98,304` → 窗口 196,608，刚好；`N=4` 需要把 B 降到约 26K。
+默认 `N=1, B+R=53,248` 余量很大；`N=2` → 106,496，`N=3` → 159,744，`N=4` → 212,992 需要把 B 降到约 26K。
+
+`THINKING_BUDGET` 默认为空 = **思考 token 无上限**；填数字才会限制推理长度。
 
 改完 `sudo systemctl restart kvmem-vllm` 生效（无热改），`kvmem-params.env` 记录本次生效值。
 
@@ -125,7 +127,7 @@ curl -s localhost:18200/metrics      # vllm:* 指标（prefill/decode/KV 使用�
 
 | 项目 | 结果 |
 |---|---|
-| 逻辑上下文 | 486,605 token 历史 → `prompt_tokens=89,066`，两个埋针全中（106 s）|
+| 逻辑上下文 | 486,605 token 历史 → `prompt_tokens=89,066`，两个埋针全中（106 s，B=65536 时测得）|
 | R 契约 | `max_tokens=100000` → `applied=32768`（只写 `max_completion_tokens`）|
 | CTX | 747,614 token → `400 history is ~747614 tokens, above kvmem CTX=524288` |
 | 流式 | 30 个 SSE 事件，首 0.07 s、末 1.43 s，时刻单调 |

@@ -13,13 +13,13 @@
 set -uo pipefail
 LOG=${LOG:-/home/srj/kvmem.log}
 PORT=${PORT:-18200}
-B=${B:-65536}
-R=${R:-32768}
+B=${B:-36864}
+R=${R:-16384}
 SINK=${SINK:-8192}
 RECENT=${RECENT:-2048}
 SESSIONS=${SESSIONS:-4}
 HOST_MIB=${HOST_MIB:-49152}
-N=${N:-2}
+N=${N:-1}
 CTX=${CTX:-524288}
 # 检索用的 query 捕获窗口（KVMem query_max_tokens 的官方默认是 512）
 CAPTURE_TOKENS=${CAPTURE_TOKENS:-512}
