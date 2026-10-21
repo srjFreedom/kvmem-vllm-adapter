@@ -1,11 +1,25 @@
-# KVMem × vLLM (SM75, TP=2) — single-service integration
+# KVMem × vLLM — dual-GPU SM75, high-throughput, single service
 
 **English** | [中文](README_zh-CN.md)
 
-Plugs [kvmem](https://github.com/kvmem/kvmem)'s policy layer into vLLM (the weicj SM75 fork):
-**one service, one port (18200)** serving the OpenAI-compatible API, metrics and a web UI from the
-same origin. vLLM stays the engine; kvmem decides how much history is sent and which KV stays
-resident.
+**kvmem's policy layer running *inside* vLLM, on two Turing (SM75) cards.** This is the
+high-performance dual-GPU build: instead of a gateway in front of the engine, kvmem's entry policy
+runs in the vLLM API process, and the engine itself is tuned for two consumer 22 GB cards —
+MTP speculative decoding, FP8 KV cache, prefix caching and a KV pool sized for N concurrent
+long-context requests.
+
+What that buys you on 2× RTX 2080 Ti:
+
+- **Real concurrency, not a queue.** Engine window = `N × (B + R)`; at `N=2` two code-generation
+  streams keep **70–73 tok/s each** (single stream: 74.9) for **≈136 tok/s aggregate**.
+- **Long context that fits.** A **172K-token** window on 44 GB of VRAM at `GPU_UTIL=0.97`
+  (B = 52K history + 32K generation per request, FP8 KV).
+- **Fast prefill.** ~1.3K tok/s at 5K tokens, still ~1K tok/s at the full 52K budget.
+- **One service, one port (18200).** OpenAI-compatible API, `/metrics`, `/docs` and the web UI on
+  the same origin — no sidecar gateway, no second process to keep alive.
+- **kvmem stays the policy layer.** It decides how much history is sent (B), which pages stay
+  resident (retrieval over the real pre-RoPE Q, mean-K scoring, LRFU), and what lives in the H/D
+  tiers; vLLM remains the engine.
 
 ```
 client ──▶ :18200 ┬─ /v1/*        OpenAI-compatible API
@@ -13,6 +27,39 @@ client ──▶ :18200 ┬─ /v1/*        OpenAI-compatible API
                   ├─ /docs        OpenAPI
                   └─ /            static UI (swappable)
 ```
+
+## Performance
+
+Measured on **2× RTX 2080 Ti 22 GB**, TP=2, `N=2`, `B=53,248`, `R=32,768` (window 172,032),
+FP8 KV, MTP `K=4`, `GPU_UTIL=0.97`, prefix caching on; `temperature=0`.
+
+**Prefill** (single request, cold prompt):
+
+| prompt tokens | TTFT | prefill |
+|---|---|---|
+| 5,035 | 3.9 s | **1,295 tok/s** |
+| 19,838 | 17.5 s | **1,136 tok/s** |
+| 51,723 | 52.5 s | **985 tok/s** |
+
+Larger prompts are pointless by design: the entry policy trims history to B before the engine sees
+it, so 52K is the ceiling that matters.
+
+**Decode** (code generation):
+
+| output | streams | throughput |
+|---|---|---|
+| 343 tok (binary search + tests) | 1 | **74.9 tok/s** |
+| 768 tok (TOML-subset parser) | 1 | **59.7 tok/s** |
+| 2,048 tok (TOML-subset parser) | 1 | **58.3 tok/s** |
+| 2 × 512 tok | 2 | **70–73 tok/s each**, ≈**136 tok/s** aggregate |
+
+Two things explain the spread, and both are properties of MTP speculative decoding, not noise:
+acceptance is higher on dense repetitive code (74.9) than on prose-heavy answers (58–60), and very
+long outputs amortise the faster opening phase. With two concurrent streams each request keeps
+~95 % of its single-stream speed — the second card is doing real work rather than waiting.
+
+Prefix cache: re-sending the same 57K-token prompt costs 2.1 s TTFT instead of 58.6 s
+(≈20.7K tok/s effective).
 
 ## Architecture
 
@@ -155,7 +202,7 @@ curl -s localhost:18200/metrics      # vllm:* metrics (prefill/decode/KV usage)
 Entry decisions are logged as `kvmem entry: {"kind":"entry_rewrite",...}` (with `gen_budget` and the
 block/character counts of `prompt_selected`).
 
-## Measured (current config: N=2, B/R=65536/32768, CAPTURE=512)
+## Contract checks (not benchmarks)
 
 | Item | Result |
 |---|---|
@@ -164,12 +211,10 @@ block/character counts of `prompt_selected`).
 | CTX | 747,614 tokens → `400 history is ~747614 tokens, above kvmem CTX=524288` |
 | Streaming | 30 SSE events, first at 0.07 s, last at 1.43 s, monotonic |
 | Ports | only `0.0.0.0:18200`; no sidecar process |
-| Prefill | 65.2K prompt: 70 s ≈ **934 tok/s**; 98.8K: 713 tok/s; two concurrent streams: 477 tok/s aggregate |
-| Decode | 512 tokens from a small prompt ≈ **59 tok/s** |
 | Prefix reuse | second identical prefix: `cached=63,024/65,890` |
 
-Long-context wall time is almost entirely prefill; concurrency does not add throughput (TP=2 already
-uses both GPUs).
+These rows pin the policy contract (how much history reaches the engine, the R clamp, the CTX
+rejection, SSE behaviour); throughput lives in [Performance](#performance).
 
 ## Tests and probe
 

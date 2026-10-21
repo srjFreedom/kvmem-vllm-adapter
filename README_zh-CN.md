@@ -1,10 +1,22 @@
-# KVMem × vLLM (SM75, TP=2) — 单服务集成
+# KVMem × vLLM — SM75 双卡高性能、单服务集成
 
 [English](README.md) | **中文**
 
-把 [kvmem](https://github.com/kvmem/kvmem) 的策略层接到 vLLM（weicj 的 SM75 fork）上：
-**一个服务、一个端口（18200）**，OpenAI 兼容 API、指标和 Web UI 同源；vLLM 仍是引擎，
-kvmem 决定"每次发多少历史、KV 留在哪一层"。
+**把 kvmem 的策略层跑在 vLLM 进程内，面向两张 Turing（SM75）显卡的高性能版本。**
+不是"引擎前面挂个网关"，而是入口策略直接跑在 vLLM 的 API 进程里；引擎本身为两张 22 GB
+消费级卡做过调优——MTP 投机解码、FP8 KV 缓存、前缀缓存，以及按并发数 N 定尺寸的 KV 池。
+
+在 2× RTX 2080 Ti 上换来的东西：
+
+- **真并发，不是排队。** 引擎窗口 = `N × (B + R)`；`N=2` 时两路代码生成各自保持
+  **70–73 tok/s**（单路 74.9），**合计 ≈136 tok/s**。
+- **长得下的长上下文。** 44 GB 显存上开出 **172K token** 的窗口，`GPU_UTIL=0.97`
+  （每请求 B=52K 历史 + 32K 生成，FP8 KV）。
+- **快 prefill。** 5K token 时约 1.3K tok/s，跑满 52K 预算仍有约 1K tok/s。
+- **一个服务、一个端口（18200）。** OpenAI 兼容 API、`/metrics`、`/docs` 和 Web UI 同源——
+  没有旁挂网关，没有第二个要养的进程。
+- **kvmem 仍是策略层。** 发多少历史（B）、哪些页常驻（用真实 pre-RoPE Q 检索、mean-K 打分、
+  LRFU 衰减）、哪些进 H/D 分层，都由它决定；vLLM 继续当引擎。
 
 ```
 客户端 ──▶ :18200 ┬─ /v1/*        OpenAI 兼容 API
@@ -12,6 +24,36 @@ kvmem 决定"每次发多少历史、KV 留在哪一层"。
                    ├─ /docs        OpenAPI
                    └─ /            静态 UI（可换）
 ```
+
+## 性能
+
+实测环境：**2× RTX 2080 Ti 22 GB**，TP=2，`N=2`，`B=53,248`，`R=32,768`（窗口 172,032），
+FP8 KV，MTP `K=4`，`GPU_UTIL=0.97`，前缀缓存开启，`temperature=0`。
+
+**Prefill**（单请求，冷 prompt）：
+
+| prompt token | TTFT | prefill |
+|---|---|---|
+| 5,035 | 3.9 s | **1,295 tok/s** |
+| 19,838 | 17.5 s | **1,136 tok/s** |
+| 51,723 | 52.5 s | **985 tok/s** |
+
+再大没有意义——入口策略会在请求进入引擎前把历史裁到 B，52K 就是有效上限。
+
+**Decode**（代码生成）：
+
+| 输出 | 并发 | 吞吐 |
+|---|---|---|
+| 343 tok（二分查找 + 单测） | 1 | **74.9 tok/s** |
+| 768 tok（TOML 子集解析器） | 1 | **59.7 tok/s** |
+| 2,048 tok（TOML 子集解析器） | 1 | **58.3 tok/s** |
+| 2 × 512 tok | 2 | **单路 70–73 tok/s**，合计 ≈**136 tok/s** |
+
+两个来源都不是噪声，而是 MTP 投机的特性：密集重复的代码接受率高（74.9），偏散文的实现说明接受率低
+（58–60）；输出越长，前面较快的阶段被摊得越薄。两路并发时每路仍有单路约 **95%** 的速度——
+第二张卡是在真干活，不是在等。
+
+前缀缓存：同一份 57K token 的 prompt 重发，TTFT 从 58.6 s 降到 2.1 s（等效 ≈20.7K tok/s）。
 
 ## 现在的架构
 
@@ -129,7 +171,7 @@ curl -s localhost:18200/metrics      # vllm:* 指标（prefill/decode/KV 使用�
 入口策略可在日志里看到：`kvmem entry: {"kind":"entry_rewrite",...}`（含 `gen_budget`、
 `prompt_selected` 的块数与字符数）。
 
-## 实测（当前配置：N=2，B/R=65536/32768，CAPTURE=512）
+## 契约检查（不是性能基准）
 
 | 项目 | 结果 |
 |---|---|
@@ -138,11 +180,9 @@ curl -s localhost:18200/metrics      # vllm:* 指标（prefill/decode/KV 使用�
 | CTX | 747,614 token → `400 history is ~747614 tokens, above kvmem CTX=524288` |
 | 流式 | 30 个 SSE 事件，首 0.07 s、末 1.43 s，时刻单调 |
 | 端口 | 只有 `0.0.0.0:18200`，无旁挂进程 |
-| prefill | 65.2K prompt：70 s ≈ **934 tok/s**；98.8K：713 tok/s；2 路并发聚合 477 tok/s |
-| decode | 小 prompt 生成 512 token ≈ **59 tok/s** |
 | 前缀复用 | 同前缀第二轮 `cached=63,024/65,890` |
 
-长上下文耗时**几乎全是 prefill**；并发不提升吞吐（TP=2 已用满两张卡）。
+这些行钉的是策略契约（多少历史进入引擎、R 上限、CTX 拒绝、SSE 行为）；吞吐数字见[性能](#性能)。
 
 ## 测试与探针
 
