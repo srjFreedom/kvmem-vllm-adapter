@@ -300,3 +300,35 @@ scripts/wait_ready.sh 18200 900 --smoke  # 就绪检查：短轮询 + 日志触�
 | 参数 | 默认 | 含义 |
 |---|---|---|
 | `--kvmem-capture-tokens` / `KVMEM_CAPTURE_TOKENS` | **512** | 每步为检索捕获的 query 行数（对齐 KVMem `query_max_tokens` 的 512 默认）；每 rank 约 100–200 MiB |
+
+## 从零跑起来（依赖什么）
+
+本仓库是**集成层**：KVMem 的策略层 + vLLM 的适配/插件/入口/部署。它不是自包含的可执行发行版，
+完整跑起来还需要三样外部件：
+
+| 外部件 | 默认路径 | 用途 |
+|---|---|---|
+| vLLM SM75 fork | `/home/srj/vLLM-2080Ti-Definitive` | 被接入的引擎（会被打 8 行补丁 + 放入 `kvmem_bridge.py`）|
+| kvmem 源码 | `/home/srj/src/kvmem-v018rc1` | 头文件与 `kvmem` 静态库（编译原生扩展）|
+| 模型权重 | `/home/srj/models/Coder390/FP8-fp8mtp` | FP8 + MTP + vision |
+
+一条命令完成：放 bridge → 打补丁 → 装插件 → 编扩展 → 自检：
+
+```bash
+./install.sh
+# 或
+VLLM_ROOT=/path/to/vllm KVMA_SRC=/path/to/kvmem ./install.sh
+```
+
+然后：
+
+```bash
+sudo cp deploy/kvmem-vllm.service /etc/systemd/system/
+cp deploy/run-current.example.sh /home/srj/run-current.sh   # 所有参数在这里改
+sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
+scripts/wait_ready.sh 18200 900 --smoke
+```
+
+**本仓库包含**：入口策略、插件（general + endpoint）、原生扩展源码、测试、探针、部署件、
+`vendor/vllm/kvmem_bridge.py`（否则只存在于那台机器的 vLLM 树里）以及
+`patches/qwen3-next-capture-q.patch`（vLLM 侧唯一的源码改动，8 行）。

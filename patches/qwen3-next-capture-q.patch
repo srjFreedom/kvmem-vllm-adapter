@@ -1,0 +1,33 @@
+diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
+index 495650eb19..70711540d2 100644
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -6,6 +6,8 @@ from collections.abc import Iterable
+ from itertools import islice
+ 
+ import torch
++
++from vllm import kvmem_bridge as _kvmem_bridge
+ from torch import nn
+ 
+ from vllm.compilation.decorators import support_torch_compile
+@@ -421,6 +423,9 @@ class Qwen3NextAttention(nn.Module):
+                     else None
+                 ),
+             )
++            # Unconditional so the op is always traced into the graph; it is a no-op until the
++            # adapter has allocated its buffers (see kvmem_bridge.ARMED / ensure()).
++            torch.ops.kvmem.capture_q(q, positions, int(getattr(self, "layer_idx", 0)))
+             return q, k, v, gate
+ 
+         if self.attn_output_gate:
+@@ -443,6 +448,9 @@ class Qwen3NextAttention(nn.Module):
+             -1, self.num_kv_heads * self.head_dim
+         )
+         q, k = self.rotary_emb(positions, q, k)
++        # KVMem bridge: unconditional call so the op is traced into the graph even if the env var
++        # is evaluated differently in the engine process; the op itself is a no-op when not armed.
++        torch.ops.kvmem.capture_q(q, positions, int(getattr(self, "layer_idx", 0)))
+         return q, k, v, gate
+ 
+     def forward(
