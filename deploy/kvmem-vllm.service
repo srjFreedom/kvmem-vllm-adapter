@@ -15,10 +15,11 @@ WorkingDirectory=/home/srj
 Environment=HOME=/home/srj
 Environment=MALLOC_ARENA_MAX=2
 # 覆盖项示例（改这些不必动 unit）：
-# Environment=CTX=524288 B=65536 R=32768 SINK=8192 RECENT=2048 SESSIONS=4 HOST_MIB=49152 N=2
+# 参数写在 start-*.sh 里，不要写在这里（保持通用性）
 # 入口策略（进程内中间件）随之派生，不需要单独配置：
 # Environment=KVMEM_ENTRY_SELECT=retrieval KVMEM_ENTRY_HISTORY_KIB=64
-ExecStart=/home/srj/run-current.sh
+# 指向你选定的站点配置脚本（start-*.sh），换配置就是换这一行
+ExecStart=/home/srj/start-kvmem-vllm.sh
 TimeoutStartSec=1200
 TimeoutStopSec=120
 Restart=on-failure

@@ -69,7 +69,7 @@ USE_LOCAL_FORK=0 ./install.sh            # fetch engines → patch → plugin �
 ENGINE=$PWD/engines/vllm ./scripts/setup-venv.sh   # torch / CUDA (several GB; skip if you have a venv)
 
 cp deploy/kvmem-vllm.service /etc/systemd/system/
-cp deploy/run-current.example.sh /home/srj/run-current.sh   # all knobs live here
+cp deploy/start-example.sh /home/srj/start-kvmem-vllm.sh    # site config: B/R/N/MODEL/...
 sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
 scripts/wait_ready.sh 18200 900 --smoke
 ```
@@ -99,8 +99,19 @@ So: any vLLM-supported model runs, and FP8 + MTP is just the configuration measu
 
 ## Configuration
 
-Every runtime knob lives in `run-current.sh`; the full reference is
-**[docs/PARAMETERS.md](docs/PARAMETERS.md)** (Chinese).
+Three layers, so the generic launcher stays generic:
+
+```
+start-<name>.sh     site parameters (B/R/N/GPU_UTIL/MODEL/...), one file per configuration
+   │ exec
+run-current.sh      generic entry, no site parameters
+   │ exec
+run-kvmem-vllm.sh   implementation (defaults live here as ${VAR:-default})
+```
+
+systemd's `ExecStart` points at whichever `start-*.sh` you want; switching configurations is one line
+plus `systemctl restart`. Full parameter reference: **[docs/PARAMETERS.md](docs/PARAMETERS.md)**
+(Chinese).
 
 ```bash
 B=36864 R=16384 CTX=524288 SINK=8192 RECENT=2048 N=1 PORT=18200

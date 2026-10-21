@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  KVMem + vLLM —— 当前生效配置（改这里，然后 restart 服务即可）
+#  KVMem + vLLM —— 站点配置模板
 #
-#    sudo systemctl restart kvmem-vllm
-#    tail -f /home/srj/kvmem.log
+#  用法：复制成 ~/start-<你的配置名>.sh，改下面的参数，
+#        再把 systemd 的 ExecStart 指向它（部署示例见 deploy/kvmem-vllm.service）。
 #
-#  只改「参数区」；下面的实现逻辑在 run-kvmem-vllm.sh 里，一般不用动。
+#    cp deploy/start-example.sh ~/start-kvmem-vllm.sh
+#    vi ~/start-kvmem-vllm.sh
+#    sudo systemctl daemon-reload && sudo systemctl restart kvmem-vllm
+#
+#  这个文件只放参数；通用启动在 run-current.sh，实现在 run-kvmem-vllm.sh。
 # ============================================================================
 
 # ---------------- 参数区（改这里）--------------------------------------------
@@ -48,4 +52,4 @@ export GPU_UTIL MAX_BATCHED_TOKENS SPECULATIVE_TOKENS MESSAGE_TYPE MM_IMAGE_LIMI
 export MODEL SERVED_NAME CHAT_TEMPLATE_FILE PROFILE
 export KVMEM_ENTRY_MODE KVMEM_ENTRY_SELECT DISABLE_PREFIX_CACHING KVMEM_UI_DIR
 
-exec /home/srj/run-kvmem-vllm.sh
+exec /home/srj/run-current.sh

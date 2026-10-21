@@ -1,7 +1,9 @@
 # 参数说明
 
-所有**运行时**参数集中在 `/home/srj/run-current.sh`（仓库里是 `deploy/run-current.example.sh`）。
-改完 `sudo systemctl restart kvmem-vllm` 生效（没有热改参数）。`kvmem-params.env` 会记录本次实际生效值。
+所有**运行时**参数写在站点配置脚本 `start-<名字>.sh` 里（模板：`deploy/start-example.sh`），
+它 `exec` 通用入口 `run-current.sh`，后者再 `exec` 实现 `run-kvmem-vllm.sh`。
+systemd 的 `ExecStart` 指向哪个 start 脚本就用哪套配置。改完 `sudo systemctl restart kvmem-vllm` 生效
+（没有热改参数）。`kvmem-params.env` 会记录本次实际生效值。
 
 **安装期**参数只在装机器时用一次，见文末。
 

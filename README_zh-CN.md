@@ -65,7 +65,7 @@ USE_LOCAL_FORK=0 ./install.sh            # 拉引擎 → 打补丁 → 装插件
 ENGINE=$PWD/engines/vllm ./scripts/setup-venv.sh   # torch / CUDA（几个 GB，已有 venv 可跳过）
 
 cp deploy/kvmem-vllm.service /etc/systemd/system/
-cp deploy/run-current.example.sh /home/srj/run-current.sh   # 参数都在这里改
+cp deploy/start-example.sh /home/srj/start-kvmem-vllm.sh    # 站点参数：B/R/N/MODEL/...
 sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
 scripts/wait_ready.sh 18200 900 --smoke
 ```
@@ -92,7 +92,18 @@ VLLM_ROOT=/path/to/fork KVMA_SRC=/path/to/kvmem PY=/path/to/venv/bin/python ./in
 
 ## 配置
 
-所有运行时参数集中在 `run-current.sh`，完整说明见 **[docs/PARAMETERS.md](docs/PARAMETERS.md)**。
+三层，保证通用入口不被污染：
+
+```
+start-<名字>.sh     站点参数（B/R/N/GPU_UTIL/MODEL/...），一个配置一份
+   │ exec
+run-current.sh      通用启动入口，不含任何站点参数
+   │ exec
+run-kvmem-vllm.sh   实现（默认值在这里的 ${VAR:-default}）
+```
+
+systemd 的 `ExecStart` 指向哪个 `start-*.sh` 就启动哪套配置，切换配置 = 改一行 + restart。
+完整参数说明见 **[docs/PARAMETERS.md](docs/PARAMETERS.md)**。
 
 ```bash
 B=36864 R=16384 CTX=524288 SINK=8192 RECENT=2048 N=1 PORT=18200
