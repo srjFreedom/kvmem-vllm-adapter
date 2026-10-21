@@ -1180,3 +1180,11 @@ ninfer 对等必须原地复用引擎页，另存副本在 B≈池/2 时物理�
 `compact_refused` → 请求停在 running。下一轮两条路：
 1. 选择器/规划器强制覆盖 prompt 页（mandatory 语义修透）；
 2. 或在 worker 侧把「prompt 页」直接并入选择结果再交给编排器（不依赖 C++ 语义）。
+
+### Route A 第十轮：forced_pages 也救不回「planner 返回的 visible」
+
+- 在 `orch.reselect` 增加 `forced_pages`：把 prompt 页硬并入选页集合（不依赖选择器语义）
+- 实跑仍出现 `compact_refused: visible=5312 < prompt 5540`：选页集合已包含 prompt 页，
+  但**规划器返回的 next.visible_tokens 仍少 228 token**
+- 结论：缺口在 `KvmemPlanner.plan` → `ext.plan_working_set`（catalog/snapshot 与 chosen 的对齐），
+  不是选择器。下一轮直接看 `snapshot()` 的 catalog 与 `plan.next.blocks` 的差集。

@@ -408,7 +408,7 @@ class SparseOrchestrator:
 
     # --- reselect ---------------------------------------------------------------------
     def reselect(self, mandatory_pages=(), slots=None, page_to_slot=None,
-                 prefill_pressure=False):
+                 prefill_pressure=False, forced_pages=()):
         # The selector works on the token frontier, which can include a partially-filled last
         # selection block; only pages that already hold written tokens may be selected.
         if self.retrieval_index is not None:
@@ -441,6 +441,14 @@ class SparseOrchestrator:
         else:
             raw = self.selector.select_pages(list(mandatory_pages))
         selected = [p for p in raw if p * self.page_tokens < max(self.total_tokens, 1)]
+        if forced_pages:
+            # Hard requirement from the caller (the backend's prompt, which vLLM keeps immutable):
+            # the selector/planner are free to rank, but they may not drop these pages.
+            have = set(selected)
+            for page in forced_pages:
+                page = int(page)
+                if page not in have and page * self.page_tokens < max(self.total_tokens, 1):
+                    selected.append(page)
         if self.planner is not None and selected:
             # KVMem decides the compact order and the visible length; we only filter pages that
             # hold no written tokens yet (a partially filled tail block).

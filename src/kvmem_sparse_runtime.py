@@ -606,7 +606,7 @@ class VllmSparseRuntime:
         prompt_tokens = int(getattr(orch, "prompt_tokens", 0) or 0)
         mandatory = list(range(0, -(-prompt_tokens // self.page_tokens))) if prompt_tokens else []
         stats = orch.reselect(slots=_take, mandatory_pages=mandatory,
-                              prefill_pressure=prefill_pressure)
+                              forced_pages=mandatory, prefill_pressure=prefill_pressure)
         selected = list(orch.last_view.row_pages)
         used = list(orch.slots[:len(selected)])
         spare = taken["slots"][-1]
