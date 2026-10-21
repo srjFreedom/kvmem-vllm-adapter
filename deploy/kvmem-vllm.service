@@ -1,0 +1,33 @@
+[Unit]
+Description=KVMem (vLLM SM75 fork backend, 2x RTX 2080 Ti); entry policy runs in-process, kvmem official port 18200
+Documentation=file:///home/srj/vllm-kvmem-adapter/README.md
+After=network-online.target nvidia-power-limit.service
+Wants=network-online.target nvidia-power-limit.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=forking
+PIDFile=/home/srj/kvmem-vllm.pid
+User=srj
+Group=srj
+WorkingDirectory=/home/srj
+Environment=HOME=/home/srj
+Environment=MALLOC_ARENA_MAX=2
+# 覆盖项示例（改这些不必动 unit）：
+# Environment=CTX=524288 B=65536 R=32768 SINK=8192 RECENT=2048 SESSIONS=4 HOST_MIB=49152 N=2
+# 入口策略（进程内中间件）随之派生，不需要单独配置：
+# Environment=KVMEM_ENTRY_SELECT=retrieval KVMEM_ENTRY_HISTORY_KIB=64
+ExecStart=/home/srj/run-current.sh
+TimeoutStartSec=1200
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=20
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
+
+# 注意: 本单元与 kvmem.service (llama.cpp 后端) 争用同一对 GPU，二者只能启一个。
+# 入口策略已内联（vllm.endpoint_plugins: kvmem_entry），不再需要 kvmem-vllm-gateway.service。

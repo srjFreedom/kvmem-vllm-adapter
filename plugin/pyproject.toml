@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-kvmem-plugin"
+version = "0.1.0"
+description = "Out-of-tree KVMem plugin for vLLM (probe + adapter hook + in-process entry policy)"
+
+# Engine side: loaded in every process (frontend, EngineCore, workers).
+[project.entry-points."vllm.general_plugins"]
+kvmem = "vllm_kvmem_plugin:register"
+
+# API server side: only loaded when named in VLLM_PLUGINS (vLLM's stricter endpoint-plugin gate).
+# Installs the entry middleware that selects history (B) and caps generation (R) in-process, so the
+# service needs one port and no sidecar.
+[project.entry-points."vllm.endpoint_plugins"]
+kvmem_entry = "kvmem_entry_middleware:KvmemEntryPlugin"
+
+[tool.setuptools]
+py-modules = ["vllm_kvmem_plugin", "kvmem_entry_middleware"]

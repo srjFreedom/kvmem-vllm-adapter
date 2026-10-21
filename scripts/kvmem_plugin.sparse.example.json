@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "probe_log": "/tmp/kvmem_probe.jsonl",
+  "sparse": true,
+  "adapter_root": "/home/srj/vllm-kvmem-adapter",
+  "budget_tokens": 32768,
+  "gen_reserve_tokens": 16384,
+  "sink_tokens": 8192,
+  "recent_tokens": 1024,
+  "select_block_tokens": 128,
+  "reselect_interval": 64,
+  "rotary_dim": 64,
+  "rope_theta": 10000000,
+  "head_dim": 256,
+  "lrfu": false
+}

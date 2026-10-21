@@ -1,0 +1,17 @@
+# build products (the native extension is built per machine: cmake + pybind11)
+build/
+*.so
+*.o
+*.a
+__pycache__/
+*.py[cod]
+
+# runtime scratch
+*.jsonl
+*.log
+smoke_live_engine.json
+.pytest_cache/
+
+# editor / backup files
+*.bak*
+*~

@@ -1,0 +1,4 @@
+Metadata-Version: 2.4
+Name: vllm-kvmem-plugin
+Version: 0.1.0
+Summary: Out-of-tree KVMem plugin for vLLM (probe + adapter hook + in-process entry policy)
