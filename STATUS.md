@@ -1188,3 +1188,12 @@ ninfer 对等必须原地复用引擎页，另存副本在 B≈池/2 时物理�
   但**规划器返回的 next.visible_tokens 仍少 228 token**
 - 结论：缺口在 `KvmemPlanner.plan` → `ext.plan_working_set`（catalog/snapshot 与 chosen 的对齐），
   不是选择器。下一轮直接看 `snapshot()` 的 catalog 与 `plan.next.blocks` 的差集。
+
+### Route A 第十一轮：forced_pages 排序修复 + 测试契约
+
+- `forced_pages` 初版把页**追加**到末尾，破坏「升序 sink..recent」契约（离线测试立刻报
+  `selected pages must be ascending`）→ 改为合并后 `sorted()`，测试恢复全绿
+- 只在 `prompt_tokens <= B` 时强制（prompt 超过 B 说明入口没裁好，强制会让视图超 B 本就该失败）
+- 实跑仍 `visible=5296 < prompt 5541`：选页集合已含 prompt 块，但 planner 返回的
+  `next.visible_tokens` 仍少 ~2 个块 → 下一轮在 `plan()` 里打印
+  `selected_blocks / plan.next.blocks / visible` 的差集定位

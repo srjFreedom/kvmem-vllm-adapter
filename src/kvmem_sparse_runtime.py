@@ -605,8 +605,12 @@ class VllmSparseRuntime:
 
         prompt_tokens = int(getattr(orch, "prompt_tokens", 0) or 0)
         mandatory = list(range(0, -(-prompt_tokens // self.page_tokens))) if prompt_tokens else []
+        # Force the prompt pages only when the prompt fits the budget. If it does not, the entry
+        # policy failed to trim it; forcing them would make the view exceed B and the plan would be
+        # rejected anyway (the compact also refuses to go below the prompt).
+        forced = mandatory if prompt_tokens and prompt_tokens <= int(self.budget_tokens) else []
         stats = orch.reselect(slots=_take, mandatory_pages=mandatory,
-                              forced_pages=mandatory, prefill_pressure=prefill_pressure)
+                              forced_pages=forced, prefill_pressure=prefill_pressure)
         selected = list(orch.last_view.row_pages)
         used = list(orch.slots[:len(selected)])
         spare = taken["slots"][-1]

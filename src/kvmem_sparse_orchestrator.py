@@ -443,12 +443,15 @@ class SparseOrchestrator:
         selected = [p for p in raw if p * self.page_tokens < max(self.total_tokens, 1)]
         if forced_pages:
             # Hard requirement from the caller (the backend's prompt, which vLLM keeps immutable):
-            # the selector/planner are free to rank, but they may not drop these pages.
-            have = set(selected)
+            # the selector/planner may rank, but they may not drop these pages. The result MUST stay
+            # ascending (sink..recent) - the store rejects an unsorted selection, and a wrong order
+            # also shifts every page's compacted position.
+            merged = set(int(p) for p in selected)
             for page in forced_pages:
                 page = int(page)
-                if page not in have and page * self.page_tokens < max(self.total_tokens, 1):
-                    selected.append(page)
+                if page * self.page_tokens < max(self.total_tokens, 1):
+                    merged.add(page)
+            selected = sorted(merged)
         if self.planner is not None and selected:
             # KVMem decides the compact order and the visible length; we only filter pages that
             # hold no written tokens yet (a partially filled tail block).
