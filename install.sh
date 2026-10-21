@@ -20,15 +20,22 @@ TARGET="$VLLM_ROOT/vllm/model_executor/models/qwen3_next.py"
 
 say() { printf '\n[install] %s\n' "$*"; }
 
+FETCH_LOCAL=${USE_LOCAL_FORK:-1}
 say "1/5 检查外部件"
-[ -d "$VLLM_ROOT/vllm" ] || { echo "缺 vLLM fork: $VLLM_ROOT"; exit 1; }
+if [ "$FETCH_LOCAL" = "1" ]; then
+  [ -d "$VLLM_ROOT/vllm" ] || { echo "缺 vLLM fork: $VLLM_ROOT（或用 USE_LOCAL_FORK=0 自动拉取）"; exit 1; }
+fi
 if [ ! -f "$KVMA_SRC/kvmem/include/kvmem/kvmem_runtime.hpp" ]; then
   echo "  kvmem 源码不在 $KVMA_SRC，按 versions.json 拉取固定 tag"
   python3 "$ROOT/scripts/prepare-backends.py" --engine kvmem
   KVMA_SRC="$ROOT/engines/kvmem"
 fi
 [ -x "$PY" ] || { echo "缺 venv python: $PY"; exit 1; }
-echo "  vLLM   : $VLLM_ROOT"
+if [ "$FETCH_LOCAL" = "1" ]; then
+  echo "  vLLM   : $VLLM_ROOT（使用本地 fork）"
+else
+  echo "  vLLM   : 将从 backends/versions.json 拉取到 engines/vllm"
+fi
 echo "  kvmem  : $KVMA_SRC"
 echo "  python : $PY"
 
@@ -48,7 +55,12 @@ else
   python3 "$ROOT/scripts/prepare-backends.py" --engine vllm --check-tree
   VLLM_ROOT="$ROOT/engines/vllm"
   PY="$VLLM_ROOT/.venv/bin/python"
-  [ -x "$PY" ] || { echo "  请先在 $VLLM_ROOT 建好 venv（参考该 fork 的 README）"; exit 1; }
+  [ -x "$PY" ] || {
+    echo "  该引擎还没有 Python 环境，先跑："
+    echo "      ENGINE=$VLLM_ROOT ./scripts/setup-venv.sh"
+    echo "  （会按 fork 的 requirements 装 torch/CUDA 依赖，几个 GB；若 fork 有官方配方以其为准）"
+    exit 1
+  }
 fi
 
 say "3/5 安装插件包（editable）"
