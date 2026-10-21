@@ -1225,3 +1225,13 @@ selected: 332   seq_len: 5312   prompt: 5535   mandatory_pages: 346
 **结果**：2.2K 行用例 121s 跑完（此前必卡），但**输出质量下降**：2415 行里只有 849 行是完整
 LEMON，其余退化成 `w`/`le` 碎片——压缩后 RoPE 重打或页搬运有偏差。下一轮对着
 `rotation_deltas`/`plan_moves`/`order_moves` 逐页核对（离线已有 rotate/needle 单测可复用）。
+
+### Route A 第十四轮：visible_limit 方案导致 CUDA 非法访问（已回退）
+
+- 假设：`st.seq_len` 用了 `len(selected)*page_tokens`（8112）而规划器 visible 是 8102，读多了
+  10 个未写 token → 碎片化
+- 改动：`seq_len` 与 compact 都改用规划器 visible（`visible_limit` 通道参数）
+- 结果：**引擎直接 CUDA illegal memory access 崩溃**（可能让 kernel 读越界）
+- 处理：整轮回退，保留上一轮已验证的修复（补提交扫描 + 缺失页捕获 ⇒ 不再卡死）
+- 下一轮方向：碎片化问题别动 seq_len/attention 边界，改查「重打后页字节与目标位置的对应」
+  （离线 rotation/needle 单测可扩展成「压缩后逐页验证 rank 偏移」）
