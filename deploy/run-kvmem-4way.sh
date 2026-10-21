@@ -53,21 +53,24 @@ export PATH="$HOME/.local/bin:$PATH"
 export DISABLE_PREFIX_CACHING=${DISABLE_PREFIX_CACHING:-0}
 export KVMEM_PLUGIN_CONFIG=/tmp/kvmem_plugin.json
 export KV_CONCURRENCY_EFFECTIVE_LEN="${KV_CONCURRENCY_EFFECTIVE_LEN:-32768}"
-exec ./launcher.sh \
-  --model-dir "${MODEL:-$HOME/models/Coder390/FP8-fp8mtp}" \
-  --profile "${PROFILE:-2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env}" \
-  --mode fast --gpu-devices 0,1 --tp-size 2 --pp-size 1 \
-  --set MAX_MODEL_LEN=${MAX_MODEL_LEN:-32768} \
-  --set GPU_UTIL=${GPU_UTIL:-0.97} \
-  --set MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-4096} \
-  --set MAX_NUM_SEQS=${MAX_NUM_SEQS:-4} \
-  --set SERVED_NAME=${SERVED_NAME:-KVMEM-SPARSE} \
-  --set CHAT_TEMPLATE_FILE="${CHAT_TEMPLATE_FILE:-$HOME/models/Coder390/FP8/chat_template.jinja}" \
-  --set MESSAGE_TYPE=${MESSAGE_TYPE:-text+image} \
-  --set MM_IMAGE_LIMIT=${MM_IMAGE_LIMIT:-64} \
-  --set SPECULATIVE_TOKENS=${SPECULATIVE_TOKENS:-4} \
-  --set SERVICE_SCOPE=${SERVICE_SCOPE:-lan} \
-  --set DISABLE_LOG_STATS=0 \
-  --set PER_REQUEST_SPEC_DECODE_METRICS=detailed \
-  --set ENABLE_AUTO_TOOL_CHOICE=1 \
-  --set TOOL_CALL_PARSER=qwen3_xml "$@"
+ARGS=(
+  --model-dir "${MODEL:-$HOME/models/Coder390/FP8-fp8mtp}"
+  --profile "${PROFILE:-2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env}"
+  --mode fast --gpu-devices 0,1 --tp-size 2 --pp-size 1
+  --set MAX_MODEL_LEN=${MAX_MODEL_LEN:-32768}
+  --set GPU_UTIL=${GPU_UTIL:-0.97}
+  --set MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-4096}
+  --set MAX_NUM_SEQS=${MAX_NUM_SEQS:-4}
+  --set SERVED_NAME=${SERVED_NAME:-KVMEM-SPARSE}
+  --set MESSAGE_TYPE=${MESSAGE_TYPE:-text+image}
+  --set MM_IMAGE_LIMIT=${MM_IMAGE_LIMIT:-64}
+  --set SPECULATIVE_TOKENS=${SPECULATIVE_TOKENS:-4}
+  --set SERVICE_SCOPE=${SERVICE_SCOPE:-lan}
+  --set DISABLE_LOG_STATS=0
+  --set PER_REQUEST_SPEC_DECODE_METRICS=detailed
+  --set ENABLE_AUTO_TOOL_CHOICE=1
+  --set TOOL_CALL_PARSER=qwen3_xml
+)
+# 只有显式给了模板才透传（模型自带 chat template 时不需要）
+[ -n "${CHAT_TEMPLATE_FILE:-}" ] && ARGS+=(--set "CHAT_TEMPLATE_FILE=${CHAT_TEMPLATE_FILE}")
+exec ./launcher.sh "${ARGS[@]}" "$@"

@@ -68,8 +68,12 @@ cd kvmem-vllm-adapter
 USE_LOCAL_FORK=0 ./install.sh            # fetch engines → patch → plugin → extension → self-check
 ENGINE=$PWD/engines/vllm ./scripts/setup-venv.sh   # torch / CUDA (several GB; skip if you have a venv)
 
+# Run it in the foreground with the repository defaults (default profile included):
+MODEL=$HOME/models/<your-model> ./deploy/run-current.sh
+
+# Or as a service (the unit's ExecStart points at this repository's run-current.sh):
 cp deploy/kvmem-vllm.service /etc/systemd/system/
-cp deploy/start-example.sh ~/start-kvmem-vllm.sh    # site config: B/R/N/MODEL/...
+mkdir -p ~/.config && printf 'MODEL=%s\n' "$HOME/models/<your-model>" > ~/.config/kvmem-vllm.env
 sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
 scripts/wait_ready.sh 18200 900 --smoke
 ```
@@ -99,27 +103,33 @@ So: any vLLM-supported model runs, and FP8 + MTP is just the configuration measu
 
 ## Configuration
 
-Three layers, so the generic launcher stays generic:
+Two layers, and the defaults are a working start — no site script required:
 
 ```
-start-<name>.sh     site parameters (B/R/N/GPU_UTIL/MODEL/...), one file per configuration
+run-current.sh      generic entry, no site parameters (systemd points here)
    │ exec
-run-current.sh      generic entry, no site parameters
-   │ exec
-run-kvmem-vllm.sh   implementation (defaults live here as ${VAR:-default})
+run-kvmem-vllm.sh   implementation (every knob is ${VAR:-default})
 ```
 
-systemd's `ExecStart` points at whichever `start-*.sh` you want; switching configurations is one line
-plus `systemctl restart`. Full parameter reference: **[docs/PARAMETERS.md](docs/PARAMETERS.md)**
-(Chinese).
+Defaults: `B=36864 R=16384 N=1 GPU_UTIL=0.97` with the shipped
+`2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env` profile. The only required input is
+`MODEL` (your weights directory); set `CHAT_TEMPLATE_FILE` only when the model ships no built-in
+chat template. Override anything else with environment variables, or put
+`KEY=VALUE` lines in `~/.config/kvmem-vllm.env` (the unit loads it when present):
+
+```bash
+N=2 B=53248 GPU_UTIL=0.98 ./deploy/run-current.sh
+```
+
+Full parameter reference: **[docs/PARAMETERS.md](docs/PARAMETERS.md)** (Chinese).
 
 ```bash
 B=36864 R=16384 CTX=524288 SINK=8192 RECENT=2048 N=1 PORT=18200
 CAPTURE_TOKENS=512 GPU_UTIL=0.97 MAX_BATCHED_TOKENS=4096 THINKING_BUDGET=
-MODEL=$HOME/models/Coder390/FP8-fp8mtp
-CHAT_TEMPLATE_FILE=.../chat_template.jinja
 PROFILE=2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env
-KVMEM_UI_DIR=$HOME/kvmem-ui
+MODEL=$HOME/models/<your-model>          # required
+CHAT_TEMPLATE_FILE=                      # only if the model has no built-in template
+KVMEM_UI_DIR=                            # optional static UI mounted at /
 ```
 
 The constraint that bites: **engine window = `N × (B + R)` must fit the KV pool** (210,651 tokens on
@@ -178,7 +188,7 @@ plugin/                     general plugin + endpoint plugin (entry policy, UI m
 src/                        entry policy, text selection, H/D cache, sparse runtime, native ext
 scripts/                    worker, wait_ready, prepare-backends, setup-venv, probe
 tests/                      39 tests (all non-GPU ones pass)
-deploy/                     systemd unit, run-current template, launch scripts
+deploy/                     systemd unit, generic entry, launch scripts
 backends/versions.json      pinned engine versions + patch sha256 + patched_tree
 backends/patches/           every vLLM-side change (17 files / 612 lines)
 docs/PARAMETERS.md          each knob, its constraint and its effect

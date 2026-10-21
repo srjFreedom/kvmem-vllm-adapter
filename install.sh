@@ -91,13 +91,17 @@ print("  entry policy :", EntryPolicy().budget, EntryPolicy().gen_reserve)
 PYCHECK
 "$ROOT/scripts/check_integration_surface.py" --vllm-root "$VLLM_ROOT" --kvmem-root "$KVMA_SRC" 2>/dev/null | tail -1 || true
 
-cat <<'NEXT'
+cat <<NEXT
 
-[install] 完成。启动方式：
+[install] 完成。启动方式（仓库默认参数即可跑，只差 MODEL；模型无内置模板时再加 CHAT_TEMPLATE_FILE）：
 
-  cp deploy/kvmem-vllm.service /etc/systemd/system/   # ExecStart 指向你的 start-*.sh
-  cp deploy/run-current.sh "$HOME/run-current.sh"   # 通用入口，参数放 start-*.sh
-  sudo systemctl daemon-reload
-  sudo systemctl enable --now kvmem-vllm
-  scripts/wait_ready.sh 18200 900 --smoke
+  前台：
+    MODEL=$HOME/models/<你的模型> $ROOT/deploy/run-current.sh
+
+  服务：
+    cp $ROOT/deploy/kvmem-vllm.service /etc/systemd/system/
+    mkdir -p ~/.config && printf 'MODEL=%s\n' "$HOME/models/<你的模型>" > ~/.config/kvmem-vllm.env
+    sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
+
+  就绪检查：$ROOT/scripts/wait_ready.sh 18200 900 --smoke
 NEXT

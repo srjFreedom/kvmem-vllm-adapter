@@ -28,7 +28,7 @@ N=${N:-1}
 CTX=${CTX:-524288}
 # 检索用的 query 捕获窗口（KVMem query_max_tokens 的官方默认是 512）
 CAPTURE_TOKENS=${CAPTURE_TOKENS:-512}
-MODEL=${MODEL:-$HOME/models/Coder390/FP8-fp8mtp}   # 示例权重目录，换模型用 start-*.sh 覆盖
+MODEL=${MODEL:?未设置 MODEL：指向你的权重目录，例如 MODEL=$HOME/models/<你的模型>}
 # 对外模型 id：按实际权重命名（FP8 + MTP）。实际加载的是
 # $HOME/models/Coder390/FP8-fp8mtp，不是 llama.cpp 的 Q6_K GGUF，也不是 ninfer 的 .ninfer。
 SERVED_NAME=${SERVED_NAME:-Qwen3.8-27B-Coder390-EfficientThink-FP8-MTP}

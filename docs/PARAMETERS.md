@@ -1,7 +1,7 @@
 # 参数说明
 
-所有**运行时**参数写在站点配置脚本 `start-<名字>.sh` 里（模板：`deploy/start-example.sh`），
-它 `exec` 通用入口 `run-current.sh`，后者再 `exec` 实现 `run-kvmem-vllm.sh`。
+所有**运行时**参数的默认值都在 `deploy/run-kvmem-vllm.sh` 的 `${VAR:-默认}` 里，clone 下来直接可跑；
+覆盖时用环境变量，或在 systemd 用法下写进 `~/.config/kvmem-vllm.env`（`KEY=VALUE`，一行一个）。
 systemd 的 `ExecStart` 指向哪个 start 脚本就用哪套配置。改完 `sudo systemctl restart kvmem-vllm` 生效
 （没有热改参数）。`kvmem-params.env` 会记录本次实际生效值。
 
@@ -68,8 +68,8 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 | `SERVICE_SCOPE` | `lan` | 监听范围 | `lan` = `0.0.0.0`；`local` = 只监听 `127.0.0.1` |
 | `THINKING_BUDGET` | 空 | 思考 token 上限（`REASONING_BUDGET`）| **默认空 = 无上限**；填数字才限制推理长度 |
 
-这些参数在 `run-kvmem-sparse.sh` 里都有 `${VAR:-默认}` 兜底，所以既可以写进 `run-current.sh`，
-也可以临时 `GPU_UTIL=0.9 ./run-kvmem-vllm.sh` 试。
+这些参数在启动脚本里都有 `${VAR:-默认}` 兜底，所以既可以写进 `~/.config/kvmem-vllm.env`，
+也可以临时 `GPU_UTIL=0.9 ./deploy/run-kvmem-vllm.sh` 试。
 
 ### 模型
 

@@ -11,18 +11,19 @@ StartLimitBurst=5
 # 所以不能像 kvmem.service / kvmem-ninfer.service 那样用 Type=simple（那样单元会立刻变成 inactive）。
 # 这里用 forking + PIDFile 跟踪真正的 api_server 进程。
 PIDFile=%h/kvmem-vllm.pid
-# User/Group 默认不写 = 以 root 运行；建议改成你的账号（或本机装成 systemd --user 单元）：
-#User=srj
-#Group=srj
+# User/Group 默认不写 = 以 root 运行；建议取消注释并改成你的账号（或装成 systemd --user 单元）：
+#User=your-user
+#Group=your-group
 WorkingDirectory=%h
 Environment=HOME=%h
 Environment=MALLOC_ARENA_MAX=2
+# 可选：站点参数文件（存在则加载，不存在忽略）。内容 KEY=VALUE，一行一个。
+EnvironmentFile=-%h/.config/kvmem-vllm.env
 # 覆盖项示例（改这些不必动 unit）：
-# 参数写在 start-*.sh 里，不要写在这里（保持通用性）
+# 参数建议写进上面的 EnvironmentFile，或作为环境变量导出，不改 unit
 # 入口策略（进程内中间件）随之派生，不需要单独配置：
 # Environment=KVMEM_ENTRY_SELECT=retrieval KVMEM_ENTRY_HISTORY_KIB=64
-# 指向你选定的站点配置脚本（start-*.sh），换配置就是换这一行
-ExecStart=%h/start-kvmem-vllm.sh
+ExecStart=%h/vllm-kvmem-adapter/deploy/run-current.sh
 TimeoutStartSec=900
 TimeoutStopSec=120
 Restart=on-failure

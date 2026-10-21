@@ -65,7 +65,6 @@ USE_LOCAL_FORK=0 ./install.sh            # 拉引擎 → 打补丁 → 装插件
 ENGINE=$PWD/engines/vllm ./scripts/setup-venv.sh   # torch / CUDA（几个 GB，已有 venv 可跳过）
 
 cp deploy/kvmem-vllm.service /etc/systemd/system/
-cp deploy/start-example.sh ~/start-kvmem-vllm.sh    # 站点参数：B/R/N/MODEL/...
 sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
 scripts/wait_ready.sh 18200 900 --smoke
 ```
@@ -92,27 +91,23 @@ VLLM_ROOT=/path/to/fork KVMA_SRC=/path/to/kvmem PY=/path/to/venv/bin/python ./in
 
 ## 配置
 
-三层，保证通用入口不被污染：
+两层，仓库默认值就是可用的起点——**不需要站点脚本**：
 
 ```
-start-<名字>.sh     站点参数（B/R/N/GPU_UTIL/MODEL/...），一个配置一份
+run-current.sh      通用启动入口，不含任何站点参数（systemd 指向它）
    │ exec
-run-current.sh      通用启动入口，不含任何站点参数
-   │ exec
-run-kvmem-vllm.sh   实现（默认值在这里的 ${VAR:-default}）
+run-kvmem-vllm.sh   实现（每个参数都是 ${VAR:-default}）
 ```
 
-systemd 的 `ExecStart` 指向哪个 `start-*.sh` 就启动哪套配置，切换配置 = 改一行 + restart。
-完整参数说明见 **[docs/PARAMETERS.md](docs/PARAMETERS.md)**。
+默认：`B=36864 R=16384 N=1 GPU_UTIL=0.97`，profile 用仓库自带的
+`2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env`。唯一必须提供的是 `MODEL`（权重目录）；只有模型没有内置 chat template 时才需要给 `CHAT_TEMPLATE_FILE`；其余参数用环境变量覆盖，或写进 `~/.config/kvmem-vllm.env`
+（单元存在则加载）：
 
 ```bash
-B=36864 R=16384 CTX=524288 SINK=8192 RECENT=2048 N=1 PORT=18200
-CAPTURE_TOKENS=512 GPU_UTIL=0.97 MAX_BATCHED_TOKENS=4096 THINKING_BUDGET=
-MODEL=$HOME/models/Coder390/FP8-fp8mtp
-CHAT_TEMPLATE_FILE=.../chat_template.jinja
-PROFILE=2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env
-KVMEM_UI_DIR=$HOME/kvmem-ui
+N=2 B=53248 GPU_UTIL=0.98 ./deploy/run-current.sh
 ```
+
+完整参数说明见 **[docs/PARAMETERS.md](docs/PARAMETERS.md)**。
 
 关键约束：**引擎窗口 = `N × (B + R)` 必须装进 KV 池**（本机 210,651 token）。
 默认 `N=1, B+R=53,248` 余量很大；`N=2` → 106,496，`N=3` → 159,744，`N=4` → 212,992 需要把 B 降到约 26K。
@@ -166,7 +161,7 @@ plugin/                     general 插件 + endpoint 插件（入口策略、UI
 src/                        入口策略、文本选片、H/D 缓存、稀疏运行时、原生扩展源码
 scripts/                    worker、wait_ready、prepare-backends、setup-venv、探针
 tests/                      39 个测试（非 GPU 全通过）
-deploy/                     systemd 单元、run-current 模板、启动脚本
+deploy/                     systemd 单元、通用入口、启动脚本
 backends/versions.json      引擎固定版本 + 补丁 sha256 + patched_tree
 backends/patches/           vLLM 侧全部改动（17 文件 / 612 行）
 docs/PARAMETERS.md          每个参数的含义、约束与影响
