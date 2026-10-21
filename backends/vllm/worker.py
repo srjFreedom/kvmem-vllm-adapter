@@ -56,8 +56,12 @@ def main(argv=None) -> int:
     # with async scheduling.
     # Only pay for it when concurrency is actually requested: single-request mode keeps the async
     # scheduler (measured 3.38-3.45 s for 882+300 vs 4.1-4.5 s with sync scheduling).
+    # NO_ASYNC_SCHEDULING=0 forces async even for N>1: with entry-side selection (no inrequest
+    # compaction) no block-table rewrite happens, so the async scheduler is safe. Unset keeps
+    # the historical sync default for N>1.
     _seqs = int(env.get("MAX_NUM_SEQS", "1") or "1")
-    if _seqs > 1 and env.get("NO_ASYNC_SCHEDULING") != "1":
+    _async_override = env.get("NO_ASYNC_SCHEDULING", "").strip()
+    if _seqs > 1 and _async_override == "":
         env["NO_ASYNC_SCHEDULING"] = "1"
         print(f"[kvmem backends/vllm] MAX_NUM_SEQS={_seqs} -> --no-async-scheduling "
               "(async scheduling pre-plans steps and conflicts with per-step page compaction; "
