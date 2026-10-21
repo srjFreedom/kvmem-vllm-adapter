@@ -208,3 +208,15 @@ uses for its llama.cpp and ninfer backends.
 
 Every vLLM touch point, what each change does and how many lines it costs:
 [INTEGRATION-SURFACE.md](INTEGRATION-SURFACE.md).
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Note that this is an **integration layer** and contains no engine sources:
+- the patched vLLM files stay under the upstream Apache-2.0 license (the patch flow preserves their
+  LICENSE/NOTICE)
+- kvmem is fetched at a pinned tag and linked, not vendored and not relicensed; its upstream
+  repository does not currently ship a top-level LICENSE file, so confirm with its maintainers
+  before redistributing binaries that contain it
+- model weights are not distributed here and keep their own terms

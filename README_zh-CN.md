@@ -192,3 +192,13 @@ commit/tag，应用 `backends/patches/vllm-kvmem.patch`，再用 `patched_tree` 
 （kvmem 官方对 llama.cpp / ninfer 用的也是这套「固定版本 + 整份集成补丁」布局）。
 
 vLLM 侧的接触点、每处改动的作用与行数见 [INTEGRATION-SURFACE.md](INTEGRATION-SURFACE.md)。
+
+## 许可
+
+本仓库为 Apache-2.0，见 [LICENSE](LICENSE) 与 [NOTICE](NOTICE)。
+
+注意：它只是**集成层**，不包含引擎源码。
+- 被补丁的 vLLM 文件仍属上游 Apache-2.0（补丁流程保留其 LICENSE/NOTICE）
+- kvmem 以固定 tag 拉取并链接，不 vendored、不改许可；其上游仓库目前没有顶层 LICENSE 文件，
+  若要分发包含它的二进制，请先与上游确认
+- 模型权重不在本仓库内，另有其许可

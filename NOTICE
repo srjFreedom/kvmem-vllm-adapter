@@ -1,0 +1,22 @@
+KVMem × vLLM (SM75, TP=2) — single-service integration
+Copyright 2026 srjFreedom
+
+This repository is an integration layer. It does not vendor the engine sources; they are fetched at
+a pinned commit/tag by scripts/prepare-backends.py (see backends/versions.json) and patched with the
+single patch listed there.
+
+Third-party components and their terms:
+
+  vLLM  https://github.com/weicj/vLLM-2080Ti-Definitive (a fork of vLLM, Apache-2.0)
+        The files this project patches (vllm/kvmem_bridge.py as a new file, and the capture_q call
+        sites in vllm/model_executor/models/qwen3_next.py) remain under the upstream Apache-2.0
+        license; the upstream LICENSE and NOTICE files are preserved by the patch flow.
+
+  kvmem  https://github.com/kvmem/kvmem
+        Fetched at tag v0.18.0 and linked as a library; it is not vendored here and no part of it is
+        relicensed by this project. The upstream repository does not currently ship a top-level
+        LICENSE file, so consult its maintainers before redistributing binaries that contain it.
+
+  Model weights are not distributed with this repository and remain under their own terms.
+
+Nothing in this NOTICE grants rights to third-party code beyond those licenses.
