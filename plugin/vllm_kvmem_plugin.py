@@ -93,7 +93,8 @@ def _append(path, record):
 
 
 def _ensure_import_path():
-    adapter_root = _config().get("adapter_root", "/home/srj/vllm-kvmem-adapter")
+    adapter_root = _config().get("adapter_root") or os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__)))
     for path in (os.path.join(adapter_root, "build", "python"),
                  os.path.join(adapter_root, "src")):
         if path not in sys.path:

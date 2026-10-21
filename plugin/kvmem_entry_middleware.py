@@ -296,7 +296,7 @@ class KvmemEntryPlugin:
         # KVMem Web UI: the static build talks to the API with relative URLs (/v1/models,
         # ./v1/chat/completions), so serving it from the same port needs no proxy. The mount is
         # added last, after every core router, so /v1/*, /health and /docs keep priority.
-        ui_dir = os.environ.get("KVMEM_UI_DIR", "/home/srj/kvmem-ui")
+        ui_dir = os.environ.get("KVMEM_UI_DIR", "")
         if ui_dir and os.path.isdir(ui_dir):
             try:
                 from starlette.staticfiles import StaticFiles

@@ -42,10 +42,10 @@
 #
 # 注意: 这些注释必须留在 exec 上方, 绝不能插进下面的参数表!
 #  [教训] 反斜杠续行的参数表中间插 # 注释会静默截断命令, 后面所有 --set 全部失效。
-cd "${VLLM_DIR:-/home/srj/vLLM-2080Ti-Definitive}"
+cd "${VLLM_DIR:-$HOME/vLLM-2080Ti-Definitive}"
 
 # 非 YaRN 档下 launcher 原样透传（合并逻辑只在 ENABLE_YARN=1 时执行）
-export HF_OVERRIDES_JSON="$(cat "${HF_OVERRIDES_FILE:-/home/srj/coder390-fp8-mtp-noexclude.json}")"
+if [ -n "${HF_OVERRIDES_FILE:-}" ]; then export HF_OVERRIDES_JSON="$(cat "$HF_OVERRIDES_FILE")"; fi
 export VLLM_LOG_STATS_INTERVAL=3   # 周期速度统计 3s 一输出(nvfp4 同款, 缺了退回默认 10s)
 
 # 坏卡防护已于 2026-10-16 移除: 用户确认机器里已无坏卡(GPU-85622d5a 已下线/不存在)。
@@ -55,15 +55,15 @@ export DISABLE_PREFIX_CACHING=${DISABLE_PREFIX_CACHING:-0}
 export KVMEM_PLUGIN_CONFIG=/tmp/kvmem_plugin.json
 export KV_CONCURRENCY_EFFECTIVE_LEN="${KV_CONCURRENCY_EFFECTIVE_LEN:-32768}"
 exec ./launcher.sh \
-  --model-dir "${MODEL:-/home/srj/models/Coder390/FP8-fp8mtp}" \
+  --model-dir "${MODEL:-$HOME/models/Coder390/FP8-fp8mtp}" \
   --profile "${PROFILE:-2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env}" \
   --mode fast --gpu-devices 0,1 --tp-size 2 --pp-size 1 \
   --set MAX_MODEL_LEN=${MAX_MODEL_LEN:-32768} \
-  --set GPU_UTIL=${GPU_UTIL:-0.98} \
+  --set GPU_UTIL=${GPU_UTIL:-0.97} \
   --set MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-4096} \
   --set MAX_NUM_SEQS=${MAX_NUM_SEQS:-4} \
   --set SERVED_NAME=${SERVED_NAME:-KVMEM-SPARSE} \
-  --set CHAT_TEMPLATE_FILE="${CHAT_TEMPLATE_FILE:-/home/srj/models/Coder390/FP8/chat_template.jinja}" \
+  --set CHAT_TEMPLATE_FILE="${CHAT_TEMPLATE_FILE:-$HOME/models/Coder390/FP8/chat_template.jinja}" \
   --set MESSAGE_TYPE=${MESSAGE_TYPE:-text+image} \
   --set MM_IMAGE_LIMIT=${MM_IMAGE_LIMIT:-64} \
   --set SPECULATIVE_TOKENS=${SPECULATIVE_TOKENS:-4} \

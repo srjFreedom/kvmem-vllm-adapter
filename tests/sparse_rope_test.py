@@ -2,6 +2,7 @@
 # If delta-rotating K by d positions does not reproduce the engine's K at position p+d, the
 # sparse-compaction path would silently corrupt attention, so this is the gate for stage 3.
 import json
+import os
 import sys
 
 import torch
@@ -24,7 +25,10 @@ except Exception as exc:  # pragma: no cover
     print("SKIP: vLLM not importable:", exc)
     sys.exit(0)
 
-CONFIG = "/home/srj/models/Coder390/FP8-fp8mtp/config.json"
+CONFIG = os.environ.get("KVMEM_TEST_CONFIG", "")
+if not CONFIG or not os.path.exists(CONFIG):
+    print("SKIP: set KVMEM_TEST_CONFIG to a model config.json to run this test")
+    sys.exit(0)
 
 
 def check(cond, msg):

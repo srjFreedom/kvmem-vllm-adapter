@@ -12,8 +12,8 @@
 # ============================================================================
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
-VLLM_ROOT=${VLLM_ROOT:-/home/srj/vLLM-2080Ti-Definitive}
-KVMA_SRC=${KVMA_SRC:-/home/srj/src/kvmem-v018rc1}
+VLLM_ROOT=${VLLM_ROOT:-$HOME/vLLM-2080Ti-Definitive}
+KVMA_SRC=${KVMA_SRC:-$HOME/src/kvmem-v018rc1}
 PY=${PY:-"$VLLM_ROOT/.venv/bin/python"}
 PATCH="$ROOT/patches/qwen3-next-capture-q.patch"
 TARGET="$VLLM_ROOT/vllm/model_executor/models/qwen3_next.py"
@@ -95,8 +95,8 @@ cat <<'NEXT'
 
 [install] 完成。启动方式：
 
-  cp deploy/kvmem-vllm.service /etc/systemd/system/
-  cp deploy/run-current.example.sh /home/srj/run-current.sh   # 按需改参数
+  cp deploy/kvmem-vllm.service /etc/systemd/system/   # ExecStart 指向你的 start-*.sh
+  cp deploy/run-current.sh "$HOME/run-current.sh"   # 通用入口，参数放 start-*.sh
   sudo systemctl daemon-reload
   sudo systemctl enable --now kvmem-vllm
   scripts/wait_ready.sh 18200 900 --smoke

@@ -38,8 +38,8 @@ export SERVICE_SCOPE=${SERVICE_SCOPE:-lan}        # lan | local
 export THINKING_BUDGET=${THINKING_BUDGET:-}       # 空 = 思考 token 无上限
 
 # ---- 权重（任意 vLLM 支持的模型；换模型时这几项要一起改）----
-export MODEL=${MODEL:-/home/srj/models/Coder390/FP8-fp8mtp}
-export CHAT_TEMPLATE_FILE=${CHAT_TEMPLATE_FILE:-/home/srj/models/Coder390/FP8/chat_template.jinja}
+export MODEL=${MODEL:-$HOME/models/Coder390/FP8-fp8mtp}
+export CHAT_TEMPLATE_FILE=${CHAT_TEMPLATE_FILE:-$HOME/models/Coder390/FP8/chat_template.jinja}
 # PROFILE = 引擎档位（.env：量化/KV dtype/上下文/投机档），最终被 vLLM fork 的
 # launcher.sh 消费。worker.py 自己不解析它，但会 exec run-kvmem-sparse.sh(N=1)
 # 或 run-kvmem-4way.sh(N>1)，两者把 profile 喂给 launcher.sh。
@@ -52,7 +52,7 @@ export SERVED_NAME=${SERVED_NAME:-Qwen3.8-27B-Coder390-EfficientThink-FP8-MTP}
 export KVMEM_ENTRY_MODE=${KVMEM_ENTRY_MODE:-middleware}     # middleware | hook
 export KVMEM_ENTRY_SELECT=${KVMEM_ENTRY_SELECT:-retrieval}  # retrieval | recency
 export DISABLE_PREFIX_CACHING=${DISABLE_PREFIX_CACHING:-0}
-export KVMEM_UI_DIR=${KVMEM_UI_DIR:-/home/srj/local-model-console}
+export KVMEM_UI_DIR=${KVMEM_UI_DIR:-}                    # 留空 = 不挂静态 UI；指向你的 UI 目录则挂到 /
 # ---------------------------------------------------------------------------
 
 if [ "${DRYRUN:-0}" = "1" ]; then
@@ -61,4 +61,4 @@ if [ "${DRYRUN:-0}" = "1" ]; then
   exit 0
 fi
 
-exec /home/srj/run-current.sh
+exec "${RUN_CURRENT:-$HOME/run-current.sh}"

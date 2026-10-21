@@ -10,4 +10,6 @@
 #  覆盖方式见 docs/PARAMETERS.md；默认值见 run-kvmem-vllm.sh 里的 ${VAR:-default}。
 # ============================================================================
 set -uo pipefail
-exec /home/srj/run-kvmem-vllm.sh "$@"
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+RUN_IMPL=${RUN_IMPL:-$HERE/run-kvmem-vllm.sh}
+exec "$RUN_IMPL" "$@"

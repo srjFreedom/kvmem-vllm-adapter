@@ -1,5 +1,0 @@
-[vllm.endpoint_plugins]
-kvmem_entry = kvmem_entry_middleware:KvmemEntryPlugin
-
-[vllm.general_plugins]
-kvmem = vllm_kvmem_plugin:register

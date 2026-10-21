@@ -12,7 +12,11 @@ endif()
 # user's feb4742 checkout (the running llama.cpp KVMem) is left untouched.
 # kvmem-v018rc1 provides the NVMe disk tier (nvme_kv_tier.hpp) the disk layer needs; the older
 # adapter-base worktree predates it. The contract headers this adapter uses are unchanged.
-set(KVMEM_BASE "/home/srj/src/kvmem-v018rc1" CACHE PATH "kvmem worktree root")
+if(DEFINED ENV{KVMA_SRC} AND NOT KVMEM_BASE)
+  set(KVMEM_BASE "$ENV{KVMA_SRC}" CACHE PATH "kvmem worktree root")
+else()
+  set(KVMEM_BASE "$ENV{HOME}/src/kvmem-v018rc1" CACHE PATH "kvmem worktree root")
+endif()
 add_subdirectory(${KVMEM_BASE}/kvmem ${CMAKE_BINARY_DIR}/kvmem)
 
 # The async page pipeline (KVMEM_ASYNC_TRANSFER arm) needs the CUDA runtime for its transfer
@@ -34,13 +38,27 @@ add_test(NAME vllm_contract_test COMMAND vllm_contract_test)
 # ---------------------------------------------------------------------------
 # pybind11 extension, built against the vLLM serving venv's Python 3.12.
 # ---------------------------------------------------------------------------
-set(_VENV_PY "/home/srj/vLLM-2080Ti-Definitive/.venv/bin/python")
+if(DEFINED ENV{VLLM_PY})
+  set(_VENV_PY "$ENV{VLLM_PY}")
+else()
+  set(_VENV_PY "$ENV{HOME}/vLLM-2080Ti-Definitive/.venv/bin/python")
+endif()
 if(EXISTS "${_VENV_PY}")
   set(Python_EXECUTABLE "${_VENV_PY}" CACHE FILEPATH "venv python" FORCE)
   find_package(Python 3.12 REQUIRED COMPONENTS Interpreter Development.Module)
-  # pybind11's CMake config ships inside the venv's site-packages.
-  set(pybind11_DIR "/home/srj/vLLM-2080Ti-Definitive/.venv/lib/python3.12/site-packages/pybind11/share/cmake/pybind11"
-      CACHE PATH "" FORCE)
+  # pybind11's CMake config ships inside the venv's site-packages (derive from the venv python).
+  if(NOT DEFINED ENV{PYBIND11_DIR})
+    get_filename_component(_VENV_BIN "${_VENV_PY}" DIRECTORY)
+    get_filename_component(_VENV_ROOT "${_VENV_BIN}" DIRECTORY)
+    file(GLOB _PYBIND11_CFG "${_VENV_ROOT}/lib/python3.*/site-packages/pybind11/share/cmake/pybind11")
+    list(LENGTH _PYBIND11_CFG _PYBIND11_N)
+    if(_PYBIND11_N GREATER 0)
+      list(GET _PYBIND11_CFG 0 pybind11_DIR)
+    endif()
+  else()
+    set(pybind11_DIR "$ENV{PYBIND11_DIR}")
+  endif()
+  set(pybind11_DIR "${pybind11_DIR}" CACHE PATH "" FORCE)
   find_package(pybind11 CONFIG REQUIRED)
   pybind11_add_module(vllm_kvmem_ext MODULE src/vllm_kvmem_ext.cpp)
   target_link_libraries(vllm_kvmem_ext PRIVATE vllm_kvmem)

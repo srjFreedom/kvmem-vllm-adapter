@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 DEFAULTS = {
@@ -146,7 +147,9 @@ def main(argv=None) -> int:
     path = "/tmp/kvmem_plugin.json"
     with open(path, "w") as fh:
         json.dump(cfg, fh)
-    script = "/home/srj/run-kvmem-4way.sh" if a.max_num_seqs > 1 else "/home/srj/run-kvmem-sparse.sh"
+    adapter = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = os.environ.get("KVMEM_LAUNCH_SCRIPT") or os.path.join(
+        adapter, "deploy", "run-kvmem-4way.sh" if a.max_num_seqs > 1 else "run-kvmem-sparse.sh")
     print(f"[kvmem-vllm-worker] backend=vllm port={a.port} budget={a.kvmem_budget} "
           f"R={a.kvmem_gen_reserve} sink={a.kvmem_sink_tokens} recent={a.kvmem_recent_tokens} "
           f"sessions={a.kvmem_sessions} H={a.kvmem_host_mib}MiB block={cfg['select_block_tokens']}")

@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
-# Thin wrapper: the maintained implementation lives in the adapter repo.
-exec /home/srj/vllm-kvmem-adapter/scripts/wait_ready.sh "$@"
+# Thin wrapper: implementation lives in <repo>/scripts/wait_ready.sh.
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+exec "$HERE/../scripts/wait_ready.sh" "$@"

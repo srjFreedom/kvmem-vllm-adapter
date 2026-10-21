@@ -27,7 +27,7 @@ while (($#)); do
 done
 
 : "${SMOKE:=0}"
-LOG_DIR=${LOG_DIR:-/home/srj/vLLM-2080Ti-Definitive/run-logs}
+LOG_DIR=${LOG_DIR:-${VLLM_ROOT:-$HOME/vLLM-2080Ti-Definitive}/run-logs}
 [ -n "$LOG" ] || LOG=$(ls -t "$LOG_DIR"/*.log 2>/dev/null | head -1)
 
 FAIL_PATTERN='initialization failed|Address already in use|Engine core initialization failed|To serve at least one request|Traceback (most recent call last)|IndentationError|NameError'

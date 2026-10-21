@@ -6,8 +6,9 @@
 #   usage: scripts/ensure_engine.sh [port]      -> prints REUSE or RESTART
 set -u
 PORT=${1:-8001}
-ADAPTER=/home/srj/vllm-kvmem-adapter
-LAUNCH=/home/srj/run-kvmem-sparse.sh
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ADAPTER=${ADAPTER:-$(cd "$HERE/.." && pwd)}
+LAUNCH=${LAUNCH:-$HOME/run-kvmem-sparse.sh}
 CFG=/tmp/kvmem_plugin.json
 LOG=/tmp/sparse_server.log
 
@@ -17,7 +18,7 @@ if [[ "$health" != "200" ]]; then
 fi
 
 # The engine's start time comes from the pid file the launcher writes.
-pidfile=$(ls -t /home/srj/vLLM-2080Ti-Definitive/run-logs/*.pid 2>/dev/null | head -1)
+pidfile=$(ls -t "${VLLM_ROOT:-$HOME/vLLM-2080Ti-Definitive}"/run-logs/*.pid 2>/dev/null | head -1)
 started=0
 if [[ -n "$pidfile" ]]; then
   started=$(stat -c %Y "$pidfile" 2>/dev/null || echo 0)

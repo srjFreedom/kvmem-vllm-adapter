@@ -2,7 +2,7 @@
   "enabled": true,
   "probe_log": "/tmp/kvmem_probe.jsonl",
   "sparse": true,
-  "adapter_root": "/home/srj/vllm-kvmem-adapter",
+  "adapter_root": "",
   "budget_tokens": 32768,
   "gen_reserve_tokens": 16384,
   "sink_tokens": 8192,

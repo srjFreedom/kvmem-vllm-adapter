@@ -1,8 +1,11 @@
 [Unit]
 Description=KVMem (vLLM SM75 fork backend, 2x RTX 2080 Ti); entry policy runs in-process, kvmem official port 18200
-Documentation=file:///home/srj/vllm-kvmem-adapter/README.md
-After=network-online.target nvidia-power-limit.service
-Wants=network-online.target nvidia-power-limit.service
+Documentation=file://%h/vllm-kvmem-adapter/README.md
+After=network-online.target
+Wants=network-online.target
+# 若你有 nvidia-power-limit.service（限功耗），按需加回：
+# After=nvidia-power-limit.service
+# Wants=nvidia-power-limit.service
 StartLimitIntervalSec=600
 StartLimitBurst=5
 
@@ -10,18 +13,19 @@ StartLimitBurst=5
 # Type=forking 的原因：vLLM 的 launcher.sh 会把引擎 setsid 到自己的会话里（父进程随后退出），
 # 所以不能像 kvmem.service / kvmem-ninfer.service 那样用 Type=simple（那样单元会立刻变成 inactive）。
 # 这里用 forking + PIDFile 跟踪真正的 api_server 进程。
-PIDFile=/home/srj/kvmem-vllm.pid
-User=srj
-Group=srj
-WorkingDirectory=/home/srj
-Environment=HOME=/home/srj
+PIDFile=%h/kvmem-vllm.pid
+# User/Group 默认不写 = 以 root 运行；建议改成你的账号（或本机装成 systemd --user 单元）：
+#User=srj
+#Group=srj
+WorkingDirectory=%h
+Environment=HOME=%h
 Environment=MALLOC_ARENA_MAX=2
 # 覆盖项示例（改这些不必动 unit）：
 # 参数写在 start-*.sh 里，不要写在这里（保持通用性）
 # 入口策略（进程内中间件）随之派生，不需要单独配置：
 # Environment=KVMEM_ENTRY_SELECT=retrieval KVMEM_ENTRY_HISTORY_KIB=64
 # 指向你选定的站点配置脚本（start-*.sh），换配置就是换这一行
-ExecStart=/home/srj/start-kvmem-vllm.sh
+ExecStart=%h/start-kvmem-vllm.sh
 TimeoutStartSec=900
 TimeoutStopSec=120
 Restart=on-failure

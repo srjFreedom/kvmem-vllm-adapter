@@ -14,7 +14,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-PY=/home/srj/vLLM-2080Ti-Definitive/.venv/bin/python
+PY=${VLLM_PY:-${VLLM_ROOT:-$HOME/vLLM-2080Ti-Definitive}/.venv/bin/python}
 
 # Refuse to run if the serving vLLM still holds the GPUs (it would OOM or deadlock).
 if nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | grep -q .; then

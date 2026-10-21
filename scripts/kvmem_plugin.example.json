@@ -2,7 +2,7 @@
   "enabled": true,
   "probe_log": "/tmp/kvmem_probe.jsonl",
   "smoke_log": "/tmp/kvmem_smoke.jsonl",
-  "adapter_root": "/home/srj/vllm-kvmem-adapter",
+  "adapter_root": "",
   "session_id": 1,
   "pool_bytes": 1073741824,
   "resident_tokens": 3232,

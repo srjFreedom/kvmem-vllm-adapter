@@ -16,8 +16,9 @@ import re
 import subprocess
 import sys
 
-VLLM_DEFAULT = "/home/srj/vLLM-2080Ti-Definitive"
-KVMEM_DEFAULT = "/home/srj/src/kvmem-v018rc1"
+HOME_DIR = os.path.expanduser("~")
+VLLM_DEFAULT = os.environ.get("VLLM_ROOT") or os.path.join(HOME_DIR, "vLLM-2080Ti-Definitive")
+KVMEM_DEFAULT = os.environ.get("KVMA_SRC") or os.path.join(HOME_DIR, "src", "kvmem-v018rc1")
 
 results = []
 

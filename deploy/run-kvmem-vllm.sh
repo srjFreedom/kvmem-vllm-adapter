@@ -11,7 +11,12 @@
 #   覆盖：B= R= SINK= RECENT= SESSIONS= HOST_MIB= N= CTX= PORT= ./本脚本
 # ============================================================================
 set -uo pipefail
-LOG=${LOG:-/home/srj/kvmem.log}
+LOG=${LOG:-$HOME/kvmem.log}
+# 适配器仓库位置：脚本在仓库里就用脚本目录；在 ~/ 下的旧式布局则用 ~/vllm-kvmem-adapter。
+_SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+if [ -d "$_SELF_DIR/backends/vllm" ]; then _ADAPTER_DEFAULT="$_SELF_DIR"
+elif [ -d "$_SELF_DIR/vllm-kvmem-adapter/backends/vllm" ]; then _ADAPTER_DEFAULT="$_SELF_DIR/vllm-kvmem-adapter"
+else _ADAPTER_DEFAULT="$HOME/vllm-kvmem-adapter"; fi
 PORT=${PORT:-18200}
 B=${B:-36864}
 R=${R:-16384}
@@ -23,14 +28,14 @@ N=${N:-1}
 CTX=${CTX:-524288}
 # 检索用的 query 捕获窗口（KVMem query_max_tokens 的官方默认是 512）
 CAPTURE_TOKENS=${CAPTURE_TOKENS:-512}
-MODEL=${MODEL:-/home/srj/models/Coder390/FP8-fp8mtp}
+MODEL=${MODEL:-$HOME/models/Coder390/FP8-fp8mtp}   # 示例权重目录，换模型用 start-*.sh 覆盖
 # 对外模型 id：按实际权重命名（FP8 + MTP）。实际加载的是
-# /home/srj/models/Coder390/FP8-fp8mtp，不是 llama.cpp 的 Q6_K GGUF，也不是 ninfer 的 .ninfer。
+# $HOME/models/Coder390/FP8-fp8mtp，不是 llama.cpp 的 Q6_K GGUF，也不是 ninfer 的 .ninfer。
 SERVED_NAME=${SERVED_NAME:-Qwen3.8-27B-Coder390-EfficientThink-FP8-MTP}
 
-ADAPTER=${ADAPTER:-/home/srj/vllm-kvmem-adapter}
-KV_PIDFILE=${KV_PIDFILE:-/home/srj/kvmem-vllm.pid}
-PARAMS_FILE=${PARAMS_FILE:-/home/srj/kvmem-params.env}
+ADAPTER=${ADAPTER:-$_ADAPTER_DEFAULT}
+KV_PIDFILE=${KV_PIDFILE:-$HOME/kvmem-vllm.pid}
+PARAMS_FILE=${PARAMS_FILE:-$HOME/kvmem-params.env}
 
 # DRYRUN=1：只打印将要执行的启动命令，绝不清理进程、绝不启动引擎。
 # 必须在任何副作用之前（早前把它放在清理之后，DRYRUN 直接把运行中的引擎杀了）。
@@ -78,7 +83,7 @@ printf 'CTX=%s\nB=%s\nR=%s\nSINK=%s\nRECENT=%s\nSESSIONS=%s\nHOST_MIB=%s\nN=%s\n
   "$CTX" "$B" "$R" "$SINK" "$RECENT" "$SESSIONS" "$HOST_MIB" "$N" "$PORT" "$CAPTURE_TOKENS" > "$PARAMS_FILE"
 
 RUN=(env MAX_NUM_SEQS="$N" \
-  /home/srj/vLLM-2080Ti-Definitive/.venv/bin/python \
+  ${VLLM_PY:-${VLLM_ROOT:-$HOME/vLLM-2080Ti-Definitive}/.venv/bin/python} \
   "$ADAPTER/backends/vllm/worker.py" \
     --model "$MODEL" --port "$PORT" --served-name "$SERVED_NAME" \
     --tensor-parallel-size 2 --max-num-seqs "$N" \

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # ============================================================================
 # KVMem 入口网关：选 B、把 max_tokens 定到 R、H/D 分层缓存历史块
-#   日志固定写到 /home/srj/kvmem-gateway.log
+#   日志固定写到 ~/kvmem-gateway.log
 # ============================================================================
 set -uo pipefail
-LOG=${LOG:-/home/srj/kvmem-gateway.log}
+LOG=${LOG:-$HOME/kvmem-gateway.log}
 HOST=${HOST:-0.0.0.0}          # 与引擎一致：局域网可访问；只本机用 127.0.0.1
 UPSTREAM=${UPSTREAM:-http://127.0.0.1:8001}
 PORT=${PORT:-8100}
-[ -f /home/srj/kvmem-params.env ] && . /home/srj/kvmem-params.env
+[ -f "$HOME/kvmem-params.env" ] && . "$HOME/kvmem-params.env"
 CTX=${CTX:-524288}
 B=${B:-65536}
 R=${R:-32768}
@@ -27,8 +27,9 @@ fi
   echo "listen=$HOST:$PORT  CTX=$CTX B=$B R=$R sink=$SINK recent=$RECENT select=$SELECT"
         echo "history cache: H=${HIST_KIB}KiB D=${HIST_DISK_MIB}MiB"
 } >> "$LOG"
-GW=(/home/srj/vLLM-2080Ti-Definitive/.venv/bin/python \
-  /home/srj/vllm-kvmem-adapter/scripts/kvmem_gateway.py \
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+GW=("${VLLM_PY:-${VLLM_ROOT:-$HOME/vLLM-2080Ti-Definitive}/.venv/bin/python}" \
+  "$HERE/../scripts/kvmem_gateway.py" \
     --host "$HOST" --upstream "$UPSTREAM" --port "$PORT" \
     --kvmem-ctx "$CTX" --kvmem-budget "$B" --kvmem-gen-reserve "$R" \
     --kvmem-sink-tokens "$SINK" --kvmem-recent-tokens "$RECENT" \
