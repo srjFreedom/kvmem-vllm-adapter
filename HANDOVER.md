@@ -86,7 +86,7 @@
   --kvmem-host-mib 16384 --kvmem-sessions 4 --no-kvmem-lrfu --max-model-len 204800
 
 # 4 并发
-bash run-kvmem-4way.sh --port 8002
+bash deploy/run-kvmem-engine.sh --port 8002
 
 # 全套 CPU 回归
 for t in tests/*_test.py; do .venv/bin/python "$t" | tail -1; done

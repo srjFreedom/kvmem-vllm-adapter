@@ -81,11 +81,10 @@ def main(argv=None) -> int:
                   "(KVMEM_CAPTURE=1)")
     env["ADDITIONAL_CONFIG_JSON"] = payload
     env["KVMEM_PLUGIN_CONFIG"] = ""          # no side-channel file
-    # Launcher scripts ship with the adapter (deploy/), so no site-specific absolute paths are needed.
-    # KVMEM_LAUNCH_SCRIPT overrides both for site-specific launchers.
+    # One launcher ships with the adapter (deploy/): concurrency N and the engine window travel as
+    # --set values, so a single script serves any N. KVMEM_LAUNCH_SCRIPT overrides it.
     script = os.environ.get("KVMEM_LAUNCH_SCRIPT") or os.path.join(
-        ADAPTER, "deploy",
-        "run-kvmem-4way.sh" if ns.max_num_seqs > 1 else "run-kvmem-sparse.sh")
+        ADAPTER, "deploy", "run-kvmem-engine.sh")
     print(f"[kvmem backends/vllm] port={ns.port} budget={ns.kvmem_budget} "
           f"R={ns.kvmem_gen_reserve} sink={ns.kvmem_sink_tokens} "
           f"recent={ns.kvmem_recent_tokens} sessions={ns.kvmem_sessions} "
@@ -114,7 +113,7 @@ def main(argv=None) -> int:
               f"({ns.kvmem_budget} + {ns.kvmem_gen_reserve}) = {_wanted}")
         ns.max_model_len = _wanted
     if _wanted:
-        # Always explicit: `run-kvmem-4way.sh` pins MAX_MODEL_LEN=32768 and would reject any prompt
+        # Always explicit: the launcher's default MAX_MODEL_LEN (32768) would reject any prompt
         # above that, which is exactly the long-context concurrency case.
         args += ["--set", f"MAX_MODEL_LEN={_wanted}"]
         env["MAX_MODEL_LEN"] = str(_wanted)

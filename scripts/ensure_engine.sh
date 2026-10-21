@@ -8,7 +8,7 @@ set -u
 PORT=${1:-8001}
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 ADAPTER=${ADAPTER:-$(cd "$HERE/.." && pwd)}
-LAUNCH=${LAUNCH:-$HOME/run-kvmem-sparse.sh}
+LAUNCH=${LAUNCH:-$ADAPTER/deploy/run-kvmem-engine.sh}
 CFG=/tmp/kvmem_plugin.json
 LOG=/tmp/sparse_server.log
 
