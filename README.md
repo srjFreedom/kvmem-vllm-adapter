@@ -1,84 +1,92 @@
-# KVMem × vLLM (SM75, TP=2) — 单服务集成
+# KVMem × vLLM (SM75, TP=2) — single-service integration
 
-把 [kvmem](https://github.com/kvmem/kvmem) 的策略层接到 vLLM（weicj 的 SM75 fork）上：
-**一个服务、一个端口（18200）**，OpenAI 兼容 API、指标和 Web UI 同源；vLLM 仍是引擎，
-kvmem 决定"每次发多少历史、KV 留在哪一层"。
+**English** | [中文](README_zh-CN.md)
+
+Plugs [kvmem](https://github.com/kvmem/kvmem)'s policy layer into vLLM (the weicj SM75 fork):
+**one service, one port (18200)** serving the OpenAI-compatible API, metrics and a web UI from the
+same origin. vLLM stays the engine; kvmem decides how much history is sent and which KV stays
+resident.
 
 ```
-客户端 ──▶ :18200 ┬─ /v1/*        OpenAI 兼容 API
-                   ├─ /metrics     引擎指标
-                   ├─ /docs        OpenAPI
-                   └─ /            静态 UI（可换）
+client ──▶ :18200 ┬─ /v1/*        OpenAI-compatible API
+                  ├─ /metrics     engine metrics
+                  ├─ /docs        OpenAPI
+                  └─ /            static UI (swappable)
 ```
 
-## 现在的架构
+## Architecture
 
-**引擎侧（vLLM 进程内）**
+**Engine side (inside the vLLM processes)**
 
-| 组件 | 作用 |
+| Component | Role |
 |---|---|
-| `plugin/vllm_kvmem_plugin.py` | `vllm.general_plugins` 入口：探针、runner 钩子、稀疏运行时接线；所有进程加载 |
-| `src/kvmem_sparse_runtime.py` + `kvmem_sparse_orchestrator.py` | 按页的 H（主机内存）/D（磁盘）分层、LRFU 淘汰、mean-K 检索 |
-| `src/vllm_kvmem_ext.cpp` | 原生扩展（链接 kvmem 库），暴露 `VllmMemoryBackend` / `NvmeKvTier` / 检索索引 |
+| `plugin/vllm_kvmem_plugin.py` | `vllm.general_plugins` entry: probe, runner hooks, sparse-runtime wiring; loaded in every process |
+| `src/kvmem_sparse_runtime.py` + `kvmem_sparse_orchestrator.py` | per-page H (host RAM) / D (disk) tiering, LRFU eviction, mean-K retrieval |
+| `src/vllm_kvmem_ext.cpp` | native extension (links the kvmem library): `VllmMemoryBackend`, `NvmeKvTier`, retrieval index |
 
-**入口侧（同一进程，官方 `vllm.endpoint_plugins` 扩展点）**
+**Entry side (same process, official `vllm.endpoint_plugins` extension point)**
 
-| 组件 | 作用 |
+| Component | Role |
 |---|---|
-| `plugin/kvmem_entry_middleware.py` → `KvmemEntryPlugin` | `attach_router`：装中间件 + 挂 UI |
-| 中间件（默认 `mode=middleware`）| 标准 Starlette body 改写（`request._body` 缓存）：按 B 选历史、`max_tokens` 夹到 R、CTX 上限、H/D 历史块缓存 |
-| `mode=hook`（兜底）| 包装 `OpenAIServingChat.create_chat_completion`，在已解析请求上应用同一策略 |
-| `src/kvmem_entry_policy.py` | 两个模式共用的唯一策略实现 |
+| `plugin/kvmem_entry_middleware.py` → `KvmemEntryPlugin` | `attach_router`: installs the middleware and mounts the UI |
+| middleware (default `mode=middleware`) | standard Starlette body rewrite through the `request._body` cache: select history to B, clamp `max_tokens` to R, enforce CTX, H/D history-block cache |
+| `mode=hook` (fallback) | wraps `OpenAIServingChat.create_chat_completion` and applies the same policy to the parsed request |
+| `src/kvmem_entry_policy.py` | the single policy implementation both modes share |
 
-响应侧完全不干预，所以**流式、CORS、错误处理都是 vLLM 原生行为**。
+The response path is never touched, so **streaming, CORS and error handling are vLLM's own**.
 
-### 为什么选片放在入口
+### Why selection happens at the entry
 
-vLLM 用逻辑位置索引 KV 块，且假定序列长度单调增长：中途截断会让调度器失步（实测
-`num_scheduled_tokens >= num_logits` 断言，关掉投机后变成挂起）。所以 kvmem 的"只保留 B"
-必须在**请求进入引擎之前**决定；引擎内则用 kvmem 自己的按页策略（`prepare_reselect`）。
+vLLM indexes KV blocks by logical position and assumes a monotonically growing sequence: truncating
+mid-request desynchronises its scheduler (measured: the `num_scheduled_tokens >= num_logits` assertion,
+then a hang once speculative decoding is off). kvmem's "keep only B" therefore has to be decided
+**before the request reaches the engine**; inside the engine, kvmem's own per-page policy
+(`prepare_reselect`) does the rest.
 
-### 检索 query 怎么来
+### Where the retrieval query comes from
 
-`torch.ops.kvmem.capture_q` 在注意力层捕获**真实的前一步 pre-RoPE Q**（默认最近 512 个 token，
-`CAPTURE_TOKENS`），kvmem 用它和页内 mean-K 做打分；LRFU 负责历史衰减。参考后端
-（llama.cpp / ninfer）用的是"最后一条 user 消息的 token span"，两者都在用模型内部表示，
-差别只是取哪些 token。
+`torch.ops.kvmem.capture_q` captures the **real pre-RoPE Q** of the current step inside the attention
+layer (last 512 tokens by default, `CAPTURE_TOKENS`); kvmem scores pages against it with mean-K, and
+LRFU decays history. The reference backends (llama.cpp / ninfer) use the token span of the last user
+message instead — both rely on model-internal representations, they only differ in which tokens they
+aggregate.
 
-## 快速开始
+## Quick start
 
-依赖三样外部件，仓库本身不含（`backends/versions.json` 固定版本）：
+Three external pieces are required and are not vendored (`backends/versions.json` pins them):
 
-| 外部件 | 固定版本 | 获取方式 |
+| Piece | Pinned version | How it is obtained |
 |---|---|---|
-| vLLM SM75 fork | `93c9013e375b` + 集成补丁 | `install.sh` 拉取并打补丁（校验 `patched_tree`）|
-| kvmem 源码 | tag `v0.18.0` | 同上（编译原生扩展要头文件与库）|
-| 模型权重 | 任意 FP8 + MTP 导出 | 自己放，改 `MODEL` |
+| vLLM SM75 fork | `93c9013e375b` + integration patch | `install.sh` fetches it and applies the patch (verifies `patched_tree`) |
+| kvmem sources | tag `v0.18.0` | same (the native extension needs its headers and library) |
+| Model weights | any FP8 + MTP export | you provide it; point `MODEL` at it |
 
 ```bash
 git clone https://github.com/srjFreedom/kvmem-vllm-adapter
 cd kvmem-vllm-adapter
 
-USE_LOCAL_FORK=0 ./install.sh            # 拉引擎 → 打补丁 → 装插件 → 编扩展 → 自检
-ENGINE=$PWD/engines/vllm ./scripts/setup-venv.sh   # torch / CUDA（几个 GB，已有 venv 可跳过）
+USE_LOCAL_FORK=0 ./install.sh            # fetch engines → patch → plugin → extension → self-check
+ENGINE=$PWD/engines/vllm ./scripts/setup-venv.sh   # torch / CUDA (several GB; skip if you have a venv)
 
 cp deploy/kvmem-vllm.service /etc/systemd/system/
-cp deploy/run-current.example.sh /home/srj/run-current.sh   # 参数都在这里改
+cp deploy/run-current.example.sh /home/srj/run-current.sh   # all knobs live here
 sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
 scripts/wait_ready.sh 18200 900 --smoke
 ```
 
-已有环境时只需一步（跳过拉取与 venv）：
+Already have the environment? One command (skips fetching and the venv):
 
 ```bash
 VLLM_ROOT=/path/to/fork KVMA_SRC=/path/to/kvmem PY=/path/to/venv/bin/python ./install.sh
 ```
 
-**不可避免的三步**（属于本仓库的代码，任何环境都要做）：打补丁、装插件、编原生扩展。
+**The three steps that are never skippable** (they are this repository's own code): apply the patch,
+install the plugin, build the native extension.
 
-## 配置
+## Configuration
 
-所有运行时参数集中在 `run-current.sh`，完整说明见 **[docs/PARAMETERS.md](docs/PARAMETERS.md)**。
+Every runtime knob lives in `run-current.sh`; the full reference is
+**[docs/PARAMETERS.md](docs/PARAMETERS.md)** (Chinese).
 
 ```bash
 B=65536 R=32768 CTX=524288 SINK=8192 RECENT=2048 N=2 PORT=18200
@@ -89,79 +97,85 @@ PROFILE=2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env
 KVMEM_UI_DIR=/home/srj/local-model-console
 ```
 
-关键约束：**引擎窗口 = `N × (B + R)` 必须装进 KV 池**（本机 210,651 token）。
-当前 `N=2, B+R=98,304` → 窗口 196,608，刚好；`N=4` 需要把 B 降到约 26K。
+The constraint that bites: **engine window = `N × (B + R)` must fit the KV pool** (210,651 tokens on
+this box). With `N=2, B+R=98,304` the window is 196,608 — just enough; `N=4` needs B near 26K.
 
-改完 `sudo systemctl restart kvmem-vllm` 生效（无热改），`kvmem-params.env` 记录本次生效值。
+Changes take effect on `sudo systemctl restart kvmem-vllm` (no hot reload); `kvmem-params.env`
+records what is actually in force.
 
-## 运维
+## Operations
 
 ```bash
 sudo systemctl start|stop|restart kvmem-vllm
-tail -f /home/srj/kvmem.log          # 引擎 + 入口策略同一份日志
-cat /home/srj/kvmem-params.env       # 本次生效参数
-curl -s localhost:18200/health       # 健康
-curl -s localhost:18200/metrics      # vllm:* 指标（prefill/decode/KV 使用率）
+tail -f /home/srj/kvmem.log          # engine and entry policy in one log
+cat /home/srj/kvmem-params.env       # effective parameters
+curl -s localhost:18200/health       # health
+curl -s localhost:18200/metrics      # vllm:* metrics (prefill/decode/KV usage)
 ```
 
-入口策略可在日志里看到：`kvmem entry: {"kind":"entry_rewrite",...}`（含 `gen_budget`、
-`prompt_selected` 的块数与字符数）。
+Entry decisions are logged as `kvmem entry: {"kind":"entry_rewrite",...}` (with `gen_budget` and the
+block/character counts of `prompt_selected`).
 
-## 实测（当前配置：N=2，B/R=65536/32768，CAPTURE=512）
+## Measured (current config: N=2, B/R=65536/32768, CAPTURE=512)
 
-| 项目 | 结果 |
+| Item | Result |
 |---|---|
-| 逻辑上下文 | 486,605 token 历史 → `prompt_tokens=89,066`，两个埋针全中（106 s）|
-| R 契约 | `max_tokens=100000` → `applied=32768`（只写 `max_completion_tokens`）|
-| CTX | 747,614 token → `400 history is ~747614 tokens, above kvmem CTX=524288` |
-| 流式 | 30 个 SSE 事件，首 0.07 s、末 1.43 s，时刻单调 |
-| 端口 | 只有 `0.0.0.0:18200`，无旁挂进程 |
-| prefill | 65.2K prompt：70 s ≈ **934 tok/s**；98.8K：713 tok/s；2 路并发聚合 477 tok/s |
-| decode | 小 prompt 生成 512 token ≈ **59 tok/s** |
-| 前缀复用 | 同前缀第二轮 `cached=63,024/65,890` |
+| Logical context | 486,605-token history → `prompt_tokens=89,066`, both needles found (106 s) |
+| R contract | `max_tokens=100000` → `applied=32768` (only `max_completion_tokens` written) |
+| CTX | 747,614 tokens → `400 history is ~747614 tokens, above kvmem CTX=524288` |
+| Streaming | 30 SSE events, first at 0.07 s, last at 1.43 s, monotonic |
+| Ports | only `0.0.0.0:18200`; no sidecar process |
+| Prefill | 65.2K prompt: 70 s ≈ **934 tok/s**; 98.8K: 713 tok/s; two concurrent streams: 477 tok/s aggregate |
+| Decode | 512 tokens from a small prompt ≈ **59 tok/s** |
+| Prefix reuse | second identical prefix: `cached=63,024/65,890` |
 
-长上下文耗时**几乎全是 prefill**；并发不提升吞吐（TP=2 已用满两张卡）。
+Long-context wall time is almost entirely prefill; concurrency does not add throughput (TP=2 already
+uses both GPUs).
 
-## 测试与探针
+## Tests and probe
 
 ```bash
 PY=/home/srj/vLLM-2080Ti-Definitive/.venv/bin/python
-for t in tests/*_test.py; do PYTHONPATH="build/python:src:plugin" $PY "$t"; done   # 39 个，全 PASS
-python3 scripts/check_integration_surface.py        # 28/28 个 vLLM/kvmem 接触点
-./run-gpu-tests.sh                                  # GPU 模式（需先停服务）
+for t in tests/*_test.py; do PYTHONPATH="build/python:src:plugin" $PY "$t"; done   # 39, all PASS
+python3 scripts/check_integration_surface.py        # 28/28 vLLM/kvmem touch points
+./run-gpu-tests.sh                                  # GPU mode (stop the service first)
 ```
 
-## 仓库结构
+## Repository layout
 
 ```
-backends/vllm/worker.py     vLLM 后端的启动包装（窗口 N×(B+R)、参数转发）
-plugin/                     general 插件 + endpoint 插件（入口策略、UI 挂载）
-src/                        入口策略、文本选片、H/D 缓存、稀疏运行时、原生扩展源码
-scripts/                    worker、wait_ready、prepare-backends、setup-venv、探针
-tests/                      39 个测试（非 GPU 全通过）
-deploy/                     systemd 单元、run-current 模板、启动脚本
-backends/versions.json      引擎固定版本 + 补丁 sha256 + patched_tree
-backends/patches/           vLLM 侧全部改动（17 文件 / 612 行）
-docs/PARAMETERS.md          每个参数的含义、约束与影响
-STATUS.md                   每次决策背后的实测数据
-INTEGRATION-SURFACE.md      vLLM 接触点清单与源码改动登记
+backends/vllm/worker.py     launcher wrapper (window N×(B+R), parameter plumbing)
+plugin/                     general plugin + endpoint plugin (entry policy, UI mount)
+src/                        entry policy, text selection, H/D cache, sparse runtime, native ext
+scripts/                    worker, wait_ready, prepare-backends, setup-venv, probe
+tests/                      39 tests (all non-GPU ones pass)
+deploy/                     systemd unit, run-current template, launch scripts
+backends/versions.json      pinned engine versions + patch sha256 + patched_tree
+backends/patches/           every vLLM-side change (17 files / 612 lines)
+docs/PARAMETERS.md          each knob, its constraint and its effect
+STATUS.md                   internal decision log with the measurements behind each choice
+INTEGRATION-SURFACE.md      touch-point list and source-change registry
 ```
 
-## 已知限制
+## Known limitations
 
-- **入口文本选片是代偿路径**（vLLM 不能中途截断 KV），不是 kvmem 的策略本身；历史与问题挤在
-  同一条消息时仍用"末尾段落"启发式，问题很长且主题在前段时可能丢块
-- **不支持 in-request compaction**（R 满后继续到 budget）：vLLM 单调长度假设，实测断言/挂起；
-  上游也是实验性默认关
-- `SESSIONS` 的语义是**把 H 平分给活请求**；请求结束即释放，不等同于参考后端的"保留 N 个非活跃历史"
-- 未实现参考后端的三级磁盘/会话冷存（`nvme-gb`、`session-cache-dir`）与 NVMe 页级存储
-- UI 的"停止生成"等用法依赖 llama.cpp/ninfer 的服务端扩展接口（`/v1/chat/completions/control`、
-  `/v1/stream`、`/slots`），vLLM 没有，会 404
+- **Entry-side text selection is a stopgap** (vLLM cannot truncate KV mid-request), not kvmem's own
+  policy; when history and question share one message the trailing-paragraph heuristic is used, so a
+  very long question whose topic sits in an earlier paragraph may lose blocks
+- **No in-request compaction** (continue past R into the budget): vLLM's monotonic-length assumption
+  makes it assert or hang; upstream also has it experimental and off by default
+- `SESSIONS` splits the H pool across **live** requests; a finished request releases its share, which
+  is not the reference backends' "retain N inactive histories"
+- No tiered disk / session cold store (`nvme-gb`, `session-cache-dir`) and no NVMe page tier
+- UI features that rely on llama.cpp/ninfer server extensions (`/v1/chat/completions/control`,
+  `/v1/stream`, `/slots`) return 404 here
 
-## 版本固定与集成面
+## Pinning and integration surface
 
-引擎源码不 vendored：`scripts/prepare-backends.py` 按 `backends/versions.json` 拉取固定
-commit/tag，应用 `backends/patches/vllm-kvmem.patch`，再用 `patched_tree` 校验结果与产线一致
-（kvmem 官方对 llama.cpp / ninfer 用的也是这套「固定版本 + 整份集成补丁」布局）。
+Engine sources are not vendored: `scripts/prepare-backends.py` fetches the pinned commit/tag from
+`backends/versions.json`, applies `backends/patches/vllm-kvmem.patch`, then verifies the resulting
+`patched_tree` so a fresh clone reproduces the deployed sources byte for byte — the same layout kvmem
+uses for its llama.cpp and ninfer backends.
 
-vLLM 侧的接触点、每处改动的作用与行数见 [INTEGRATION-SURFACE.md](INTEGRATION-SURFACE.md)。
+Every vLLM touch point, what each change does and how many lines it costs:
+[INTEGRATION-SURFACE.md](INTEGRATION-SURFACE.md).
