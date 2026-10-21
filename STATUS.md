@@ -1070,3 +1070,23 @@ worker `--kvmem-capture-tokens`、启动脚本 `CAPTURE_TOKENS=`、落盘 `kvmem
 **当前阻塞**：压缩边界处仍有一个 token 的 KV/位置不一致（表现为数字某一位错/多一位）。
 下一步应做逐步对账（重选后逐 token 比对引擎 `num_tokens`、运行时 `seq_len`、行内容与
 `_all_token_ids` 的实际切片），而不是继续猜。
+
+### Route A 第三轮（同日晚）：机制验证成立，跨请求状态待修
+
+**重要方法论教训**：引擎端口一开就跑请求，会撞上启动/图捕获阶段（实测第一条请求输出退化成
+"Write"），误判为压缩 bug。必须等预热请求（`_warmup_*`）结束后再测。
+
+**已经验证成立**（B=53248、R=2048、MTP 开、单请求）：
+- 长生成 5080 token、两次 R 节拍重选（tok 2100 / 4150，可见集 2100→4150），
+  1693/1694 行 LEMON 完整无错、唯一异常是 max_tokens 截断的半个词
+- `compact_applied` 在引擎侧真实生效（`_all_token_ids` 截断 + `num_computed` 回退）
+
+**仍未通过**：同一引擎上后续请求开始输出乱码（混入 `<|box_end|>` 与随机多语种 token）。
+首个请求干净、后续退化 → 跨请求的设备槽/页状态泄漏。已修其中一处：
+`release()` 只清 `_owned_slots` 没清 `_slot_owner`，死请求的槽永远不可复用。
+另发现 `_take_slots(req, budget_pages()+1)` 一次预留整个预算（B=53248 → 3329 页），
+单请求看似无碍，多请求时必然耗尽/冲突，下一轮要改成「按选中页数按需取槽」。
+
+本轮其余修复：规划器按排名裁到预算内；V2 runner 补 `prepare_inputs` 视图安装；
+positions 基准改为 `seq_len - n`；压缩只在 decode 步触发；槽位从池顶向下分配；
+新增 KVMEM_NO_ROW/NO_SEQ/NO_POS 活体隔离开关。

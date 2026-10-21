@@ -218,7 +218,12 @@ class VllmSparseRuntime:
         orch = self._orch.pop(req, None)
         self._retrieval.pop(req, None)
         self._state.pop(req, None)
-        self._owned_slots.pop(req, None)
+        # Free the device slots as well: dropping only `_owned_slots` left `_slot_owner` entries
+        # pointing at dead requests, so a later request could never reuse them (the slot pool
+        # silently shrinks to exhaustion) and the stale owner table outlived the request.
+        for slot in list(self._owned_slots.pop(req, set()) or ()):
+            if self._slot_owner.get(slot) == req:
+                self._slot_owner.pop(slot, None)
         self._page_map.pop(req, None)
         self._dirty_pages.pop(req, None)
         if orch is not None and getattr(self, "budget_pool", None) is not None:
@@ -490,7 +495,11 @@ class VllmSparseRuntime:
                       "planner": orch.planner is not None, "due": bool(due)})
         # With compaction disabled nothing may rewrite the block table: `not st.row` means the sparse
         # row was never built (that is the point), not that a reselect is owed.
-        if bool(getattr(self, "inrequest_compaction", False)) and (not st.row or due):
+        # Compaction is DECODE-only: during prefill the prompt is still streaming in, so truncating
+        # it mid-chunk corrupts the tail the engine is about to append (measured: the initial view
+        # built at a 16-token prefill chunk made the second generated line turn into noise).
+        if bool(getattr(self, "inrequest_compaction", False)) and not prefill \
+                and (not st.row or due):
             result = self._reselect(req)
             if int(getattr(self, "needle_trace", 0)) > 0:
                 resident = sorted(orch.resident)
@@ -610,16 +619,21 @@ class VllmSparseRuntime:
 
     # --- page allocation ----------------------------------------------------------------
     def _take_slots(self, req, count):
+        # Allocate DOWNWARD from the top of the pool: the engine allocates its own blocks
+        # bottom-up, so scanning up (the old behaviour) handed us pages the engine was still
+        # using for this very request. A batched page move then had overlapping source and
+        # destination sets and clobbered pages before they were read - measured as the second
+        # line of a repeated word turning into noise on the very first reselect.
         slots = []
-        candidate = self.first_page
+        candidate = self.view.num_blocks() - 1
         while len(slots) < count:
-            if candidate >= self.view.num_blocks():
+            if candidate < self.first_page:
                 raise RuntimeError("device slot pool exhausted")
             if candidate not in self._slot_owner:
                 self._slot_owner[candidate] = req
                 self._owned_slots[req].add(candidate)
                 slots.append(candidate)
-            candidate += 1
+            candidate -= 1
         return slots
 
     def _free_slots(self, req, selected, count):

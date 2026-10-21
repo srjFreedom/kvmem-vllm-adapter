@@ -501,9 +501,11 @@ def _attach_sparse(runner, log_path):
     runtime.needle_trace = int(cfg.get("needle_trace", 0))
     for _orch in ():  # placeholder: configured per request when the orchestrator is created
         pass
-    runtime.install_row = bool(cfg.get("install_row", True))
-    runtime.install_seq = bool(cfg.get("install_seq", True))
-    runtime.install_pos = bool(cfg.get("install_pos", True))
+    # Bisect switches (env-only, for live diagnosis): turn one piece of the view install off at a
+    # time to localise a corrupt read without editing code between engine restarts.
+    runtime.install_row = bool(cfg.get("install_row", True)) and not os.environ.get("KVMEM_NO_ROW")
+    runtime.install_seq = bool(cfg.get("install_seq", True)) and not os.environ.get("KVMEM_NO_SEQ")
+    runtime.install_pos = bool(cfg.get("install_pos", True)) and not os.environ.get("KVMEM_NO_POS")
 
     # Hook 1b: give the FULL-ATTENTION metadata builder the compacted seq_lens. The GDN layers
     # must keep the true length, and they share one tensor, so the split has to happen at the
