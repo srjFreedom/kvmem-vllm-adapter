@@ -504,6 +504,11 @@ class VllmSparseRuntime:
             # tokens, exactly when the pool (B history + R output) is full.
             st.prefill_done = True
             orch._tokens_at_reselect = max(0, st.tokens - n_new_tokens)
+            # The prompt is IMMUTABLE for this backend: vLLM derives the output length from
+            # `num_tokens - prompt_len` and requires `_all_token_ids` to cover the prompt, so a
+            # compaction may only ever drop GENERATED tokens. Remember the prefill length here so
+            # every reselect can declare the prompt pages mandatory.
+            orch.prompt_tokens = max(0, st.tokens - n_new_tokens)
         # During a long prefill the resident set must stay bounded even though relevance is not
         # meaningful yet: keep the sink prefix + newest tail and spill the middle (kvmem's
         # prefill-pressure selection). Without this a 200K prefill would consume the whole pool.
@@ -594,7 +599,10 @@ class VllmSparseRuntime:
             taken["slots"] = slots
             return slots[:-1]
 
-        stats = orch.reselect(slots=_take, prefill_pressure=prefill_pressure)
+        prompt_tokens = int(getattr(orch, "prompt_tokens", 0) or 0)
+        mandatory = list(range(0, -(-prompt_tokens // self.page_tokens))) if prompt_tokens else []
+        stats = orch.reselect(slots=_take, mandatory_pages=mandatory,
+                              prefill_pressure=prefill_pressure)
         selected = list(orch.last_view.row_pages)
         used = list(orch.slots[:len(selected)])
         spare = taken["slots"][-1]

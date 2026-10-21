@@ -903,18 +903,36 @@ def register():
                     continue
                 visible.extend(all_tokens[start:min(start + page_tokens, len(all_tokens))])
             if not visible or len(visible) >= len(all_tokens):
-                # Diagnostic: a no-op here while the WORKER still installs a shorter compacted view
-                # leaves the two books disagreeing (the model computes at compacted positions but
-                # the scheduler keeps the old lengths -> num_tokens == num_computed -> the request
-                # is never scheduled again).
+                # Idempotency across TP ranks: each rank reselects and sends its own compact, so the
+                # SECOND rank always arrives after the first one already truncated the book. That
+                # rank must still install its own view (each rank has its own KV tensors and block
+                # table); reporting a plain no-op there made one rank drop its view and the two
+                # ranks diverged - measured as a long-context stall / noise.
+                applied = _compact_state.get(request_id)
+                already = applied == len(visible) and len(all_tokens) == len(visible)
                 _append(_sched_cfg(scheduler).get("probe_log") or "/tmp/kvmem_sparse.jsonl",
                         {"kind": "compact_noop", "pid": os.getpid(), "req": request_id,
                          "visible": len(visible), "all_tokens": len(all_tokens),
-                         "computed": int(req.num_computed_tokens), "pages": len(pages)})
-                return {"ok": len(visible) == len(all_tokens), "truncated": False,
+                         "computed": int(req.num_computed_tokens), "pages": len(pages),
+                         "peer_applied": bool(already)})
+                return {"ok": len(visible) == len(all_tokens),
+                        "truncated": bool(already),
                         "visible": len(visible)}
+            # vLLM requires `_all_token_ids` to COVER the prompt (num_tokens >= num_prompt_tokens):
+            # the sampler/stop checker derive the output length from the difference. Truncating
+            # below the prompt leaves num_tokens < prompt_len and the request stops being scheduled
+            # (measured: an 8305-token prompt compacted to 8192 stalled with the GPU idle). The
+            # entry policy is what must keep the prompt <= B; until it always does, refuse here.
+            prompt_len = len(getattr(req, "prompt_token_ids", ()) or ())
+            if prompt_len and len(visible) < prompt_len:
+                _append(_sched_cfg(scheduler).get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "compact_refused", "pid": os.getpid(), "req": request_id,
+                         "visible": len(visible), "prompt_len": prompt_len,
+                         "all_tokens": len(all_tokens)})
+                return {"ok": False, "truncated": False, "visible": len(visible)}
             req._all_token_ids[:] = visible
             req.num_computed_tokens = max(0, len(visible) - pending)
+            _compact_state[request_id] = len(visible)
             _append(_sched_cfg(scheduler).get("probe_log") or "/tmp/kvmem_sparse.jsonl",
                     {"kind": "compact_applied", "pid": os.getpid(),
                      "req": request_id, "pages": len(pages),
@@ -930,6 +948,8 @@ def register():
             return {"ok": True, "truncated": True, "visible": len(visible)}
 
         _channel_state = {"scheduler": None, "server": None}
+        # request_id -> visible length of the last applied compaction (TP-rank idempotency).
+        _compact_state = {}
         original = Scheduler.schedule
         if not getattr(original, "_kvmem_channel_patched", False):
             def schedule(self, *args, **kwargs):

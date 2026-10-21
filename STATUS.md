@@ -1135,3 +1135,18 @@ ninfer 对等必须原地复用引擎页，另存副本在 B≈池/2 时物理�
 **仍未通过**：本次真截断（`compact_truncated=true`）后请求仍停在 running 不再被调度（GPU 0%）。
 下一步：确认 `note_engine_computed` 是否真的被调用（加探针），再查截断瞬间 `num_computed` 与
 `num_tokens` 的实际关系。
+
+### Route A 第七轮：长上下文不再卡；「选择器保留量 < prompt」仍会卡
+
+修掉的三处：
+
+| 问题 | 证据 | 修法 |
+|---|---|---|
+| 两个 TP rank 各自重选，第二个到达时账本已被截断 → 判 noop → 清掉自己的视图 | 长上下文真截断后卡死 | compact 幂等：`peer_applied` 时也返回 `truncated=true`，两 rank 都安装 |
+| 截断到 **prompt 以下** 破坏 vLLM 不变量（`num_tokens < prompt_len`） | `visible=8192 / prompt_len=8305` 后卡死 | 拒绝截断到 prompt 以下（`compact_refused`） |
+| 选择器可以丢 prompt 页 | 同上 | 把 prompt 覆盖的页全部作为 mandatory 传给选择器 |
+
+**已验证**：5.5K prompt + 4350 输出、两次 R 节拍重选 → **1450/1450 行正确、49.1s 完成**（此前长上下文必卡）。
+
+**仍卡**：选择器只保留 4368 token（< prompt 5540）时，`compact_refused` 之后请求仍停在 running。
+下一步：让 mandatory 真正生效（planner 的 trim 是否把 mandatory 也裁了），且「拒绝」路径不得影响请求继续。
