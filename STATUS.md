@@ -962,3 +962,25 @@ worker `--kvmem-capture-tokens`、启动脚本 `CAPTURE_TOKENS=`、落盘 `kvmem
 - `./v1/chat/completions/control` —— 停止生成（llama.cpp/ninfer 的服务端扩展）
 - `./v1/stream`、`./v1/streams/lookup` —— 流恢复/会话查找
 - `./slots` —— slot 列表（llama.cpp 概念）
+
+### 性能基线：旧并发表的真实含义（prefill，不是 decode）
+
+`scripts/concurrency_check.sh` 里 `max_tokens=16`，所以之前那张表（37K/36s、2×37K/69s、4×13K/43s）
+测的是 **prefill + 排队**，decode 只占 <1 s。用引擎自己的计数器拆开重测（当前配置 N=2、B/R=65536/32768）：
+
+| 用例 | prompt | wall | prefill | prefill 速率 | decode |
+|---|---|---|---|---|---|
+| 单请求 98.8K | 98,799 | 140.6 s | 138.5 s | **713 tok/s** | 8 tok/s（16 token）|
+| 单请求 65.2K | 65,211 | 71.1 s | 69.8 s | **934 tok/s** | 19.7 tok/s |
+| 2×65.2K（唯一内容） | 130,422 | 139.1 s | 273.2 s（合计）| **477 tok/s** 聚合 | — |
+| 小 prompt 生成 512 | 832 | 9.2 s | 0.5 s | 1530 tok/s | **59.4 tok/s** |
+
+结论：
+1. 长上下文的耗时**几乎全是 prefill**（65K ≈ 70 s，约 900 tok/s；2×2080Ti + fp8 + GDN 混合 + MTP）。
+2. 旧表数字与今天一致（37K/36s ≈ 1000 tok/s），说明期间没有退化也没有提速——那 1.83× 的预算标定
+   影响的是"发多少 token"，不是"每 token 多快"。
+3. 并发不提升 prefill 吞吐（2 流聚合 477 tok/s < 单流 934 tok/s），因为 TP=2 已经用满两张卡。
+4. 多轮对话受益于前缀缓存，实际远好于这些冷启动数字（实测同前缀第二轮 cached 63,024/65,890）。
+
+待验证的优化方向（未做）：`MAX_BATCHED_TOKENS` 4096 → 8192/16384 可减少 chunk 数；历史记录里提过
+调大会让启动 smoke 失败，需要在当前配置下重试确认。
