@@ -20,7 +20,11 @@ N=2                     # 并发请求数；引擎窗口 = N x (B + R)，自动�
 PORT=18200              # kvmem 官方端口
 CAPTURE_TOKENS=512      # 每步为检索捕获的 query token 数（官方 query_max_tokens 默认 512）
 
+# ---- 权重（改这里换模型）----
 MODEL=/home/srj/models/Coder390/FP8-fp8mtp
+# 换模型时通常还要一起改：chat template、launcher profile（量化/KV/上下文档）、SERVED_NAME
+CHAT_TEMPLATE_FILE=/home/srj/models/Coder390/FP8/chat_template.jinja
+PROFILE=2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env
 SERVED_NAME=Qwen3.8-27B-Coder390-EfficientThink-FP8-MTP
 
 KVMEM_UI_DIR=/home/srj/local-model-console  # 同端口挂载自写 UI（空字符串 = 不挂）
@@ -31,7 +35,7 @@ DISABLE_PREFIX_CACHING=0       # 1 = 关前缀缓存（仅 in-request compaction
 # ---------------------------------------------------------------------------
 
 export B R CTX SINK RECENT SESSIONS HOST_MIB N PORT CAPTURE_TOKENS
-export MODEL SERVED_NAME
+export MODEL SERVED_NAME CHAT_TEMPLATE_FILE PROFILE
 export KVMEM_ENTRY_MODE KVMEM_ENTRY_SELECT DISABLE_PREFIX_CACHING KVMEM_UI_DIR
 
 exec /home/srj/run-kvmem-vllm.sh
