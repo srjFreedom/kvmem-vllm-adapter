@@ -7,7 +7,9 @@ StartLimitIntervalSec=600
 StartLimitBurst=5
 
 [Service]
-Type=forking
+# Type=forking 的原因：vLLM 的 launcher.sh 会把引擎 setsid 到自己的会话里（父进程随后退出），
+# 所以不能像 kvmem.service / kvmem-ninfer.service 那样用 Type=simple（那样单元会立刻变成 inactive）。
+# 这里用 forking + PIDFile 跟踪真正的 api_server 进程。
 PIDFile=/home/srj/kvmem-vllm.pid
 User=srj
 Group=srj
@@ -20,10 +22,10 @@ Environment=MALLOC_ARENA_MAX=2
 # Environment=KVMEM_ENTRY_SELECT=retrieval KVMEM_ENTRY_HISTORY_KIB=64
 # 指向你选定的站点配置脚本（start-*.sh），换配置就是换这一行
 ExecStart=/home/srj/start-kvmem-vllm.sh
-TimeoutStartSec=1200
+TimeoutStartSec=900
 TimeoutStopSec=120
 Restart=on-failure
-RestartSec=20
+RestartSec=15
 StandardOutput=null
 StandardError=null
 

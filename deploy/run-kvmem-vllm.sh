@@ -32,6 +32,16 @@ ADAPTER=${ADAPTER:-/home/srj/vllm-kvmem-adapter}
 KV_PIDFILE=${KV_PIDFILE:-/home/srj/kvmem-vllm.pid}
 PARAMS_FILE=${PARAMS_FILE:-/home/srj/kvmem-params.env}
 
+# DRYRUN=1：只打印将要执行的启动命令，绝不清理进程、绝不启动引擎。
+# 必须在任何副作用之前（早前把它放在清理之后，DRYRUN 直接把运行中的引擎杀了）。
+if [ "${DRYRUN:-0}" = "1" ]; then
+  echo "DRYRUN: engine window = $(( N * (B + R) )), port=$PORT, served=$SERVED_NAME"
+  printf '  %s\n' "model=$MODEL" "B=$B R=$R N=$N sink=$SINK recent=$RECENT CTX=$CTX" \
+    "capture=$CAPTURE_TOKENS gpu_util=${GPU_UTIL:-default} entry=${KVMEM_ENTRY_MODE:-middleware}"
+  echo "  worker: $ADAPTER/backends/vllm/worker.py --model $MODEL --port $PORT"
+  exit 0
+fi
+
 # FOREGROUND=1: run under systemd (no daemonising, no self-cleanup - the unit owns the process).
 if [ "${FOREGROUND:-0}" != "1" ]; then
   for p in $(ps -eo pid=,args= | awk '/VLLM::|vllm\.entrypoints|launcher\.sh/ && !/awk/ {print $1}'); do

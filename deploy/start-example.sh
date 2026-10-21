@@ -3,53 +3,56 @@
 #  KVMem + vLLM —— 站点配置模板
 #
 #  用法：复制成 ~/start-<你的配置名>.sh，改下面的参数，
-#        再把 systemd 的 ExecStart 指向它（部署示例见 deploy/kvmem-vllm.service）。
+#        再把 systemd 的 ExecStart 指向它（见 deploy/kvmem-vllm.service）。
 #
 #    cp deploy/start-example.sh ~/start-kvmem-vllm.sh
 #    vi ~/start-kvmem-vllm.sh
+#    DRYRUN=1 ~/start-kvmem-vllm.sh        # 只打印参数与命令，不启动
 #    sudo systemctl daemon-reload && sudo systemctl restart kvmem-vllm
 #
-#  这个文件只放参数；通用启动在 run-current.sh，实现在 run-kvmem-vllm.sh。
+#  写法与 start-kvmem-coder390-q6.sh / start-kvmem-ninfer-22g.sh 一致：
+#   export VAR=${VAR:-默认}  → 环境变量可覆盖；本文件只放参数，启动逻辑在 run-current.sh。
 # ============================================================================
+set -uo pipefail
 
 # ---------------- 参数区（改这里）--------------------------------------------
-B=36864                 # 历史预算：每次发给引擎的历史 token 上限（36K）
-R=16384                 # 生成上限：max_tokens 会被夹到 R（16K）
-CTX=524288              # kvmem 逻辑上下文上限（512K），与引擎窗口无关
-SINK=8192               # 永远保留的开头 token 数
-RECENT=2048             # 永远保留的结尾 token 数
-SESSIONS=4              # H 池按并发会话数平分的份数
-HOST_MIB=49152          # H 层（主机内存）预算 MiB
-N=1                     # 并发请求数（默认 1）；引擎窗口 = N x (B + R)，自动算
-PORT=18200              # kvmem 官方端口
-CAPTURE_TOKENS=512      # 每步为检索捕获的 query token 数（官方 query_max_tokens 默认 512）
+export B=${B:-36864}                              # 历史预算（36K）
+export R=${R:-16384}                              # 生成上限（16K）
+export CTX=${CTX:-524288}                         # kvmem 逻辑上下文上限
+export SINK=${SINK:-8192}
+export RECENT=${RECENT:-2048}
+export SESSIONS=${SESSIONS:-4}
+export HOST_MIB=${HOST_MIB:-49152}
+export N=${N:-1}                                  # 并发数；窗口 = N x (B + R)
+export PORT=${PORT:-18200}
+export CAPTURE_TOKENS=${CAPTURE_TOKENS:-512}
 
-# ---- 引擎/硬件（换卡、换机器时需要调）----
-GPU_UTIL=0.97           # vLLM 显存占用比例；22GB 卡用 0.97，小卡适当降低，OOM 时先降这个
-MAX_BATCHED_TOKENS=4096 # 单步 prefill 的 token 上限；调大可减 chunk 数，但吃显存
-SPECULATIVE_TOKENS=4    # MTP 投机 token 数；0 = 关闭投机（显存/速度之间取舍）
-MESSAGE_TYPE=text+image # text | text+image，是否启用视觉塔
-MM_IMAGE_LIMIT=64       # 每个 prompt 允许的图片数
-SERVICE_SCOPE=lan       # lan = 监听 0.0.0.0；local = 只监听 127.0.0.1
-THINKING_BUDGET=        # 思考 token 上限；空 = 无上限（默认），填数字才限制推理长度
+# ---- 引擎 / 硬件 ----
+export GPU_UTIL=${GPU_UTIL:-0.97}                 # 显存占用比例，OOM 先降这个
+export MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-4096}
+export SPECULATIVE_TOKENS=${SPECULATIVE_TOKENS:-4}
+export MESSAGE_TYPE=${MESSAGE_TYPE:-text+image}   # text | text+image
+export MM_IMAGE_LIMIT=${MM_IMAGE_LIMIT:-64}
+export SERVICE_SCOPE=${SERVICE_SCOPE:-lan}        # lan | local
+export THINKING_BUDGET=${THINKING_BUDGET:-}       # 空 = 思考 token 无上限
 
-# ---- 权重（改这里换模型）----
-MODEL=/home/srj/models/Coder390/FP8-fp8mtp
-# 换模型时通常还要一起改：chat template、launcher profile（量化/KV/上下文档）、SERVED_NAME
-CHAT_TEMPLATE_FILE=/home/srj/models/Coder390/FP8/chat_template.jinja
-PROFILE=2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env
-SERVED_NAME=Qwen3.8-27B-Coder390-EfficientThink-FP8-MTP
+# ---- 权重（任意 vLLM 支持的模型；换模型时这几项要一起改）----
+export MODEL=${MODEL:-/home/srj/models/Coder390/FP8-fp8mtp}
+export CHAT_TEMPLATE_FILE=${CHAT_TEMPLATE_FILE:-/home/srj/models/Coder390/FP8/chat_template.jinja}
+export PROFILE=${PROFILE:-2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env}
+export SERVED_NAME=${SERVED_NAME:-Qwen3.8-27B-Coder390-EfficientThink-FP8-MTP}
 
-KVMEM_UI_DIR=/home/srj/local-model-console  # 同端口挂载自写 UI（空字符串 = 不挂）
-
-KVMEM_ENTRY_MODE=middleware    # middleware = 标准 Starlette body 改写；hook = 兜底
-KVMEM_ENTRY_SELECT=retrieval   # retrieval | recency
-DISABLE_PREFIX_CACHING=0       # 1 = 关前缀缓存（仅 in-request compaction 时需要）
+# ---- 入口策略 ----
+export KVMEM_ENTRY_MODE=${KVMEM_ENTRY_MODE:-middleware}     # middleware | hook
+export KVMEM_ENTRY_SELECT=${KVMEM_ENTRY_SELECT:-retrieval}  # retrieval | recency
+export DISABLE_PREFIX_CACHING=${DISABLE_PREFIX_CACHING:-0}
+export KVMEM_UI_DIR=${KVMEM_UI_DIR:-/home/srj/local-model-console}
 # ---------------------------------------------------------------------------
 
-export B R CTX SINK RECENT SESSIONS HOST_MIB N PORT CAPTURE_TOKENS
-export GPU_UTIL MAX_BATCHED_TOKENS SPECULATIVE_TOKENS MESSAGE_TYPE MM_IMAGE_LIMIT SERVICE_SCOPE
-export MODEL SERVED_NAME CHAT_TEMPLATE_FILE PROFILE
-export KVMEM_ENTRY_MODE KVMEM_ENTRY_SELECT DISABLE_PREFIX_CACHING KVMEM_UI_DIR
+if [ "${DRYRUN:-0}" = "1" ]; then
+  echo "DRYRUN: 以下参数将交给 run-current.sh"
+  env | grep -E '^(B|R|CTX|SINK|RECENT|SESSIONS|HOST_MIB|N|PORT|CAPTURE_TOKENS|GPU_UTIL|MAX_BATCHED_TOKENS|SPECULATIVE_TOKENS|MESSAGE_TYPE|MM_IMAGE_LIMIT|SERVICE_SCOPE|THINKING_BUDGET|MODEL|CHAT_TEMPLATE_FILE|PROFILE|SERVED_NAME|KVMEM_[A-Z_]*|DISABLE_PREFIX_CACHING)=' | sort
+  exit 0
+fi
 
 exec /home/srj/run-current.sh
