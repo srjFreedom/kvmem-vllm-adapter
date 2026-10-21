@@ -59,7 +59,7 @@ Three external pieces are required and are not vendored (`backends/versions.json
 |---|---|---|
 | vLLM SM75 fork | `93c9013e375b` + integration patch | `install.sh` fetches it and applies the patch (verifies `patched_tree`) |
 | kvmem sources | tag `v0.18.0` | same (the native extension needs its headers and library) |
-| Model weights | any FP8 + MTP export | you provide it; point `MODEL` at it |
+| Model weights | **any model vLLM can serve** (this deployment runs an FP8 + MTP export) | you provide them; point `MODEL` at the directory |
 
 ```bash
 git clone https://github.com/srjFreedom/kvmem-vllm-adapter
@@ -82,6 +82,20 @@ VLLM_ROOT=/path/to/fork KVMA_SRC=/path/to/kvmem PY=/path/to/venv/bin/python ./in
 
 **The three steps that are never skippable** (they are this repository's own code): apply the patch,
 install the plugin, build the native extension.
+
+### Which models work
+
+vLLM decides what can be loaded (architecture, quantization, chat template); the KVMem layer adds
+two requirements on top:
+
+* **Per-page tiering** (H/D spill, LRFU) works on the full-attention KV groups, so hybrid models
+  (attention + GDN/Mamba) are fine — that is what the default model is.
+* **Retrieval scoring** needs the pre-RoPE query hook, which lives in
+  `vllm/model_executor/models/qwen3_next.py` (part of the integration patch). Another architecture
+  needs the same two-line call inside its attention layer; without it the entry policy, R ceiling
+  and history cache still work, only mean-K page scoring is unavailable.
+
+So: any vLLM-supported model runs, and FP8 + MTP is just the configuration measured here.
 
 ## Configuration
 

@@ -55,7 +55,7 @@ vLLM 用逻辑位置索引 KV 块，且假定序列长度单调增长：中途�
 |---|---|---|
 | vLLM SM75 fork | `93c9013e375b` + 集成补丁 | `install.sh` 拉取并打补丁（校验 `patched_tree`）|
 | kvmem 源码 | tag `v0.18.0` | 同上（编译原生扩展要头文件与库）|
-| 模型权重 | 任意 FP8 + MTP 导出 | 自己放，改 `MODEL` |
+| 模型权重 | **vLLM 能跑的任何模型**（本部署用的是 FP8 + MTP 导出）| 自己放，改 `MODEL` |
 
 ```bash
 git clone https://github.com/srjFreedom/kvmem-vllm-adapter
@@ -77,6 +77,18 @@ VLLM_ROOT=/path/to/fork KVMA_SRC=/path/to/kvmem PY=/path/to/venv/bin/python ./in
 ```
 
 **不可避免的三步**（属于本仓库的代码，任何环境都要做）：打补丁、装插件、编原生扩展。
+
+### 支持哪些模型
+
+能加载什么由 vLLM 决定（架构、量化、chat template）；KVMem 层在此之上只多两条要求：
+
+- **按页分层**（H/D 溢出、LRFU）作用在 full-attention 的 KV 组上，所以混合架构（注意力 + GDN/Mamba）
+  没问题——默认模型就是这种。
+- **检索打分**依赖 pre-RoPE query 捕获，钩子落在 `vllm/model_executor/models/qwen3_next.py`
+  （属于集成补丁）。换别的架构需要在它的注意力层里加同样两行；没有钩子时入口选片、R 上限、
+  历史缓存仍然工作，只是 mean-K 页打分不可用。
+
+所以：vLLM 支持的模型都能跑，FP8 + MTP 只是这里实测过的配置。
 
 ## 配置
 
