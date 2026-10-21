@@ -48,7 +48,6 @@ cd "${VLLM_DIR:-$HOME/vLLM-2080Ti-Definitive}"
 if [ -n "${HF_OVERRIDES_FILE:-}" ]; then export HF_OVERRIDES_JSON="$(cat "$HF_OVERRIDES_FILE")"; fi
 export VLLM_LOG_STATS_INTERVAL=3   # 周期速度统计 3s 一输出(nvfp4 同款, 缺了退回默认 10s)
 
-# 坏卡防护已于 2026-10-16 移除: 用户确认机器里已无坏卡(GPU-85622d5a 已下线/不存在)。
 export PATH="$HOME/.local/bin:$PATH"
 # 前缀缓存：默认开启。仅当启用 --kvmem-inrequest-compaction（稀疏视图会改写块表）时必须关掉。
 export DISABLE_PREFIX_CACHING=${DISABLE_PREFIX_CACHING:-0}
