@@ -48,24 +48,24 @@ def main(argv=None) -> int:
     # KVMem retrieval needs pre-RoPE statistics, and under `torch.compile` + CUDA Graph no Python
     # code runs per step (measured: capture.calls == 0 in the default config). The eager path is
     # therefore mandatory for retrieval only; recency keeps the compiled/graph path.
-    # The sparse path rewrites the block table when a request is compacted. vLLM's ASYNC scheduler
-    # plans the next step before the current one's outputs are accounted for, so that rewrite breaks
+    # Scheduler mode. Under entry-side selection the engine only ever sees B+R tokens and the block
+    # table is never rewritten mid-request, so the async scheduler is safe and is the default here
+    # (measured: identical decode throughput to sync scheduling in this configuration). Only
+    # in-request compaction (opt-in) rewrites the block table: vLLM's async scheduler plans the next
+    # step before the current one's outputs are accounted for, so that rewrite breaks
     # `assert request.num_output_placeholders >= 0` (async_scheduler.py:63) and kills the engine.
-    # Sync scheduling keeps every step self-contained, which is exactly the invariant kvmem needs.
-    # Measured: 2-way and 4-way concurrency both return 200 with sync scheduling, and both crash
-    # with async scheduling.
-    # Only pay for it when concurrency is actually requested: single-request mode keeps the async
-    # scheduler (measured 3.38-3.45 s for 882+300 vs 4.1-4.5 s with sync scheduling).
-    # NO_ASYNC_SCHEDULING=0 forces async even for N>1: with entry-side selection (no inrequest
-    # compaction) no block-table rewrite happens, so the async scheduler is safe. Unset keeps
-    # the historical sync default for N>1.
+    # Sync scheduling keeps every step self-contained, so compaction forces it back on.
+    # Explicit NO_ASYNC_SCHEDULING always wins (1 = sync, 0 = async).
     _seqs = int(env.get("MAX_NUM_SEQS", "1") or "1")
     _async_override = env.get("NO_ASYNC_SCHEDULING", "").strip()
-    if _seqs > 1 and _async_override == "":
-        env["NO_ASYNC_SCHEDULING"] = "1"
-        print(f"[kvmem backends/vllm] MAX_NUM_SEQS={_seqs} -> --no-async-scheduling "
-              "(async scheduling pre-plans steps and conflicts with per-step page compaction; "
-              "single-request mode keeps async for ~20% more decode throughput)")
+    if _async_override == "":
+        env["NO_ASYNC_SCHEDULING"] = "1" if cfg.get("inrequest_compaction") else "0"
+        if cfg.get("inrequest_compaction"):
+            print("[kvmem backends/vllm] inrequest_compaction=on -> --no-async-scheduling "
+                  "(block-table rewrite requires sync scheduling)")
+        else:
+            print(f"[kvmem backends/vllm] MAX_NUM_SEQS={_seqs} -> async scheduling "
+                  "(entry-side selection, no mid-request block-table rewrite)")
     if cfg.get("retrieval"):
         # The fork bridge (vllm/kvmem_bridge.py) exposes the query through a device copy that is
         # part of the compiled graph, so retrieval no longer needs the slow eager path. Keep the
@@ -81,8 +81,11 @@ def main(argv=None) -> int:
                   "(KVMEM_CAPTURE=1)")
     env["ADDITIONAL_CONFIG_JSON"] = payload
     env["KVMEM_PLUGIN_CONFIG"] = ""          # no side-channel file
-    script = ("/home/srj/run-kvmem-4way.sh" if ns.max_num_seqs > 1
-              else "/home/srj/run-kvmem-sparse.sh")
+    # Launcher scripts ship with the adapter (deploy/), so a clone works without /home/srj paths.
+    # KVMEM_LAUNCH_SCRIPT overrides both for site-specific launchers.
+    script = os.environ.get("KVMEM_LAUNCH_SCRIPT") or os.path.join(
+        ADAPTER, "deploy",
+        "run-kvmem-4way.sh" if ns.max_num_seqs > 1 else "run-kvmem-sparse.sh")
     print(f"[kvmem backends/vllm] port={ns.port} budget={ns.kvmem_budget} "
           f"R={ns.kvmem_gen_reserve} sink={ns.kvmem_sink_tokens} "
           f"recent={ns.kvmem_recent_tokens} sessions={ns.kvmem_sessions} "

@@ -34,6 +34,10 @@ FAIL_PATTERN='initialization failed|Address already in use|Engine core initializ
 
 START_MS=$(date +%s%3N)
 deadline=$(( START_MS + TIMEOUT * 1000 ))
+# Only judge lines written by THIS start: the log is append-only across restarts, and an old
+# failure (e.g. a ValueError from a previous run) must not abort a healthy new launch.
+LOG_OFFSET=0
+if [ -n "$LOG" ] && [ -f "$LOG" ]; then LOG_OFFSET=$(grep -ac '' "$LOG" 2>/dev/null || echo 0); fi
 health_ok=0
 while :; do
   now=$(date +%s%3N)
@@ -44,13 +48,13 @@ while :; do
     break
   fi
   if [ -n "$LOG" ] && [ -f "$LOG" ]; then
-    if grep -aq "Application startup complete" "$LOG" 2>/dev/null; then
+    if tail -n +$(( LOG_OFFSET + 1 )) "$LOG" 2>/dev/null | grep -aq "Application startup complete"; then
       health_ok=1
       break
     fi
-    if match=$(grep -aoE "$FAIL_PATTERN" "$LOG" 2>/dev/null | head -1); [ -n "$match" ]; then
+    if match=$(tail -n +$(( LOG_OFFSET + 1 )) "$LOG" 2>/dev/null | grep -aoE "$FAIL_PATTERN" | head -1); [ -n "$match" ]; then
       echo "ENGINE FAILED: ${match} (log: $LOG)" >&2
-      grep -aE "$FAIL_PATTERN" "$LOG" 2>/dev/null | head -3 >&2
+      tail -n +$(( LOG_OFFSET + 1 )) "$LOG" 2>/dev/null | grep -aE "$FAIL_PATTERN" | head -3 >&2
       exit 2
     fi
   fi

@@ -77,7 +77,7 @@ export KVMEM_ENTRY_HISTORY_DISK_PATH=${KVMEM_ENTRY_HISTORY_DISK_PATH:-/tmp/kvmem
 printf 'CTX=%s\nB=%s\nR=%s\nSINK=%s\nRECENT=%s\nSESSIONS=%s\nHOST_MIB=%s\nN=%s\nPORT=%s\nCAPTURE_TOKENS=%s\n' \
   "$CTX" "$B" "$R" "$SINK" "$RECENT" "$SESSIONS" "$HOST_MIB" "$N" "$PORT" "$CAPTURE_TOKENS" > "$PARAMS_FILE"
 
-RUN=(env NO_ASYNC_SCHEDULING=${NO_ASYNC_SCHEDULING:-1} MAX_NUM_SEQS="$N" \
+RUN=(env MAX_NUM_SEQS="$N" \
   /home/srj/vLLM-2080Ti-Definitive/.venv/bin/python \
   "$ADAPTER/backends/vllm/worker.py" \
     --model "$MODEL" --port "$PORT" --served-name "$SERVED_NAME" \
