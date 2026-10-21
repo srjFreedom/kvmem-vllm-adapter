@@ -108,6 +108,20 @@ def main():
     orch.reselect()
     check(all(torch.equal(b, k) for b, k in zip(before, kv)), "a repeated reselect writes identical bytes (no extra hop)")
 
+    # --- R cadence: baseline anchored at the prompt, R counts OUTPUT tokens -------------
+    orc = SparseOrchestrator(selector, kv, PAGE, HEAD_DIM, ROTARY, BASE, reselect_interval=10 ** 6)
+    orc.inrequest_compaction = True
+    orc.gen_reserve = 1024          # R: the generation reserve
+    orc.reselect_token_budget = 0   # no adapter-invented timer in compaction mode
+    prompt = 30000
+    orc._tokens_at_reselect = prompt          # what after_step sets at the first decode step
+    orc.note_tokens(prompt + 1023)
+    check(not orc.should_reselect(), "no reselect just before R new output tokens")
+    orc.note_tokens(prompt + 1024)
+    check(orc.should_reselect(), "reselect fires exactly at R new output tokens (pool full)")
+    orc.inrequest_compaction = False
+    check(not orc.should_reselect(), "compaction off never reselects")
+
     print("PASS sparse_orchestrator_test" if not failed else "FAILED sparse_orchestrator_test")
     sys.exit(0 if not failed else 1)
 

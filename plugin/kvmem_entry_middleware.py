@@ -84,14 +84,15 @@ def apply_policy(request, policy: EntryPolicy, cache=None) -> dict | None:
     STATE["calls"] += 1
     stats: dict = {}
 
-    if policy.gen_reserve > 0:
+    ceil = policy.generation_ceil()
+    if ceil > 0:
         requested = _budget_field(request)
-        if requested is None or requested > policy.gen_reserve:
-            # R is kvmem's ceiling, not a client preference. Written to the field vLLM actually
+        if requested is None or requested > ceil:
+            # The ceiling is kvmem's, not a client preference. Written to the field vLLM actually
             # reads, and only that one, so a smaller `max_tokens` can never be silently overridden.
-            request.max_completion_tokens = policy.gen_reserve
+            request.max_completion_tokens = ceil
             stats["gen_budget"] = {"field": "max_completion_tokens", "requested": requested,
-                                   "applied": policy.gen_reserve}
+                                   "applied": ceil}
 
     selection = apply_to_messages(getattr(request, "messages", None) or [], policy, cache)
     if selection:

@@ -39,7 +39,7 @@ class _ReqState:
     # logical:  logical page id (true token page) occupying each row position, so a written
     #           token can be attributed to the history block it belongs to.
     __slots__ = ("row", "logical", "seq_len", "tokens", "next_page", "steps", "spare",
-                 "row_index")
+                 "row_index", "prefill_done")
 
     def __init__(self):
         self.row = ()
@@ -50,6 +50,7 @@ class _ReqState:
         self.steps = 0
         self.spare = None
         self.row_index = 0
+        self.prefill_done = False
 
 
 class VllmSparseRuntime:
@@ -172,6 +173,12 @@ class VllmSparseRuntime:
             # In-request compaction is opt-in for this backend: vLLM tracks sequence length
             # monotonically, so truncation must be requested explicitly.
             orch.inrequest_compaction = bool(getattr(self, "inrequest_compaction", False))
+            # Cadence: KVMem's R is the authority - the pool (B+R) fills exactly when the output
+            # since the last reselect reaches R. Drop the adapter's own 4096-token timer in that
+            # mode, and expose R here so the trigger also holds when the native planner is absent.
+            orch.gen_reserve = int(self.gen_reserve)
+            if orch.inrequest_compaction:
+                orch.reselect_token_budget = 0
             # KVMem is the authority for the attention view. The planner is optional so the same
             # runtime still works when the native extension is unavailable.
             if getattr(self, "use_kvmem_plan", False):
@@ -273,10 +280,15 @@ class VllmSparseRuntime:
         if self.install_seq:
             self.view.seq_lens()[row_index] = seq_len
         positions = self.view.positions()
-        # The query tokens sit right after the keys, in compacted space.
+        # The query tokens sit right after the keys, in compacted space: their absolute positions
+        # are [seq_len - n, seq_len), NOT [seq_len, seq_len + n). The previous form used the
+        # INCLUDING-query length as the base, so every step shifted positions by one (decode) or
+        # by a whole chunk (prefill) - the KV was then rotated to the wrong RoPE and the output
+        # degenerated into gibberish (measured live).
         if self.install_pos:
+            base = seq_len - len(position_slots)
             for j, slot in enumerate(position_slots):
-                positions[slot] = seq_len + j
+                positions[slot] = base + j
         return {"row": row, "seq_len": seq_len}
 
     # --- hook 2 ------------------------------------------------------------------------
@@ -316,32 +328,22 @@ class VllmSparseRuntime:
         st.tokens = max(st.tokens, getattr(st, "tokens", 0))
         orch.note_tokens(st.tokens)
         try:
-            # Compaction rewrites the block table and the compacted positions. Doing that inside a
-            # PREFILL step that also schedules other requests breaks the worker's invariant
-            # `num_scheduled_tokens >= num_logits` (prepare_inputs, model_runner.py:1348), because the
-            # chunk is still being materialised at true positions. Decode batches are fine.
-            # Defer compaction when the step is a prefill chunk of a concurrent run: other requests
-            # share the batch and their logits accounting is derived from the same step
-            # (`num_scheduled_tokens >= num_logits`). Decode steps still compact, which is what keeps
-            # the working set bounded on long contexts (verified: 2 x 37K returns 200 this way).
+            # Route A compaction runs during DECODE: the pool (B+R) fills as the output grows, and
+            # the reselect rewrites the block table + compacted positions. That rewrite is safe
+            # because the three-book channel (BlockChannel.compact) makes EngineCore truncate
+            # `_all_token_ids` and rewind `num_computed_tokens` synchronously before the next
+            # schedule, so the worker and engine stay reconciled (the old mid-decode failure,
+            # `assert num_scheduled_tokens >= num_logits`, came from the engine keeping a monotone
+            # sequence the worker had already compacted). Prefill steps are deferred: the prompt is
+            # already entry-selected to <= B, and an oversized prefill is bounded by the separate
+            # prefill-pressure path below. A step that carries ANY draft tokens is also deferred
+            # (D5): speculative logits are addressed relative to the query end, so the block table
+            # must not move underneath them; the page move drains at the next draft-free step
+            # (<= 1 wasted spec round). Sync scheduling (forced when inrequest_compaction is on)
+            # keeps every decode step self-contained, so concurrent decode batches are fine.
             prefill_step = int(n_new) >= self.page_tokens
-            concurrent = max(int(getattr(self, "batch_size", 1) or 1),
-                             len(getattr(self, "_state", {}) or {})) > 1
-            # Speculative decoding addresses a request's logits rows relative to its query end, so a
-            # step that carries ANY draft tokens must not have its block table rewritten underneath
-            # (`assert num_scheduled_tokens >= num_logits`). Compaction therefore only runs in steps
-            # with no drafts at all - which in practice means prefill steps, the same boundary the
-            # reference design (Ninfer-KVMem-Async) drains page moves at.
-            # vLLM's scheduler keeps a request's sequence length monotone: its logits rows are
-            # addressed relative to the query end and its KV blocks are accounted per step.
-            # Truncating the context mid-decode therefore breaks that accounting
-            # (`assert num_scheduled_tokens >= num_logits`, model_runner.py:1348). Compaction is
-            # confined to PREFILL steps, where the sequence is still being built: the working set is
-            # bounded while the prompt streams in, and once decoding starts the block table is frozen
-            # for the rest of the request. This mirrors the reference design, which only moves pages
-            # at boundaries and never inside a decoding step.
             has_drafts = req in (getattr(self, "spec_reqs", None) or ())
-            deferred = has_drafts or not prefill_step
+            deferred = has_drafts or prefill_step
             if deferred:
                 self._deferred = int(getattr(self, "_deferred", 0)) + 1
             if not deferred and st.tokens > 0 and orch.should_reselect():
@@ -382,7 +384,8 @@ class VllmSparseRuntime:
         frontier = int(self._pending_frontier.get(req, 0) or 0)
         if frontier:
             # Trust the scheduler's absolute frontier; derive this step's delta from it.
-            st_pending.tokens = max(st_pending.tokens, frontier - int(n_new_tokens or 0))
+            _st = self._state[req]
+            _st.tokens = max(_st.tokens, frontier - int(n_new_tokens or 0))
         pending = int(self._pending_new.get(req, 0) or 0)
         if pending > int(n_new_tokens or 0):
             n_new_tokens = pending            # prefill chunks are visible only via query_start_loc
@@ -459,6 +462,13 @@ class VllmSparseRuntime:
 
         st.steps += 1
         orch.tick()
+        if not prefill and not st.prefill_done and st.tokens:
+            # First decode step: anchor the R cadence at the prompt length. Without this the first
+            # R check is already true (the logical total covers the prompt) and every request would
+            # reselect before generating a single token; with it, reselection fires after R OUTPUT
+            # tokens, exactly when the pool (B history + R output) is full.
+            st.prefill_done = True
+            orch._tokens_at_reselect = max(0, st.tokens - n_new_tokens)
         # During a long prefill the resident set must stay bounded even though relevance is not
         # meaningful yet: keep the sink prefix + newest tail and spill the middle (kvmem's
         # prefill-pressure selection). Without this a 200K prefill would consume the whole pool.
@@ -563,6 +573,18 @@ class VllmSparseRuntime:
         score_stats = getattr(orch, "last_score_stats", None)
         if score_stats:
             record["scores"] = score_stats          # proof that retrieval ranking was applied
+        # Three-book reconciliation (Route A): the worker has rewritten the block-table row to the
+        # compacted working set, but the engine still tracks the monotone sequence length. Tell
+        # EngineCore to truncate `_all_token_ids` to the visible tokens and rewind
+        # `num_computed_tokens`, so the scheduler sees no gap and does not recompute the spilled
+        # tokens. Synchronous: the worker blocks until the engine applies it, so the next schedule
+        # (step k+1) is already consistent.
+        ch = getattr(self, "compact_channel", None)
+        if ch is not None and selected:
+            try:
+                record["compact_applied"] = bool(ch.compact(req, selected, self.page_tokens))
+            except Exception as exc:
+                record["compact_error"] = str(exc)[:160]
         self.log(record)
         return st
 

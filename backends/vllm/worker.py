@@ -32,12 +32,33 @@ def _cli_module():
     return module
 
 
+def async_scheduling_mode(cfg, override=None):
+    """Decide the scheduler mode (``"1"`` = sync) for this engine.
+
+    In-request compaction rewrites the block table mid-request, which the async scheduler cannot
+    absorb: it plans step k+1 before step k's output has been accounted, so the rewrite trips
+    ``assert request.num_output_placeholders >= 0`` (async_scheduler.py:63). Sync scheduling keeps
+    every step self-contained, so compaction FORCES it — an explicit ``0`` cannot be honoured there
+    (that configuration is not merely slower, it is broken). With compaction off the caller's
+    explicit choice stands, and async is the default.
+    """
+    override = "" if override is None else str(override).strip()
+    if cfg.get("inrequest_compaction"):
+        return "1"
+    return override or "0"
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     module = _cli_module()
     ns = module.parse(argv)
     cfg = module.build_config(ns)
     cfg['inrequest_compaction'] = bool(getattr(ns, 'kvmem_inrequest_compaction', False))
+    # Route A: the three-book reconciliation rides on the worker->EngineCore block channel, so it
+    # must be enabled whenever in-request compaction is. The EngineCore starts the socket server
+    # from this flag; the worker's compact signal connects to it.
+    if cfg['inrequest_compaction']:
+        cfg['block_channel'] = True
     payload = json.dumps({"kvmem": cfg}, separators=(",", ":"))
     if "--dry-run" in argv:
         json.dump({"additional_config": payload, "plugin_config": cfg}, sys.stdout,
@@ -54,18 +75,20 @@ def main(argv=None) -> int:
     # in-request compaction (opt-in) rewrites the block table: vLLM's async scheduler plans the next
     # step before the current one's outputs are accounted for, so that rewrite breaks
     # `assert request.num_output_placeholders >= 0` (async_scheduler.py:63) and kills the engine.
-    # Sync scheduling keeps every step self-contained, so compaction forces it back on.
-    # Explicit NO_ASYNC_SCHEDULING always wins (1 = sync, 0 = async).
+    # Sync scheduling keeps every step self-contained, so compaction FORCES it back on; without
+    # compaction an explicit NO_ASYNC_SCHEDULING still wins and async remains the default.
     _seqs = int(env.get("MAX_NUM_SEQS", "1") or "1")
     _async_override = env.get("NO_ASYNC_SCHEDULING", "").strip()
-    if _async_override == "":
-        env["NO_ASYNC_SCHEDULING"] = "1" if cfg.get("inrequest_compaction") else "0"
-        if cfg.get("inrequest_compaction"):
-            print("[kvmem backends/vllm] inrequest_compaction=on -> --no-async-scheduling "
-                  "(block-table rewrite requires sync scheduling)")
-        else:
-            print(f"[kvmem backends/vllm] MAX_NUM_SEQS={_seqs} -> async scheduling "
-                  "(entry-side selection, no mid-request block-table rewrite)")
+    env["NO_ASYNC_SCHEDULING"] = async_scheduling_mode(cfg, _async_override)
+    if cfg.get("inrequest_compaction"):
+        if _async_override == "0":
+            print("[kvmem backends/vllm] inrequest_compaction=on overrides NO_ASYNC_SCHEDULING=0: "
+                  "the compaction rewrite requires sync scheduling")
+        print("[kvmem backends/vllm] inrequest_compaction=on -> --no-async-scheduling "
+              "(block-table rewrite requires sync scheduling)")
+    elif _async_override == "":
+        print(f"[kvmem backends/vllm] MAX_NUM_SEQS={_seqs} -> async scheduling "
+              "(entry-side selection, no mid-request block-table rewrite)")
     if cfg.get("retrieval"):
         # The fork bridge (vllm/kvmem_bridge.py) exposes the query through a device copy that is
         # part of the compiled graph, so retrieval no longer needs the slow eager path. Keep the

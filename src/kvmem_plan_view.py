@@ -132,8 +132,36 @@ class KvmemPlanner:
     def plan(self, selected_pages, total_tokens, session_id=1, mandatory_pages=()):
         """Ask KVMem for the compact view over the pages the policy already chose."""
         ext = _ext()
-        selected_blocks = sorted({int(p) // self.pages_per_block for p in selected_pages})
+        # The selector works at block granularity, so its choice can cross B by up to one block
+        # (a 128-token block whose tail sits past the budget). kvmem's contract is strict -
+        # `visible_tokens > selected_tokens` aborts the plan - so drop the lowest-ranked blocks of
+        # the selection until it fits, never touching mandatory ones.
+        ordered, seen = [], set()
+        for page in selected_pages:
+            block = int(page) // self.pages_per_block
+            if block not in seen:
+                seen.add(block)
+                ordered.append(block)
         mandatory = sorted({int(p) // self.pages_per_block for p in mandatory_pages})
+        mandatory_set = set(mandatory)
+
+        def tokens_of(blocks):
+            total = 0
+            for block in blocks:
+                start = block * self.block_tokens
+                if start < int(total_tokens):
+                    total += min(self.block_tokens, int(total_tokens) - start)
+            return total
+
+        trimmed = list(ordered)
+        while tokens_of(trimmed) > self.budget_tokens:
+            for index in range(len(trimmed) - 1, -1, -1):
+                if trimmed[index] not in mandatory_set:
+                    trimmed.pop(index)
+                    break
+            else:
+                break                       # only mandatory blocks left: let kvmem report it
+        selected_blocks = sorted(trimmed)
         # The host budget must cover EVERY retained cold block, not just the new spills: the plan
         # reports host_payload_bytes_required over all blocks that are not kept resident.
         total_blocks = -(-int(total_tokens) // self.block_tokens)

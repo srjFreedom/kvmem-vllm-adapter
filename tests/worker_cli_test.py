@@ -61,6 +61,17 @@ def main():
     plan, _ = run("--max-num-seqs", "4", "--max-model-len", "32768")
     check(plan["backend_args"]["max_num_seqs"] == 4, "concurrency is a backend argument")
 
+    # In-request compaction rewrites the block table mid-request, so it must outweigh an explicit
+    # async request; with compaction off the caller's choice stands and async stays the default.
+    sys.path.insert(0, "backends/vllm")
+    import worker as backend_worker  # noqa: E402
+    check(backend_worker.async_scheduling_mode({"inrequest_compaction": True}, "0") == "1",
+          "compaction forces sync scheduling even against an explicit 0")
+    check(backend_worker.async_scheduling_mode({"inrequest_compaction": False}, "") == "0",
+          "without compaction the default is async")
+    check(backend_worker.async_scheduling_mode({"inrequest_compaction": False}, "1") == "1",
+          "an explicit sync choice stands without compaction")
+
     print("PASS worker_cli_test" if not failed else "FAILED worker_cli_test")
     sys.exit(0 if not failed else 1)
 

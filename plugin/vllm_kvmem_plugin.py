@@ -354,6 +354,14 @@ def _attach_sparse(runner, log_path):
         k_slice=slice(0, int(cfg.get("head_dim", 256))),
         reselect_interval=int(cfg.get("reselect_interval", 64)),
         log=lambda record: _append(log_path, record),
+        # The kvmem contract parameters: the planner needs B/R verbatim (defaults would plan a
+        # 32768-token view and drive the R cadence from 16384, both wrong for this site).
+        select_block_tokens=int(cfg.get("select_block_tokens", 128)),
+        budget_tokens=int(cfg.get("budget_tokens", 32768)),
+        gen_reserve=int(cfg.get("gen_reserve_tokens", 16384)),
+        host_mib=int(cfg.get("host_mib", 16384)),
+        use_kvmem_plan=bool(cfg.get("use_kvmem_plan", False)),
+        sessions=int(cfg.get("sessions", 4)),
         # vLLM's NULL block occupies one aligned unit at the front of the pool.
         first_page=int(cfg.get("first_page", 0)) or
         (int(cfg.get("select_block_tokens", 128)) // max(1, int(view.page_tokens))))
@@ -361,6 +369,18 @@ def _attach_sparse(runner, log_path):
     # In-request compaction rewrites the block table mid-request; vLLM accounts sequence length
     # monotonically, so this is opt-in and comes from --kvmem-inrequest-compaction.
     runtime.inrequest_compaction = bool(cfg.get("inrequest_compaction", False))
+    # Route A three-book reconciliation: the worker->EngineCore channel that delivers each
+    # reselect so the engine truncates `_all_token_ids` and rewinds `num_computed_tokens`. It
+    # reuses the block-channel socket, so it is only available when that channel is enabled.
+    if runtime.inrequest_compaction:
+        try:
+            from kvmem_block_channel import BlockChannel
+            runtime.compact_channel = BlockChannel(
+                path=cfg.get("block_channel_path", "/tmp/kvmem_block_channel.sock"))
+        except Exception:
+            runtime.compact_channel = None
+    else:
+        runtime.compact_channel = None
     runtime.use_kvmem_plan = bool(cfg.get("use_kvmem_plan", False))
     runtime.use_kvmem_host = bool(cfg.get("use_kvmem_host", True))
     try:
@@ -818,35 +838,99 @@ def register():
             _boot(f"import {module_name} failed: " + traceback.format_exc())
     if not runners:
         return
-    if bool(cfg.get("block_channel", False)):
-        try:
-            from vllm.v1.core.sched.scheduler import Scheduler
-            from kvmem_block_channel import BlockChannelScheduler
+    # Block channel (Route A). The settings are NOT visible at register() time in EngineCore (no
+    # runner exists there), so the hook is installed unconditionally and the socket server starts
+    # lazily on the first schedule whose vllm_config carries `block_channel`.
+    try:
+        from vllm.v1.core.sched.scheduler import Scheduler
+        from kvmem_block_channel import BlockChannelScheduler
 
-            def _alloc(request_id, count):
-                mgr = getattr(_channel_state.get("scheduler"), "kv_cache_manager", None)
-                if mgr is None:
-                    raise RuntimeError("no kv_cache_manager")
-                blocks = mgr.block_pool.get_new_blocks(int(count))
-                return [int(getattr(b, "block_id", b)) for b in blocks]
+        def _sched_cfg(scheduler):
+            try:
+                raw = getattr(getattr(scheduler, "vllm_config", None),
+                              "additional_config", None) or {}
+                kv = raw.get("kvmem") if isinstance(raw, dict) else None
+                return kv if isinstance(kv, dict) else {}
+            except Exception:
+                return {}
 
-            _channel_state = {"scheduler": None, "server": None}
-            original = Scheduler.schedule
-            if not getattr(original, "_kvmem_channel_patched", False):
-                def schedule(self, *args, **kwargs):
-                    _channel_state["scheduler"] = self
-                    if _channel_state["server"] is None:
+        def _alloc(request_id, count):
+            mgr = getattr(_channel_state.get("scheduler"), "kv_cache_manager", None)
+            if mgr is None:
+                raise RuntimeError("no kv_cache_manager")
+            blocks = mgr.block_pool.get_new_blocks(int(count))
+            return [int(getattr(b, "block_id", b)) for b in blocks]
+
+        def _compact(request_id, pages, page_tokens):
+            """Three-book reconciliation (Route A): the worker selected a working set;
+            truncate the request's `_all_token_ids` to the tokens of those pages (in the
+            compacted order the worker will install) and rewind `num_computed_tokens` to the
+            visible length. In-place slice assignment keeps the `ConstantList` view in sync,
+            so `num_tokens` drops to the visible length and the scheduler sees no gap — it
+            will not recompute the spilled tokens. `_output_token_ids` is untouched, so
+            `num_output_tokens` (the API's generated count) stays correct."""
+            scheduler = _channel_state.get("scheduler")
+            if scheduler is None or not pages or page_tokens <= 0:
+                return False
+            req = None
+            for r in list(getattr(scheduler, "running", []) or []):
+                if getattr(r, "request_id", None) == request_id:
+                    req = r
+                    break
+            if req is None:
+                req = (getattr(scheduler, "requests", None) or {}).get(request_id)
+            if req is None:
+                return False
+            all_tokens = req._all_token_ids
+            # The scheduler already built THIS step from the pre-compaction book (accounting in the
+            # worker is one step behind), so its scheduled tokens are still pending: they will be
+            # added to `num_computed_tokens` when the step completes. Set the frontier minus that
+            # pending count, otherwise num_computed catches up to num_tokens and the request is
+            # never scheduled again (measured: generation stalls at 0 tok/s, GPU idle).
+            pending = max(1, len(all_tokens) - int(req.num_computed_tokens))
+            visible = []
+            # `pages` arrives in COMPACTED order, so the visible-space token range of the k-th
+            # page is [k * page_tokens, (k+1) * page_tokens) - NOT [page * page_tokens). The page
+            # id is a LOGICAL page (what the engine wrote before compaction); after the first
+            # compaction the engine's `_all_token_ids` is visible-space, so using the id as an
+            # offset spliced the wrong tokens and corrupted the context from that point on
+            # (measured: a count broke ~50 tokens after the first reselect).
+            for rank, page in enumerate(pages):
+                start = int(rank) * page_tokens
+                if start >= len(all_tokens):
+                    continue
+                visible.extend(all_tokens[start:min(start + page_tokens, len(all_tokens))])
+            if not visible or len(visible) >= len(all_tokens):
+                return len(visible) == len(all_tokens)
+            req._all_token_ids[:] = visible
+            req.num_computed_tokens = max(0, len(visible) - pending)
+            _append(_sched_cfg(scheduler).get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                    {"kind": "compact_applied", "pid": os.getpid(),
+                     "req": request_id, "pages": len(pages),
+                     "visible_tokens": len(visible),
+                     "was_tokens": len(all_tokens)})
+            return True
+
+        _channel_state = {"scheduler": None, "server": None}
+        original = Scheduler.schedule
+        if not getattr(original, "_kvmem_channel_patched", False):
+            def schedule(self, *args, **kwargs):
+                _channel_state["scheduler"] = self
+                if _channel_state["server"] is None:
+                    scfg = _sched_cfg(self)
+                    if scfg.get("block_channel") and scfg.get("inrequest_compaction"):
                         _channel_state["server"] = BlockChannelScheduler(
-                            _alloc, path=cfg.get("block_channel_path",
-                                                 "/tmp/kvmem_block_channel.sock")).start()
-                        _append(cfg.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                            _alloc, path=scfg.get("block_channel_path",
+                                                  "/tmp/kvmem_block_channel.sock"),
+                            compactor=_compact).start()
+                        _append(scfg.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
                                 {"kind": "block_channel_attached", "pid": os.getpid()})
-                    return original(self, *args, **kwargs)
-                schedule._kvmem_channel_patched = True
-                Scheduler.schedule = schedule
-        except Exception:
-            _append(cfg.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
-                    {"kind": "block_channel_error", "error": traceback.format_exc()})
+                return original(self, *args, **kwargs)
+            schedule._kvmem_channel_patched = True
+            Scheduler.schedule = schedule
+    except Exception:
+        _append(cfg.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                {"kind": "block_channel_error", "error": traceback.format_exc()})
     if bool(cfg.get("free_path", False)) or bool(cfg.get("free_probe", False)):
         _attach_free_path(cfg.get("probe_log") or "/tmp/kvmem_free.jsonl")
     if bool(cfg.get("sched_probe", False)):
@@ -985,6 +1069,47 @@ def _install(cls, module_name, probe, smoke, state):
         # DISABLED: the fork does not call this method per step (measured: no call for a 37K
         # request). Kept as documentation; counting happens at execute_model entry instead.
         _boot(f"sample_tokens hook skipped for {module_name}.{cls.__name__}")
+
+    # The V2 runner has no `prepare_pos_seq_lens` METHOD, so the sparse view would never be
+    # installed: the engine would truncate its book (compact) while the block table still pointed
+    # at the pages written at TRUE positions - measured as gibberish output. `prepare_inputs` runs
+    # once per step (prefill and decode) and is where positions/seq_lens are materialised, so the
+    # install (and the row/seq_len/position override) belongs here.
+    if not hasattr(cls, "prepare_pos_seq_lens") and hasattr(cls, "prepare_inputs"):
+        _orig_prepare_inputs = cls.prepare_inputs
+        if not getattr(_orig_prepare_inputs, "_kvmem_v2_patched", False):
+            @functools.wraps(_orig_prepare_inputs)
+            def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc,
+                               *args, **kwargs):
+                out = _orig_prepare_inputs(self, scheduler_output, batch_req_state,
+                                           batch_desc, *args, **kwargs)
+                try:
+                    rt = state.get("sparse")
+                    if rt is not None:
+                        reqs = list(getattr(batch_req_state, "req_ids", None) or [])
+                        counts = getattr(batch_req_state, "num_scheduled_tokens", None)
+                        if reqs and counts is not None:
+                            import numpy as _np
+                            counts_np = _np.asarray(counts, dtype=_np.int64)
+                            csl = _np.concatenate(([0], _np.cumsum(counts_np)))
+                            idx = getattr(batch_req_state, "idx_mapping_np", None)
+                            rt.view.bind_step(idx, reqs, csl)
+                            for gone in [r for r in rt.live_requests() if r not in reqs]:
+                                rt.release(gone)
+                                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                        {"kind": "released", "req": gone, "pid": os.getpid()})
+                            for req in reqs:
+                                row = rt.view.row_index(req)
+                                if row is None:
+                                    continue
+                                rt.before_step(req, row_index=row,
+                                               position_slots=rt.view.query_position_slots(req))
+                except Exception:
+                    _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                            {"kind": "sparse_step_error", "error": traceback.format_exc()})
+                return out
+            prepare_inputs._kvmem_v2_patched = True
+            cls.prepare_inputs = prepare_inputs
 
     _boot(f"patched {module_name}.{cls.__name__}.execute_model")
 

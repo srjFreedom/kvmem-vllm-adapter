@@ -144,6 +144,20 @@ def main():
     reselects = [r for r in logs if r["kind"] == "reselect"]
     check(len(reselects) >= 4, f"reselect happened on schedule ({len(reselects)} times)")
 
+    # --- R cadence baseline: the first decode step anchors at the prompt ----------------
+    rt2 = VllmSparseRuntime(view, selector, PAGE, HEAD_DIM, ROTARY, 1e7,
+                            reselect_interval=10 ** 6, gen_reserve=16384, log=logs.append)
+    rt2.inrequest_compaction = True
+    for step in range(64):
+        engine_allocate(view, [step], base=101)
+        rt2.after_step(1, PAGE, prefill=True)
+    rt2.after_step(1, 1)                      # the first decode step (builds the initial view)
+    o2 = rt2.orchestrator(1)
+    check(64 * PAGE <= o2._tokens_at_reselect <= 64 * PAGE + 1,
+          f"baseline anchored at the prompt, not 0 (got {o2._tokens_at_reselect})")
+    check(o2.reselect_token_budget == 0, "the adapter-invented timer is off under compaction")
+    check(not o2.should_reselect(), "no reselect before R output tokens")
+
     print("PASS sparse_runtime_test" if not failed else "FAILED sparse_runtime_test")
     sys.exit(0 if not failed else 1)
 

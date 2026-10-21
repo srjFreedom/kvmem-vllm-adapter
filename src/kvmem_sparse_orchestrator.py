@@ -291,25 +291,26 @@ class SparseOrchestrator:
             self.selector.set_block_scores(list(scores))
 
     def should_reselect(self):
-        # vLLM keeps a request's sequence monotone and accounts its KV per step, so truncating the
-        # context while a request is alive desynchronises the scheduler (`assert
-        # num_scheduled_tokens >= num_logits`, model_runner.py:1348) - measured for N=1..4 as soon as
-        # the request decodes past ~16 tokens. Compaction is therefore opt-in for this backend: the
-        # default keeps vLLM's original path during generation and uses kvmem for the session-level
-        # H/D tiers and retrieval-based restores.
+        # Compaction rewrites the block table and the scheduler's token book together (three-book
+        # reconciliation, see the BlockChannel compact message), so it is opt-in: the default keeps
+        # vLLM's original monotone path and uses kvmem only for the H/D tiers and retrieval.
         if not bool(getattr(self, "inrequest_compaction", False)):
             return False
         # KVMem semantics: reselect once NEW tokens since the last reselect reach the generation
-        # reserve R. A plain token budget is kept as a safety net for configurations without a
-        # planner, so retrieval never silently stops reselecting.
-        if self.reselect_token_budget and \
-                self.total_tokens - self._tokens_at_reselect >= self.reselect_token_budget:
+        # reserve R - that is the point where the pool (B history + R output) is full. The baseline
+        # is set to the prompt length when prefill completes (see VllmSparseRuntime.after_step), so
+        # R counts OUTPUT tokens, not the prefill.
+        since = self.total_tokens - self._tokens_at_reselect
+        if self.reselect_token_budget and since >= self.reselect_token_budget:
             return True
-        if self.planner is not None and self.planner.gen_reserve:
-            if self.total_tokens - self._tokens_at_reselect >= self.planner.gen_reserve:
-                return True
-        if self.reselect_token_budget and self.total_tokens - self._tokens_at_reselect >= \
-                self.reselect_token_budget:
+        # R is the authority. The planner carries it when the native extension is available; the
+        # runtime copies the same R onto `gen_reserve` so the cadence still holds without it.
+        reserve = 0
+        if self.planner is not None and getattr(self.planner, "gen_reserve", 0):
+            reserve = int(self.planner.gen_reserve)
+        elif getattr(self, "gen_reserve", 0):
+            reserve = int(self.gen_reserve)
+        if reserve and since >= reserve:
             return True
         return self.steps_since_reselect >= self.reselect_interval
 

@@ -987,3 +987,86 @@ worker `--kvmem-capture-tokens`、启动脚本 `CAPTURE_TOKENS=`、落盘 `kvmem
 
 待验证的优化方向（未做）：`MAX_BATCHED_TOKENS` 4096 → 8192/16384 可减少 chunk 数；历史记录里提过
 调大会让启动 smoke 失败，需要在当前配置下重试确认。
+
+## Route A：引擎内压缩（ninfer 对等）——实现与验证计划（2026-10-21）
+
+**目标**：把 ninfer 的「超 R 生成」搬进 vLLM。物理池仍是每请求 `B+R`，但请求可以一直生成到
+`CTX-B`：池子填满时重选（sink+media+recent 保留、其余溢写 host 层），并把引擎侧的记账一起截断，
+使 vLLM 认识「被压缩的序列」。
+
+### 决策项（D1–D6）与状态
+
+| 项 | 决策 | 状态 |
+|---|---|---|
+| D1 入口上限 | 压缩关：`max_tokens` 夹到 R；压缩开：上限 `CTX-B`（逻辑预算），R 退化为重选节拍 | ✅ `EntryPolicy.generation_ceil()`，两条入口（原始 payload + OpenAI 中间件）共用 |
+| D2 三本账对账 | worker 重写 block table 后，经 `BlockChannel.compact` 让 EngineCore **原地** `_all_token_ids[:] = visible` 并回退 `num_computed_tokens` | ✅ 通道 + `_compact` 闭包；`ConstantList` 视图同步 |
+| D3 前缀缓存 | 内容寻址（`H(parent_hash, tokens)`）、释放即失效，压缩不污染 | ✅ 无需改动 |
+| D4 引擎窗口 | `max_model_len = N×(B+R)` 已大于单请求可见长度；压缩后 `_all_token_ids` 恒 ≤ B+R，长度上限永不误触发 | ✅ 无需改动 |
+| D5 在途草稿 | 带草稿的步推迟压缩（≤1 个投机轮次浪费），下一次无草稿步执行 | ✅ `deferred = has_drafts or prefill_step` |
+| D6 调度模式 | 压缩必须在 **decode** 步执行；async 会预排下一步、与改写冲突 → 压缩开启**强制同步**，显式 `NO_ASYNC_SCHEDULING=0` 也会被覆盖并打印原因 | ✅ `async_scheduling_mode()` + 单测 |
+| 闸门方向 | 旧逻辑把 decode 步全部推迟（只允许 prefill 压缩）；Route A 需要 decode 压缩，prefill 交给 prefill-pressure 路径 | ✅ 已翻转 |
+
+### 触发语义
+
+* 池是**一段连续的 B+R 空间**，判定「B 和 R 都满了」→ 重选。实现为：`_tokens_at_reselect` 在
+  **prefill 结束**时锚定到 prompt 长度，之后 `total_tokens - baseline >= R` 才触发；首个 decode 步
+  的初始视图构建会重选一次（与入口 B 选择幂等），其后严格每 R 个输出 token 一次。
+* 适配器不自建定时器：`reselect_token_budget` 在压缩模式下置 0，R 由 planner 提供；无原生扩展时
+  用 runtime 的 `gen_reserve` 兜底。
+
+### 一对开关（必须同时开）
+
+| 开关 | 位置 | 作用 |
+|---|---|---|
+| `KVMEM_ENTRY_INREQUEST_COMPACTION=1` | 入口进程 env | 生成上限从 R 抬到 CTX-B |
+| `--kvmem-inrequest-compaction` | 引擎 worker CLI | 开启引擎内压缩、block 通道、强制同步 |
+
+只开入口 → 上限放开但引擎不压缩，池会被撑爆；只开引擎 → 入口仍夹 R，压缩永不触发。
+
+### 行为契约
+
+| 压缩 | 输出上限 | 调度 | 引擎序列 |
+|---|---|---|---|
+| 关（默认） | R（客户端要更多也只到 R，正常 finish） | 异步（显式 `NO_ASYNC_SCHEDULING` 优先） | 单调、block table prefill 后冻结 |
+| 开 | 客户端 `max_tokens`，到顶 `CTX-B`；唯一停止条件是 `max_tokens`/EOS | **强制同步** | 循环回收，`_all_token_ids` 恒 ≤ B+R |
+
+### 验证状态
+
+* 单测：入口上限 4 种取值、cadence/基线、强制同步、对账通道 —— 全绿（全套 38 个非 GPU 测试，
+  `PYTHONPATH=build/python` 时 `disk_tier_test` 也过）。
+* 活引擎矩阵（待跑，需先腾卡）：埋针正确性 / N=2 并发 / prefix-cache TTFT 不退化 / MTP 长生成不崩 /
+  5050 复现（B=256 R=128，输出 512、1024，池恒 384）。
+* 站点脚本注意：`NO_ASYNC_SCHEDULING=0` 在压缩开启时会被 worker 覆盖为 1（打印提示），不需要手改。
+
+### 活引擎验证（2026-10-21 深夜，Route A 首轮）
+
+首轮活引擎（生产配置 + 5050 小配置各一次）暴露并修掉了 5 个真 bug——它们都属于
+「代码写好了但从未真跑过」的那类：
+
+| # | 症状 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | `compact_error: No such file or directory`，三本账从未生效 | EngineCore 里 `register()` 拿不到 `--additional-config`，`cfg.get("block_channel")` 恒 False | 通道改为**懒启动**：`Scheduler.schedule` 钩子无条件安装，首次读到 `block_channel` 配置时起 socket |
+| 2 | 每次重选抛 `selection/reserve/host payload budget exceeded` | 入口/选择器按 128-token 块粒度会略超 B（实测 53929 > 53248），kvmem 内核严格拒绝 | `KvmemPlanner.plan` 按排名裁到 `budget_tokens` 内，mandatory 不动 |
+| 3 | 重选后请求卡死（GPU 0%、吞吐 0） | compact 在下一步已排期后才应用，`num_computed` 被该步再加一次 → `num_tokens == num_computed`，永不再调度 | `_compact` 按在途步数回退：`num_computed = len(visible) - pending` |
+| 4 | 输出全是乱码 | 这台引擎是 V2 runner，**没有 `prepare_pos_seq_lens` 方法**，sparse view（row/seq_len/positions）从未安装，引擎却已截断账本 | 给 `prepare_inputs` 加钩子：`bind_step` + `before_step`（复用现成 LiveRunnerView） |
+| 5 | 安装后仍乱码 | `positions` 用「含 query 的长度」做基准，整体偏移 n（解码 +1、prefill 整块） | 基准改为 `seq_len - n` |
+| — | planner/runtime 用了默认 B/R | 插件构造 runtime 时没传 `budget_tokens/gen_reserve/...`（用了 32768/16384） | 构造时传全，规划器/节拍与 CLI 一致 |
+
+修复后小池（B=256 R=128）确实跑出了 Route A 的闭环：单请求 14 次 `compact_applied`，
+可见集稳定在 310–326 ≤ B+R=384，首个用例密钥在压缩后仍正确回写。
+
+**仍未通过**：连续数字在 ~50 个之后出现错位（如预期 52 却输出 5/554），说明压缩边界上
+仍有一处 KV/位置不一致（最可能是搬运边界那一页的 RoPE/槽位，或 pending token 的位置）。
+下一轮要用「单页边界 + 逐步对账」的方式定位，而不是继续盲改。
+
+### Route A 第二轮定位（同日，小池 B=256 R=128）
+
+| 发现 | 证据 | 处理 |
+|---|---|---|
+| compact 把**逻辑页号**当可见空间偏移 | `start = page * page_tokens`；第一次压缩后引擎的 `_all_token_ids` 是可见空间 | 改为按排名：`start = rank * page_tokens` |
+| 压缩关时（同小池）数字序列连续，压缩开时 ~60 处坏 | 基线跑到 max_model_len=1024 上限，1..29 连续无误；开压缩时 61 号变 6 / 62 号变 6200 | 说明损坏由压缩路径引入，不是模板/采样 |
+| 关掉 MTP 仍坏 | SPECULATIVE_TOKENS=0 时同样在 ~62 坏 | 排除投机解码交互 |
+
+**当前阻塞**：压缩边界处仍有一个 token 的 KV/位置不一致（表现为数字某一位错/多一位）。
+下一步应做逐步对账（重选后逐 token 比对引擎 `num_tokens`、运行时 `seq_len`、行内容与
+`_all_token_ids` 的实际切片），而不是继续猜。
