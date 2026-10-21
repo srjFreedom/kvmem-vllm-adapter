@@ -620,6 +620,7 @@ class VllmSparseRuntime:
         record = {"kind": "reselect", "req": req, "selected": stats["selected"],
                   "evicted": stats["evicted"], "resident": stats["resident"],
                   "seq_len": st.seq_len, "tokens": st.tokens,
+                  "prompt": prompt_tokens, "mandatory_pages": len(mandatory),
                   "prefill_pressure": stats["prefill_pressure"]}
         cap = getattr(self, "capture", None)
         if cap is not None:

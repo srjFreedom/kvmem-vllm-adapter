@@ -1150,3 +1150,21 @@ ninfer 对等必须原地复用引擎页，另存副本在 B≈池/2 时物理�
 
 **仍卡**：选择器只保留 4368 token（< prompt 5540）时，`compact_refused` 之后请求仍停在 running。
 下一步：让 mandatory 真正生效（planner 的 trim 是否把 mandatory 也裁了），且「拒绝」路径不得影响请求继续。
+
+### Route A 第八轮：mandatory 生效，但两个 TP rank 选页不一致
+
+证据（同一请求、两个 rank）：
+
+| rank | mandatory_pages | selected | seq_len | compact |
+|---|---|---|---|---|
+| A | 347 | 507 | 8112 | truncated |
+| B | 347 | **273** | **4368** | refused（< prompt 5539） |
+
+- mandatory 在正常路径确实生效：5.5K prompt + 4350 输出、两次节拍重选 → 1450/1450 行，48.8s ✅
+- 但 rank B 只选出 273 页（< mandatory 347 页），导致 `visible < prompt` → 拒绝 → 请求停在 running
+
+**根因假设**：两个 rank 的 `orch.total_tokens`（运行时候选判据）不一致——MTP 下运行时按
+`num_scheduled_tokens` 计数（含被拒绝的草稿），两卡的接受情况不同 → 选页范围不同。
+`note_engine_computed` 已加但看起来没生效（runtime tokens 9638 vs 引擎 8112）。
+下一轮：确认 `note_engine_computed` 是否被调用（V2 hook 里 `req_states.num_computed_tokens_np`
+是否可读），保证两 rank 的计数一致。
