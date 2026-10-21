@@ -144,18 +144,18 @@ after_step_error: 0        （槽位增长修复后）
 适配器的 CMake 把 kvmem 钉在：
 
 ```
-set(KVMEM_BASE "/home/srj/src/kvmem-adapter-base")
+set(KVMEM_BASE "$HOME/src/kvmem-adapter-base")
 ```
 
 而这个 worktree 是**较早的 kvmem**，`kvmem/include/kvmem/` 下没有 `nvme_kv_tier.hpp`；
-磁盘层只存在于 `/home/srj/src/kvmem-v018rc1/kvmem/include/kvmem/nvme_kv_tier.hpp`。
+磁盘层只存在于 `<kvmem>/kvmem/include/kvmem/nvme_kv_tier.hpp`。
 
 因此 `#include "kvmem/nvme_kv_tier.hpp"` 直接编译失败（`No such file or directory`），
 我已把尝试过的 pybind 绑定**回退**，扩展恢复可编译（`vllm_contract_test` 仍 Passed）。
 
 接入磁盘层有两条明确路径（都属于 ④ 的"升级对接"范畴）：
 
-1. **升基座**：把 `KVMEM_BASE` 指向 `/home/srj/src/kvmem-v018rc1`，重新构建并跑
+1. **升基座**：把 `KVMEM_BASE` 指向 kvmem v0.18.0 源码，重新构建并跑
    `check_integration_surface.py`（contract 若有变动，清单会指出要改哪几行）；
 2. **补齐头文件**：把 `nvme_kv_tier.hpp` 及其依赖（`nvme_io.hpp` 等）回移到 adapter-base。
 
@@ -756,7 +756,7 @@ in-request 压缩不可用后，H/D 层失去了活引擎消费者。解决办�
 
 ## 收尾：对 vLLM 源码的实际改动面（2026-10-21 07:3x，核对 git）
 
-`/home/srj/vLLM-2080Ti-Definitive` 工作区共有 14 个改动文件，但**本适配器引入的只有 2 处**：
+vLLM fork 工作区共有 14 个改动文件，但**本适配器引入的只有 2 处**：
 
 | 文件 | 性质 |
 |---|---|
@@ -954,7 +954,7 @@ worker `--kvmem-capture-tokens`、启动脚本 `CAPTURE_TOKENS=`、落盘 `kvmem
 
 ### KVMem Web UI 同端口挂载
 
-`/home/srj/kvmem-ui`（SvelteKit 静态构建）现在由端点插件在 `attach_router` 里挂到 `/`，
+`KVMEM_UI_DIR`（SvelteKit 静态构建）现在由端点插件在 `attach_router` 里挂到 `/`，
 因此 `http://<host>:18200/` 就是 KVMem 的 Web UI，和 API 同源同端口（UI 内部用的是相对路径
 `/v1/models`、`./v1/chat/completions`，不需要代理）。挂载在核心路由之后，`/v1/*`、`/health`、
 `/docs` 优先，实测全部 200。

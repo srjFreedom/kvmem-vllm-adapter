@@ -45,7 +45,7 @@ curl -s http://127.0.0.1:18200/metrics | grep vllm:kv_cache_usage_perc
 ```bash
 ss -tln | grep -E ':(8001|8100|18200) '    # 只应出现 18200
 systemctl list-units 'kvmem*'              # 只应有 kvmem-vllm
-tail -f /home/srj/kvmem.log                # 应出现 "kvmem entry policy:" 与 entry_rewrite
+tail -f ~/kvmem.log                # 应出现 "kvmem entry policy:" 与 entry_rewrite
 ```
 
 判据：只有一个 HTTP 端口；`/v1/chat/completions` 的长历史被裁剪；无第二个服务进程。

@@ -81,7 +81,7 @@ def main(argv=None) -> int:
                   "(KVMEM_CAPTURE=1)")
     env["ADDITIONAL_CONFIG_JSON"] = payload
     env["KVMEM_PLUGIN_CONFIG"] = ""          # no side-channel file
-    # Launcher scripts ship with the adapter (deploy/), so a clone works without /home/srj paths.
+    # Launcher scripts ship with the adapter (deploy/), so no site-specific absolute paths are needed.
     # KVMEM_LAUNCH_SCRIPT overrides both for site-specific launchers.
     script = os.environ.get("KVMEM_LAUNCH_SCRIPT") or os.path.join(
         ADAPTER, "deploy",

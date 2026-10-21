@@ -46,7 +46,7 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 | `KVMEM_ENTRY_MODE` | `middleware` | 入口策略实现：`middleware`（标准 Starlette body 改写，默认）/ `hook`（解析后请求上的兜底钩子）|
 | `KVMEM_ENTRY_SELECT` | `retrieval` | 选片打分方式：`retrieval`（按问题检索）/ `recency`（只留 sink+最近，不检索）|
 | `DISABLE_PREFIX_CACHING` | `0` | `1` 关闭 vLLM 前缀缓存。**仅当**启用 `--kvmem-inrequest-compaction` 时必须关 |
-| `KVMEM_UI_DIR` | `/home/srj/local-model-console` | 同端口挂载的静态 UI；空字符串 = 不挂 |
+| `KVMEM_UI_DIR` | 空 | 同端口挂载的静态 UI；空字符串 = 不挂 |
 
 ### 内存分层
 
@@ -75,7 +75,7 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
-| `MODEL` | `/home/srj/models/Coder390/FP8-fp8mtp` | 权重目录（需含 `config.json`、tokenizer、safetensors）。**不限于 FP8**：vLLM 支持的模型都能用，本部署的 FP8+MTP 只是实测配置 |
+| `MODEL` | `$HOME/models/Coder390/FP8-fp8mtp`（示例）| 权重目录（需含 `config.json`、tokenizer、safetensors）。**不限于 FP8**：vLLM 支持的模型都能用，本部署的 FP8+MTP 只是实测配置 |
 | `CHAT_TEMPLATE_FILE` | `.../FP8/chat_template.jinja` | 聊天模板；该模型内置模板为空，必须显式给 |
 | `PROFILE` | `2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env` | 引擎档位 .env（量化/KV dtype/上下文/投机），经 worker.py exec 的 `run-kvmem-sparse.sh`(N=1)/`run-kvmem-4way.sh`(N>1) 喂给 launcher.sh。**N=1 改环境变量即生效；N>1 时 4way 脚本写死同一路径，要改脚本** |
 | `SERVED_NAME` | `Qwen3.8-27B-Coder390-EfficientThink-FP8-MTP` | 对外模型 id（客户端用它）|
@@ -93,8 +93,8 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 | 变量 | 默认 | 用途 |
 |---|---|---|
 | `USE_LOCAL_FORK` | `1` | `1` 用本机已有的 vLLM fork；`0` 按 `backends/versions.json` 拉固定 commit |
-| `VLLM_ROOT` | `/home/srj/vLLM-2080Ti-Definitive` | vLLM fork 路径（`USE_LOCAL_FORK=1` 时）|
-| `KVMA_SRC` | `/home/srj/src/kvmem-v018rc1` | kvmem 源码（编译原生扩展要头文件+库）；不存在会自动拉 `v0.18.0` |
+| `VLLM_ROOT` | `$HOME/vLLM-2080Ti-Definitive` | vLLM fork 路径（`USE_LOCAL_FORK=1` 时）|
+| `KVMA_SRC` | `$HOME/src/kvmem-v018rc1` | kvmem 源码（编译原生扩展要头文件+库）；不存在会自动拉 `v0.18.0` |
 | `PY` | `$VLLM_ROOT/.venv/bin/python` | 用哪个 Python 环境；**已有可用 venv 时指过来就不用建** |
 | `GPU_UTIL` / `MAX_BATCHED_TOKENS` / … | 见上文"引擎与硬件" | 同样可在这层用环境变量覆盖 |
 | `ENGINE` / `PY_VER` | 由脚本推导 / `3.12` | `setup-venv.sh` 的目标引擎与 Python 版本 |

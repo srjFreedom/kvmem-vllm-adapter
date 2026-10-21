@@ -69,7 +69,7 @@ USE_LOCAL_FORK=0 ./install.sh            # fetch engines → patch → plugin �
 ENGINE=$PWD/engines/vllm ./scripts/setup-venv.sh   # torch / CUDA (several GB; skip if you have a venv)
 
 cp deploy/kvmem-vllm.service /etc/systemd/system/
-cp deploy/start-example.sh /home/srj/start-kvmem-vllm.sh    # site config: B/R/N/MODEL/...
+cp deploy/start-example.sh ~/start-kvmem-vllm.sh    # site config: B/R/N/MODEL/...
 sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
 scripts/wait_ready.sh 18200 900 --smoke
 ```
@@ -116,10 +116,10 @@ plus `systemctl restart`. Full parameter reference: **[docs/PARAMETERS.md](docs/
 ```bash
 B=36864 R=16384 CTX=524288 SINK=8192 RECENT=2048 N=1 PORT=18200
 CAPTURE_TOKENS=512 GPU_UTIL=0.97 MAX_BATCHED_TOKENS=4096 THINKING_BUDGET=
-MODEL=/home/srj/models/Coder390/FP8-fp8mtp
+MODEL=$HOME/models/Coder390/FP8-fp8mtp
 CHAT_TEMPLATE_FILE=.../chat_template.jinja
 PROFILE=2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env
-KVMEM_UI_DIR=/home/srj/local-model-console
+KVMEM_UI_DIR=$HOME/kvmem-ui
 ```
 
 The constraint that bites: **engine window = `N × (B + R)` must fit the KV pool** (210,651 tokens on
@@ -136,8 +136,8 @@ records what is actually in force.
 
 ```bash
 sudo systemctl start|stop|restart kvmem-vllm
-tail -f /home/srj/kvmem.log          # engine and entry policy in one log
-cat /home/srj/kvmem-params.env       # effective parameters
+tail -f ~/kvmem.log          # engine and entry policy in one log
+cat ~/kvmem-params.env       # effective parameters
 curl -s localhost:18200/health       # health
 curl -s localhost:18200/metrics      # vllm:* metrics (prefill/decode/KV usage)
 ```
@@ -164,7 +164,7 @@ uses both GPUs).
 ## Tests and probe
 
 ```bash
-PY=/home/srj/vLLM-2080Ti-Definitive/.venv/bin/python
+PY=$HOME/vLLM-2080Ti-Definitive/.venv/bin/python
 for t in tests/*_test.py; do PYTHONPATH="build/python:src:plugin" $PY "$t"; done   # 39, all PASS
 python3 scripts/check_integration_surface.py        # 28/28 vLLM/kvmem touch points
 ./run-gpu-tests.sh                                  # GPU mode (stop the service first)

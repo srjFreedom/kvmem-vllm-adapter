@@ -65,7 +65,7 @@ USE_LOCAL_FORK=0 ./install.sh            # 拉引擎 → 打补丁 → 装插件
 ENGINE=$PWD/engines/vllm ./scripts/setup-venv.sh   # torch / CUDA（几个 GB，已有 venv 可跳过）
 
 cp deploy/kvmem-vllm.service /etc/systemd/system/
-cp deploy/start-example.sh /home/srj/start-kvmem-vllm.sh    # 站点参数：B/R/N/MODEL/...
+cp deploy/start-example.sh ~/start-kvmem-vllm.sh    # 站点参数：B/R/N/MODEL/...
 sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
 scripts/wait_ready.sh 18200 900 --smoke
 ```
@@ -108,10 +108,10 @@ systemd 的 `ExecStart` 指向哪个 `start-*.sh` 就启动哪套配置，切换
 ```bash
 B=36864 R=16384 CTX=524288 SINK=8192 RECENT=2048 N=1 PORT=18200
 CAPTURE_TOKENS=512 GPU_UTIL=0.97 MAX_BATCHED_TOKENS=4096 THINKING_BUDGET=
-MODEL=/home/srj/models/Coder390/FP8-fp8mtp
+MODEL=$HOME/models/Coder390/FP8-fp8mtp
 CHAT_TEMPLATE_FILE=.../chat_template.jinja
 PROFILE=2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env
-KVMEM_UI_DIR=/home/srj/local-model-console
+KVMEM_UI_DIR=$HOME/kvmem-ui
 ```
 
 关键约束：**引擎窗口 = `N × (B + R)` 必须装进 KV 池**（本机 210,651 token）。
@@ -125,8 +125,8 @@ KVMEM_UI_DIR=/home/srj/local-model-console
 
 ```bash
 sudo systemctl start|stop|restart kvmem-vllm
-tail -f /home/srj/kvmem.log          # 引擎 + 入口策略同一份日志
-cat /home/srj/kvmem-params.env       # 本次生效参数
+tail -f ~/kvmem.log          # 引擎 + 入口策略同一份日志
+cat ~/kvmem-params.env       # 本次生效参数
 curl -s localhost:18200/health       # 健康
 curl -s localhost:18200/metrics      # vllm:* 指标（prefill/decode/KV 使用率）
 ```
@@ -152,7 +152,7 @@ curl -s localhost:18200/metrics      # vllm:* 指标（prefill/decode/KV 使用�
 ## 测试与探针
 
 ```bash
-PY=/home/srj/vLLM-2080Ti-Definitive/.venv/bin/python
+PY=$HOME/vLLM-2080Ti-Definitive/.venv/bin/python
 for t in tests/*_test.py; do PYTHONPATH="build/python:src:plugin" $PY "$t"; done   # 39 个，全 PASS
 python3 scripts/check_integration_surface.py        # 28/28 个 vLLM/kvmem 接触点
 ./run-gpu-tests.sh                                  # GPU 模式（需先停服务）

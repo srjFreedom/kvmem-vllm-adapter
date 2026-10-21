@@ -1066,7 +1066,7 @@ qwen3_next` 拿到的是另一个模块实例。
 **决定性线索**在启动日志里：
 
 ```
-Directly load AOT compilation from path /home/srj/.cache/vllm/...
+Directly load AOT compilation from the vLLM cache directory, e.g. $HOME/.cache/vllm/...
 ```
 
 fork 支持 `VLLM_USE_AOT_COMPILE`（`vllm/envs.py:138`），并把编译产物缓存到磁盘。加载该产物后，
