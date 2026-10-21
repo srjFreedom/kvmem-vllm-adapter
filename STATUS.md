@@ -1108,3 +1108,18 @@ positions 基准改为 `seq_len - n`；压缩只在 decode 步触发；槽位从
   当前的「副本 + 独立槽池」模型只在 B 远小于池时可行（小 prompt 场景已全通）
 
 短上下文（900 行/2820 token/跨一次重选）四连发全干净，说明压缩、对账、节拍、跨请求释放都正确。
+
+### Route A 第五轮：长 prefill 后首次截断仍卡死（已定位到边界条件）
+
+| 用例 | 结果 |
+|---|---|
+| 短 prompt + 长生成（900 行/2820 token，跨 R 节拍截断） | ✅ 四连发全干净 |
+| 长 prompt（8K with B=8192 / 53K with B=53248） | ❌ prefill 100% 后、首次 decode 截断 → 引擎空闲（GPU 0%），客户端挂起 |
+
+关键区分：**decode 中途的截断是好的**（短 prompt 跨节拍截断正常），**长 prefill 结束后的首次截断**
+不好。compact 的账本数学已加探针（before_computed/pending/after_tokens/after_computed），下一轮从
+调度器状态（请求是否仍 running、num_new_tokens、块分配）定位。
+
+本轮另修：`_absorb_engine_row` 从「每 token 一次 row.tolist()」提到每步一次（长 prefill 原来是 O(n²)）。
+原地重排的实现试过但离线夹具未同步、活引擎仍未通过，已回退，保留设计结论：
+ninfer 对等必须原地复用引擎页，另存副本在 B≈池/2 时物理不可行。

@@ -910,7 +910,14 @@ def register():
                     {"kind": "compact_applied", "pid": os.getpid(),
                      "req": request_id, "pages": len(pages),
                      "visible_tokens": len(visible),
-                     "was_tokens": len(all_tokens)})
+                     "was_tokens": len(all_tokens),
+                     # Book reconciliation proof: the scheduler continues with
+                     # num_tokens = after_tokens and num_computed = after_computed; a request with
+                     # zero new tokens is never scheduled again (the GPU idles, client hangs).
+                     "before_computed": int(before_computed),
+                     "pending": int(pending),
+                     "after_tokens": len(req._all_token_ids),
+                     "after_computed": int(req.num_computed_tokens)})
             return True
 
         _channel_state = {"scheduler": None, "server": None}

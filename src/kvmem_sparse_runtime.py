@@ -409,13 +409,15 @@ class VllmSparseRuntime:
         if not st.row and n_new_tokens:
             # Before the first reselect the engine writes at TRUE positions: the page holding
             # token p is logical page p // page_tokens and its slot is the same id (delta 0).
+            # Absorb the engine's row ONCE per step, not per token: `row.tolist()` inside the loop
+            # made a long prefill quadratic (53K tokens x a 3.4K-entry row).
+            self._absorb_engine_row(req)
             for i in range(n_new_tokens):
                 logical = (st.tokens + i) // self.page_tokens
                 if logical in orch.store.pages:
                     continue
                 # The engine allocated this page itself; use ITS id (never a self-built pool,
                 # which exhausted on long runs and does not own page ids).
-                self._absorb_engine_row(req)
                 slot = self._page_map[req].get(logical)
                 if slot is None:
                     continue
