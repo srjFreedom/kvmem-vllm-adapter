@@ -76,12 +76,12 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 |---|---|---|
 | `MODEL` | `/home/srj/models/Coder390/FP8-fp8mtp` | 权重目录（需含 `config.json`、tokenizer、safetensors）。**不限于 FP8**：vLLM 支持的模型都能用，本部署的 FP8+MTP 只是实测配置 |
 | `CHAT_TEMPLATE_FILE` | `.../FP8/chat_template.jinja` | 聊天模板；该模型内置模板为空，必须显式给 |
-| `PROFILE` | `2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env` | **仅稀疏版 `run-kvmem-sparse.sh` 读取**（launcher.sh `--profile`）：量化、KV dtype、上下文、视觉、投机档。主线 `run-kvmem-vllm.sh → worker.py` 不读它 |
+| `PROFILE` | `2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env` | 引擎档位 .env（量化/KV dtype/上下文/投机），经 worker.py exec 的 `run-kvmem-sparse.sh`(N=1)/`run-kvmem-4way.sh`(N>1) 喂给 launcher.sh。**N=1 改环境变量即生效；N>1 时 4way 脚本写死同一路径，要改脚本** |
 | `SERVED_NAME` | `Qwen3.8-27B-Coder390-EfficientThink-FP8-MTP` | 对外模型 id（客户端用它）|
 
-换模型的最短清单：`MODEL` + `CHAT_TEMPLATE_FILE` + `SERVED_NAME`（主线）。仍用稀疏版时再加 `PROFILE`。
+换模型的最短清单：`MODEL` + `CHAT_TEMPLATE_FILE` + `PROFILE` + `SERVED_NAME`。
 
-- （仅稀疏版）量化不再是 FP8 时，`PROFILE` 里的量化/KV dtype 也要跟着换（或直接改 `--set` 项）；主线无此操作
+- 量化不再是 FP8 时，`PROFILE` 里的量化/KV dtype 也要跟着换（或直接改 `--set` 项）。N>1 时 4way 脚本写死了 profile 路径，要改脚本
 - **检索打分**需要 pre-RoPE query 钩子，目前只加在 `qwen3_next.py`（Qwen3.5/3.8 架构）；
   换架构要加同样两行。没有钩子时其他能力（入口选片、R 上限、H/D 缓存、前缀缓存）不受影响
 

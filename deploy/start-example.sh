@@ -39,9 +39,11 @@ export THINKING_BUDGET=${THINKING_BUDGET:-}       # 空 = 思考 token 无上限
 # ---- 权重（任意 vLLM 支持的模型；换模型时这几项要一起改）----
 export MODEL=${MODEL:-/home/srj/models/Coder390/FP8-fp8mtp}
 export CHAT_TEMPLATE_FILE=${CHAT_TEMPLATE_FILE:-/home/srj/models/Coder390/FP8/chat_template.jinja}
-# PROFILE 只对 run-kvmem-sparse.sh（旧稀疏版，launcher.sh --profile）生效；
-# 主线 run-kvmem-vllm.sh -> worker.py 不读它——量化/MTP/KV dtype/上下文
-# 全部来自权重目录 config.json 与 worker 显式参数，改它对主线行为无作用。
+# PROFILE = 引擎档位（.env：量化/KV dtype/上下文/投机档），最终被 vLLM fork 的
+# launcher.sh 消费。worker.py 自己不解析它，但会 exec run-kvmem-sparse.sh(N=1)
+# 或 run-kvmem-4way.sh(N>1)，两者把 profile 喂给 launcher.sh。
+#   N=1：sparse 读 ${PROFILE:-…}，改这个环境变量即生效。
+#   N>1：4way 把同一路径写死，改 PROFILE 无效，要直接改 run-kvmem-4way.sh。
 export PROFILE=${PROFILE:-2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env}
 export SERVED_NAME=${SERVED_NAME:-Qwen3.8-27B-Coder390-EfficientThink-FP8-MTP}
 
