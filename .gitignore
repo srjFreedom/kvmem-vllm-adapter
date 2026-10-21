@@ -15,3 +15,6 @@ smoke_live_engine.json
 # editor / backup files
 *.bak*
 *~
+
+# engines are fetched at a pinned commit by scripts/prepare-backends.py (not vendored)
+engines/

@@ -1,0 +1,612 @@
+diff --git a/launcher.sh b/launcher.sh
+index 293891285b..2b0eb3e777 100755
+--- a/launcher.sh
++++ b/launcher.sh
+@@ -192,7 +192,9 @@ validate_configured_kv_concurrency() {
+     return 1
+   fi
+ 
+-  required=$((max_num_seqs * max_model_len))
++  # KVMem稀疏模式:实际驻留按 B+R 计,不是 max_model_len。仅在显式设置时生效(默认行为不变)。
++  local effective_len=${KV_CONCURRENCY_EFFECTIVE_LEN:-$max_model_len}
++  required=$((max_num_seqs * effective_len))
+   if (( total < required )); then
+     echo "ERROR: configured concurrency cannot be admitted by the allocated GPU KV cache." >&2
+     echo "  GPU KV tokens: $total" >&2
+@@ -4963,6 +4965,7 @@ build_args() {
+     VLLM_ARGS+=(--disable-custom-all-reduce)
+   fi
+   [[ "${DISABLE_LOG_STATS:-0}" == "1" ]] && VLLM_ARGS+=(--disable-log-stats)
++  [[ -n "${DISABLE_ACCESS_LOG_FOR_ENDPOINTS:-}" ]] && VLLM_ARGS+=(--disable-access-log-for-endpoints "$DISABLE_ACCESS_LOG_FOR_ENDPOINTS")
+   [[ -n "${ATTENTION_BACKEND:-}" ]] && VLLM_ARGS+=(--attention-backend "$ATTENTION_BACKEND")
+   if [[ -n "${REASONING_PARSER:-}" ]] && ! reasoning_parser_is_disabled; then
+     VLLM_ARGS+=(--reasoning-parser "$REASONING_PARSER")
+diff --git a/profiles/2x2080Ti/README.md b/profiles/2x2080Ti/README.md
+index ffdddf99f1..89f1c6d717 100644
+--- a/profiles/2x2080Ti/README.md
++++ b/profiles/2x2080Ti/README.md
+@@ -10,7 +10,7 @@ Tested weight: [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP
+ | `qwen27b/w8a16/nomtp-fp16kv-1x176K-text-only.env` | 176K | FP16 | None (autoregressive) | text-only | 179,940 | 1694.94 / 33.17 | 1483.04 / 30.80 |
+ | `qwen27b/w8a16/nomtp-fp16kv-1x121K-text-image.env` | 121K | FP16 | None (autoregressive) | text+image | 122,608 | 1697.78 / 32.81 | 1447.04 / 30.65 |
+ | `qwen27b/w8a16/mtp4-fp8kv-1x262K-text-only.env` | 262K | FP8 | MTP/4 | text-only | 295,455 | 1623.68 / 94.60 | 1393.94 / 92.47 |
+-| `qwen27b/w8a16/mtp4-fp8kv-1x186K-text-image.env` | 186K | FP8 | MTP/4 | text+image | 190,540 | 1634.73 / 96.11 | 1384.95 / 93.17 |
++| `qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env` | 184K | FP8 | MTP/4 | text+image | 190,540 | 1634.73 / 96.11 | 1384.95 / 93.17 |
+ | `qwen27b/w8a16/yarn-fp8kv-1x338K-text-only.env` | 338K | FP8 | None + YaRN | text-only | 354,143 | 1239.30 / 23.71 | 1338.48 / 17.91 |
+ 
+ ## Qwen3.8-27B-NVFP4
+diff --git a/profiles/2x2080Ti/README.zh-CN.md b/profiles/2x2080Ti/README.zh-CN.md
+index a42427102e..77ed9409af 100644
+--- a/profiles/2x2080Ti/README.zh-CN.md
++++ b/profiles/2x2080Ti/README.zh-CN.md
+@@ -10,7 +10,7 @@
+ | `qwen27b/w8a16/nomtp-fp16kv-1x176K-text-only.env` | 176K | FP16 | 无/自回归 | text-only | 179,940 | 1694.94 / 33.17 | 1483.04 / 30.80 |
+ | `qwen27b/w8a16/nomtp-fp16kv-1x121K-text-image.env` | 121K | FP16 | 无/自回归 | text+image | 122,608 | 1697.78 / 32.81 | 1447.04 / 30.65 |
+ | `qwen27b/w8a16/mtp4-fp8kv-1x262K-text-only.env` | 262K | FP8 | MTP/4 | text-only | 295,455 | 1623.68 / 94.60 | 1393.94 / 92.47 |
+-| `qwen27b/w8a16/mtp4-fp8kv-1x186K-text-image.env` | 186K | FP8 | MTP/4 | text+image | 190,540 | 1634.73 / 96.11 | 1384.95 / 93.17 |
++| `qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env` | 184K | FP8 | MTP/4 | text+image | 190,540 | 1634.73 / 96.11 | 1384.95 / 93.17 |
+ | `qwen27b/w8a16/yarn-fp8kv-1x338K-text-only.env` | 338K | FP8 | 无 + YaRN | text-only | 354,143 | 1239.30 / 23.71 | 1338.48 / 17.91 |
+ 
+ ## Qwen3.8-27B-NVFP4
+diff --git a/profiles/2x2080Ti/qwen27b/w4a16/mtp4-fp8kv-1x262K-text-image.env b/profiles/2x2080Ti/qwen27b/w4a16/mtp4-fp8kv-1x262K-text-image.env
+new file mode 100644
+index 0000000000..4214f1a3e4
+--- /dev/null
++++ b/profiles/2x2080Ti/qwen27b/w4a16/mtp4-fp8kv-1x262K-text-image.env
+@@ -0,0 +1,10 @@
++MODEL_FAMILY=qwen35
++MODEL_VARIANT=nvfp4
++QUANTIZATION=compressed-tensors
++KV_CACHE_DTYPE=fp8
++MAX_MODEL_LEN=262144
++GPU_UTIL=0.92
++MAX_NUM_SEQS=1
++SPECULATIVE_METHOD=mtp
++SPECULATIVE_TOKENS=4
++MESSAGE_TYPE=text+image
+diff --git a/profiles/2x2080Ti/qwen27b/w4a16/mtp4-fp8kv-2x184K-text-image.env b/profiles/2x2080Ti/qwen27b/w4a16/mtp4-fp8kv-2x184K-text-image.env
+new file mode 100644
+index 0000000000..b0003ab595
+--- /dev/null
++++ b/profiles/2x2080Ti/qwen27b/w4a16/mtp4-fp8kv-2x184K-text-image.env
+@@ -0,0 +1,10 @@
++MODEL_FAMILY=qwen35
++MODEL_VARIANT=nvfp4
++QUANTIZATION=compressed-tensors
++KV_CACHE_DTYPE=fp8
++MAX_MODEL_LEN=188416
++GPU_UTIL=0.97
++MAX_NUM_SEQS=2
++SPECULATIVE_METHOD=mtp
++SPECULATIVE_TOKENS=4
++MESSAGE_TYPE=text+image
+diff --git a/profiles/2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x186K-text-image.env b/profiles/2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env
+similarity index 81%
+rename from profiles/2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x186K-text-image.env
+rename to profiles/2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env
+index d1e12f7ddc..a790b9e7b2 100644
+--- a/profiles/2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x186K-text-image.env
++++ b/profiles/2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env
+@@ -2,8 +2,8 @@ MODEL_FAMILY=qwen35
+ MODEL_VARIANT=fp8
+ QUANTIZATION=fp8
+ KV_CACHE_DTYPE=fp8
+-MAX_MODEL_LEN=186368
+-GPU_UTIL=0.96
++MAX_MODEL_LEN=188416
++GPU_UTIL=0.97
+ MAX_NUM_SEQS=1
+ SPECULATIVE_METHOD=mtp
+ SPECULATIVE_TOKENS=4
+diff --git a/vllm/config/observability.py b/vllm/config/observability.py
+index 0394245f3c..7ec782f45b 100644
+--- a/vllm/config/observability.py
++++ b/vllm/config/observability.py
+@@ -82,11 +82,16 @@ class ObservabilityConfig:
+     This is for internal use only (e.g., benchmarks) and is not exposed as a CLI
+     argument."""
+ 
+-    enable_logging_iteration_details: bool = False
++    enable_logging_iteration_details: bool = True
+     """Enable detailed logging of iteration details.
+     If set, vllm EngineCore will log iteration details
+     This includes number of context/generation requests and tokens
+-    and the elapsed cpu time for the iteration."""
++    and the elapsed cpu time for the iteration.
++
++    Enabled by default so the logging stat logger can attribute prompt
++    throughput on prefill steps (which produce no generated tokens). The
++    per-iteration "Iteration(...)" lines are emitted at DEBUG level to avoid
++    info-level noise."""
+ 
+     jit_monitor_mode: Literal["warn", "error"] = "warn"
+     """How to handle post-warmup JIT compilation events."""
+diff --git a/vllm/entrypoints/launchers/api_server/routers.py b/vllm/entrypoints/launchers/api_server/routers.py
+index 39d670c019..36cd9bac61 100644
+--- a/vllm/entrypoints/launchers/api_server/routers.py
++++ b/vllm/entrypoints/launchers/api_server/routers.py
+@@ -25,6 +25,12 @@ def register_api_routers(
+ 
+     register_models_api_router(app)
+ 
++    from vllm.entrypoints.serve.speedmeter.api_router import (
++        attach_router as register_speedmeter_api_router,
++    )
++
++    register_speedmeter_api_router(app)
++
+     from vllm.entrypoints.serve.sagemaker.api_router import (
+         attach_router as register_sagemaker_api_router,
+     )
+diff --git a/vllm/kvmem_bridge.py b/vllm/kvmem_bridge.py
+new file mode 100644
+index 0000000000..a2990acd60
+--- /dev/null
++++ b/vllm/kvmem_bridge.py
+@@ -0,0 +1,120 @@
++"""KVMem bridge: expose the current step's query to an out-of-tree policy layer.
++
++The hard constraint: under `torch.compile` (fullgraph) + CUDA Graph replay **no Python runs per
++decode step**, and the compiled region tolerates nothing that dynamo cannot trace - a graph break,
++an allocation, or a `torch` call returning a non-tensor all abort compilation (observed:
++"op returned non-Tensor", then "RuntimeError when making fake tensor call").
++
++So the copy lives in a **registered custom op**. Dynamo treats it as opaque, inductor emits the
++call into the graph, and the copies it performs are ordinary kernels that replay with the live
++buffers. Buffers are allocated once, from outside the graph (`ensure()`), by the adapter.
++
++Keys do not need this bridge: they are already in the KV cache in post-RoPE form, and the policy
++layer can read them and un-rotate using the original positions.
++"""
++from __future__ import annotations
++
++import os
++
++import torch
++
++ARMED = os.environ.get("KVMEM_CAPTURE", "0") == "1"
++MAX_TOKENS = int(os.environ.get("KVMEM_CAPTURE_TOKENS", "64") or "64")
++
++_query: dict[int, torch.Tensor] = {}
++_count: dict[int, torch.Tensor] = {}
++_positions: torch.Tensor | None = None
++_pos_count: torch.Tensor | None = None
++_ready = False
++_op_calls = 0        # how many times the custom op body actually ran (diagnostic)
++_op_calls = 0        # how many times the custom op body actually ran (diagnostic)
++
++
++def ensure(layers: int, heads: int, head_dim: int, device="cuda", max_tokens: int | None = None,
++           dtype: torch.dtype = torch.bfloat16) -> bool:
++    """Allocate the buffers. Must be called outside any compiled region (adapter does this)."""
++    global _positions, _pos_count, _ready
++    take = int(max_tokens or MAX_TOKENS)
++    # Allocate ONCE per process. The compiled graph and its CUDA-graph replay capture the buffer
++    # pointers, so re-allocating later would leave the kernels writing into the old (freed) tensors
++    # while `read()` looks at the new ones - which is exactly how the query silently vanished.
++    if _ready:
++        return True
++    try:
++        for layer in range(int(layers)):
++            _query[layer] = torch.zeros(take, int(heads), int(head_dim), dtype=dtype,
++                                        device=device)
++            _count[layer] = torch.zeros(1, dtype=torch.int32, device=device)
++        _positions = torch.zeros(take, dtype=torch.int64, device=device)
++        _pos_count = torch.zeros(1, dtype=torch.int32, device=device)
++        _ready = True
++        return True
++    except Exception:
++        _ready = False
++        return False
++
++
++# `mutates_args=("query",)` is what keeps inductor from deleting this node: an op with no declared
++# mutation and a None result looks pure, and the graph compiler drops it (measured: the op body ran
++# zero times after a clean compile). The op does not actually modify the query.
++@torch.library.custom_op("kvmem::capture_q", mutates_args=("query",))
++def capture_q(query: torch.Tensor, positions: torch.Tensor, layer: int) -> None:
++    """Opaque to dynamo; the body below is plain tensor work executed at capture/replay time."""
++    global _op_calls
++    _op_calls += 1
++    if not ARMED:
++        return None
++    layer = int(layer)
++    buf = _query.get(layer)
++    pos_buf = _positions
++    if buf is None or pos_buf is None or _pos_count is None:
++        return None
++    # The model hands us a flat [tokens, heads*head_dim] tensor; the buffer is [tokens, heads, dim].
++    if query.dim() == 2 and buf.dim() == 3:
++        query = query.view(query.shape[0], buf.shape[1], buf.shape[2])
++    n = query.shape[0]
++    take = MAX_TOKENS if n > MAX_TOKENS else n
++    if n > MAX_TOKENS:
++        buf.copy_(query[n - MAX_TOKENS:])
++    else:
++        buf[:n].copy_(query)
++    # M-RoPE hands in [3, tokens] (one row per spatial axis); text is the identity, so the first
++    # row is the token position. Flattening it instead made 3*tokens values for n tokens.
++    pos = positions if positions.ndim == 1 else positions[0]
++    if n > MAX_TOKENS:
++        pos_buf.copy_(pos[n - MAX_TOKENS:])
++    else:
++        pos_buf[:n].copy_(pos)
++    _count[layer].fill_(take)
++    _pos_count.fill_(take)
++    # NOTE: no `.item()` / host sync here. This body also runs while CUDA graphs are being captured,
++    # where a device->host synchronisation aborts the capture ("operation failed due to a previous
++    # error during capture").
++    return None
++
++
++@capture_q.register_fake
++def _(query, positions, layer):
++    return None
++
++
++def read(layer: int):
++    """(query_rows, positions) buffered for `layer`, or (None, None). Host-side, outside the graph."""
++    buf = _query.get(int(layer))
++    count = _count.get(int(layer))
++    if buf is None or count is None:
++        return None, None
++    take = int(count.item())
++    if take <= 0:
++        return None, None
++    return buf[:take], (_positions[:take] if _positions is not None else None)
++
++
++def stats():
++    """Diagnostic: whether the compiled graph really calls the capture op."""
++    return {"op_calls": _op_calls, "armed": ARMED, "layers": len(_query),
++            "counts": {k: int(v.item()) for k, v in list(_count.items())[:4]}}
++
++
++def read_all():
++    return {layer: read(layer) for layer in list(_query)}
+diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
+index e3e8b37369..c7c84707a3 100644
+--- a/vllm/model_executor/layers/quantization/modelopt.py
++++ b/vllm/model_executor/layers/quantization/modelopt.py
+@@ -2502,6 +2502,11 @@ class ModelOptLinearMethod(LinearMethodBase):
+     ) -> None:
+         del input_size, output_size
+         weight_loader = extra_weight_attrs.get("weight_loader")
++        # Mirror Fp8LinearMethod/CompressedTensors (fp8.py:314): the Marlin FP8
++        # kernel's process_weights_after_loading casts weight_scale to
++        # layer.orig_dtype. ModelOpt layers (FP8_PB_WO in MIXED_PRECISION
++        # checkpoints) never set it, so supply it here.
++        layer.orig_dtype = params_dtype
+         layer.logical_widths = output_partition_sizes
+         layer.input_size_per_partition = input_size_per_partition
+         layer.output_size_per_partition = sum(output_partition_sizes)
+diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
+index 495650eb19..70711540d2 100644
+--- a/vllm/model_executor/models/qwen3_next.py
++++ b/vllm/model_executor/models/qwen3_next.py
+@@ -6,6 +6,8 @@ from collections.abc import Iterable
+ from itertools import islice
+ 
+ import torch
++
++from vllm import kvmem_bridge as _kvmem_bridge
+ from torch import nn
+ 
+ from vllm.compilation.decorators import support_torch_compile
+@@ -421,6 +423,9 @@ class Qwen3NextAttention(nn.Module):
+                     else None
+                 ),
+             )
++            # Unconditional so the op is always traced into the graph; it is a no-op until the
++            # adapter has allocated its buffers (see kvmem_bridge.ARMED / ensure()).
++            torch.ops.kvmem.capture_q(q, positions, int(getattr(self, "layer_idx", 0)))
+             return q, k, v, gate
+ 
+         if self.attn_output_gate:
+@@ -443,6 +448,9 @@ class Qwen3NextAttention(nn.Module):
+             -1, self.num_kv_heads * self.head_dim
+         )
+         q, k = self.rotary_emb(positions, q, k)
++        # KVMem bridge: unconditional call so the op is traced into the graph even if the env var
++        # is evaluated differently in the engine process; the op itself is a no-op when not armed.
++        torch.ops.kvmem.capture_q(q, positions, int(getattr(self, "layer_idx", 0)))
+         return q, k, v, gate
+ 
+     def forward(
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 253ea9d3ea..39e1fda6bd 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -3005,6 +3005,16 @@ class Scheduler(SchedulerInterface):
+         connector_stats_payload = (
+             kv_connector_stats.to_dict() if kv_connector_stats else None
+         )
++        # Prefill progress: sum prompt/computed tokens of requests still
++        # being prefilled. num_computed == num_prompt (just finished this
++        # step) is included so the 100% line is logged before the request
++        # turns into decode.
++        prefill_total = 0
++        prefill_done = 0
++        for req in self.running:
++            if req.num_computed_tokens <= req.num_prompt_tokens:
++                prefill_total += req.num_prompt_tokens
++                prefill_done += req.num_computed_tokens
+         return SchedulerStats(
+             num_running_reqs=len(self.running),
+             num_waiting_reqs=len(self.waiting),
+@@ -3017,6 +3027,8 @@ class Scheduler(SchedulerInterface):
+             kv_connector_stats=connector_stats_payload,
+             cudagraph_stats=cudagraph_stats,
+             perf_stats=perf_stats,
++            prefill_total_tokens=prefill_total,
++            prefill_done_tokens=prefill_done,
+         )
+ 
+     def make_spec_decoding_stats(
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index ffc9a5de7e..82a5eff626 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -495,6 +495,25 @@ class EngineCore:
+         # (i.e. client-aborted vs stop criteria met).
+         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
+ 
++    def speedmeter_prefill(self) -> list[dict]:
++        """Speedmeter: live prefill progress of every running request.
++
++        Exposed over the generic UTILITY RPC channel so the API server can
++        poll it without any protocol change. ``computed`` is initialized to
++        the prefix-cache hit length at scheduling time and only grows from
++        there, so (prompt_len - computed) is the exact remaining prefill
++        work. ``num_prompt_tokens`` already includes expanded multimodal
++        tokens, so image requests are measured on the same token base.
++        """
++        return [
++            {
++                "id": request.request_id,
++                "prompt_len": request.num_prompt_tokens,
++                "computed": request.num_computed_tokens,
++            }
++            for request in self.scheduler.running
++        ]
++
+     @contextmanager
+     def log_error_detail(self, scheduler_output: SchedulerOutput):
+         """Execute the model and log detailed info on failure."""
+diff --git a/vllm/v1/engine/llm_engine.py b/vllm/v1/engine/llm_engine.py
+index 32096079e0..c2e8543ddd 100644
+--- a/vllm/v1/engine/llm_engine.py
++++ b/vllm/v1/engine/llm_engine.py
+@@ -336,8 +336,12 @@ class LLMEngine:
+                     iteration_stats=iteration_stats,
+                     mm_cache_stats=self.renderer.stat_mm_cache(),
+                 )
+-                if outputs.outputs:
+-                    self.do_log_stats_with_interval()
++                # Log on every step that carries scheduler stats — including prefill
++                # steps that produced no generated tokens yet — so prompt throughput
++                # is reported on the VLLM_LOG_STATS_INTERVAL cadence instead of being
++                # averaged into the first decode line. Idle steps stay suppressed by
++                # the engine_is_idle check inside log().
++                self.do_log_stats_with_interval()
+ 
+         return processed_outputs.request_outputs
+ 
+diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
+index 9e3f9c63a6..869a59bb4f 100644
+--- a/vllm/v1/metrics/loggers.py
++++ b/vllm/v1/metrics/loggers.py
+@@ -126,6 +126,12 @@ class LoggingStatLogger(StatLoggerBase):
+         self.last_generation_throughput: float = 0.0
+         self.engine_is_idle = False
+         self.aggregated = False
++        # Prefill progress display: log a line each time the 10% boundary
++        # is crossed. _prefill_total_seen detects a new (smaller) prefill
++        # starting and resets the boundary.
++        self._prefill_boundary = 0
++        self._prefill_total_seen = 0
++        self._prefill_done_seen = 0
+ 
+         if self._enable_perf_stats():
+             self.perf_metrics_logging = PerfMetricsLogging(vllm_config)
+@@ -180,7 +186,10 @@ class LoggingStatLogger(StatLoggerBase):
+                 f"encoder output embeddings: {details.num_encoder_output_tokens}"
+             )
+ 
+-        logger.info(
++        # DEBUG level: these fire on every engine step, so info level would
++        # spam the log. Prompt/generation throughput is reported by log() on
++        # the VLLM_LOG_STATS_INTERVAL cadence instead.
++        logger.debug(
+             "%sIteration(%d): %d context requests, %d context tokens, "
+             "%d generation requests, %d generation tokens, "
+             "iteration elapsed time: %.2f ms%s, "
+@@ -207,6 +216,18 @@ class LoggingStatLogger(StatLoggerBase):
+         """Log Stats to standard output."""
+         if iteration_stats:
+             self._track_iteration_stats(iteration_stats)
++        elif (
++            scheduler_stats is not None
++            and scheduler_stats.iteration_details is not None
++            and scheduler_stats.iteration_details.num_ctx_tokens > 0
++        ):
++            # Pure prefill step (no generated tokens yet, so iteration_stats is
++            # None): accumulate prompt tokens from the scheduler's context-token
++            # count so prompt throughput is reported on the log cadence instead
++            # of being averaged into the first decode line.
++            self.num_prompt_tokens += (
++                scheduler_stats.iteration_details.num_ctx_tokens
++            )
+ 
+         if scheduler_stats is not None:
+             self._log_iteration_details(scheduler_stats, engine_idx)
+@@ -230,9 +251,41 @@ class LoggingStatLogger(StatLoggerBase):
+                 self.last_scheduler_stats = scheduler_stats
+             if (perf_stats := scheduler_stats.perf_stats) and self._enable_perf_stats():
+                 self.perf_metrics_logging.observe(perf_stats)
++            if not self.aggregated:
++                self._log_prefill_progress(scheduler_stats)
+         if mm_cache_stats:
+             self.mm_caching_metrics.observe(mm_cache_stats)
+ 
++    def _log_prefill_progress(self, scheduler_stats: SchedulerStats) -> None:
++        """Log a progress line each time a prefill crosses a 10% boundary.
++
++        Fires on the per-step scheduler stats (not the 3s cadence), so a
++        long cold prefill shows 10%, 20%, ... 100% as chunks complete.
++        """
++        total = scheduler_stats.prefill_total_tokens
++        done = scheduler_stats.prefill_done_tokens
++        if total <= 0:
++            self._prefill_boundary = 0
++            self._prefill_done_seen = 0
++            return
++        if total < self._prefill_total_seen or done < self._prefill_done_seen:
++            # A new (smaller) prefill started, or an in-flight prefill was
++            # preempted (num_computed reset to 0) and is being recomputed.
++            self._prefill_boundary = 0
++        self._prefill_total_seen = total
++        self._prefill_done_seen = done
++        pct = done * 100 // total
++        if pct >= self._prefill_boundary:
++            msg = self.log_prefix + "Prefill progress: %d%% (%d/%d tokens" % (
++                pct,
++                done,
++                total,
++            )
++            if self.last_prompt_throughput > 0 and done < total:
++                msg += ", ~%ds left" % int((total - done) / self.last_prompt_throughput + 0.5)
++            logger.info(msg + ")")
++            self._prefill_boundary = (pct // 10 + 1) * 10
++
+     def _update_stats(self):
+         now = time.monotonic()
+         prompt_throughput = self._get_throughput(self.num_prompt_tokens, now)
+@@ -259,58 +312,17 @@ class LoggingStatLogger(StatLoggerBase):
+         self.aggregate_scheduler_stats()
+         # Avoid log noise on an idle production system
+         log_fn = logger.debug if self.engine_is_idle else logger.info
+-        # Format and print output.
+-        log_parts = [
+-            "Avg prompt throughput: %.1f tokens/s",
+-            "Avg generation throughput: %.1f tokens/s",
+-            "Running: %d reqs",
+-            "Waiting: %d reqs",
+-        ]
+-        total_waiting = (
+-            self.last_scheduler_stats.num_waiting_reqs
+-            + self.last_scheduler_stats.num_skipped_waiting_reqs
+-        )
+-        log_args: list[int | float | str] = [
+-            self.last_prompt_throughput,
+-            self.last_generation_throughput,
+-            self.last_scheduler_stats.num_running_reqs,
+-            total_waiting,
+-        ]
+-
+-        if self.last_scheduler_stats.num_skipped_waiting_reqs > 0:
+-            log_parts.append("Deferred: %d reqs")
+-            log_args.append(self.last_scheduler_stats.num_skipped_waiting_reqs)
+-
+-        if self.num_preemptions > 0:
+-            log_parts.append("Preemptions: %d")
+-            log_args.append(self.num_preemptions)
+-
+-        log_parts.extend(
+-            [
+-                "GPU KV cache usage: %.1f%%",
+-                "Prefix cache hit rate: %.1f%%",
+-            ]
+-        )
+-        log_args.extend(
+-            [
+-                self.last_scheduler_stats.kv_cache_usage * 100,
+-                self.prefix_caching_metrics.hit_rate * 100,
+-            ]
+-        )
+-
+-        if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+-            log_parts.append("Corrupted: %d reqs")
+-            log_args.append(self.num_corrupted_reqs)
+-        if not self.connector_prefix_caching_metrics.empty:
+-            log_parts.append("External prefix cache hit rate: %.1f%%")
+-            log_args.append(self.connector_prefix_caching_metrics.hit_rate * 100)
+-        if not self.mm_caching_metrics.empty:
+-            log_parts.append("MM cache hit rate: %.1f%%")
+-            log_args.append(self.mm_caching_metrics.hit_rate * 100)
+-
++        # Local trim: only prompt/generation throughput are wanted here;
++        # running/waiting/KV-usage/prefix-hit-rate and the conditional
++        # Deferred/Preemptions/Corrupted/connector/MM fields were removed.
+         log_fn(
+-            self.log_prefix + ", ".join(log_parts),
+-            *log_args,
++            self.log_prefix
++            + "Avg prompt throughput: %.1f tokens/s, "
++            "Avg generation throughput: %.1f tokens/s"
++            % (
++                self.last_prompt_throughput,
++                self.last_generation_throughput,
++            )
+         )
+ 
+         self.spec_decoding_logging.log(log_fn=log_fn)
+diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
+index 24e07e57cc..29e54838c7 100644
+--- a/vllm/v1/metrics/stats.py
++++ b/vllm/v1/metrics/stats.py
+@@ -198,6 +198,11 @@ class SchedulerStats:
+     kv_cache_usage: float = 0.0
+     iteration_details: SchedulerIterationDetails | None = None
+ 
++    # Tokens of requests still in prefill (num_computed <= num_prompt).
++    # Used for prefill progress display.
++    prefill_total_tokens: int = 0
++    prefill_done_tokens: int = 0
++
+     prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
+     connector_prefix_cache_stats: PrefixCacheStats | None = None
+ 
+diff --git a/vllm/v1/spec_decode/metrics.py b/vllm/v1/spec_decode/metrics.py
+index a3ccfb29e7..5f6c494890 100644
+--- a/vllm/v1/spec_decode/metrics.py
++++ b/vllm/v1/spec_decode/metrics.py
+@@ -104,35 +104,15 @@ class SpecDecodingLogging:
+             self.reset()
+             return
+ 
+-        draft_acceptance_rate = (
+-            num_accepted_tokens / num_draft_tokens * 100
+-            if num_draft_tokens > 0
+-            else float("nan")
+-        )
+-
+         # Conventionally, mean acceptance length includes the bonus token
+         mean_acceptance_length = 1 + (num_accepted_tokens / num_drafts)
+ 
+-        pos_matrix = np.array(self.accepted_tokens_per_pos_lists)
+-        acceptance_rates = np.sum(pos_matrix, axis=0) / num_drafts
+-        rates_str = ", ".join(f"{p:.3f}" for p in acceptance_rates)
+-
++        # Local trim: only the mean acceptance length is wanted here; the
++        # accepted/drafted throughputs, raw token counts, per-position
++        # acceptance rates and the avg draft acceptance rate were removed.
+         log_fn(
+-            "SpecDecoding metrics: "
+-            "Mean acceptance length: %.2f, "
+-            "Accepted throughput: %.2f tokens/s, "
+-            "Drafted throughput: %.2f tokens/s, "
+-            "Accepted: %d tokens, "
+-            "Drafted: %d tokens, "
+-            "Per-position acceptance rate: %s, "
+-            "Avg Draft acceptance rate: %.1f%%",
++            "SpecDecoding metrics: Mean acceptance length: %.2f",
+             mean_acceptance_length,
+-            accepted_throughput,
+-            draft_throughput,
+-            num_accepted_tokens,
+-            num_draft_tokens,
+-            rates_str,
+-            draft_acceptance_rate,
+         )
+         self.reset()
+ 

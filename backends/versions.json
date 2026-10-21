@@ -1,0 +1,22 @@
+{
+  "layout": "pinned-engines-with-patches",
+  "engines": {
+    "path": "engines/vllm",
+    "upstream": "https://github.com/weicj/vLLM-2080Ti-Definitive.git",
+    "base_commit": "93c9013e375b1ecbf2da88179d2a31175a0d5c99",
+    "license_file": "engines/vllm/LICENSE",
+    "local_changes": "KVMem integration (query bridge + capture_q call sites) and the SM75/FP8 profiles this deployment runs with are maintained in the versioned patch; the submodule stays pinned to base_commit",
+    "patch": "backends/patches/vllm-kvmem.patch",
+    "patch_sha256": "99eb5d365e257bea2e83285a20b7cef725e7549ef08504a0548a25353090c30d",
+    "patched_tree": "98e166bd72831c96081ef444883db7355a523fc6"
+  },
+  "model": {
+    "note": "weights are not in git (tens of GB); point MODEL at an FP8+MTP export"
+  },
+  "engines_kvmem": {
+    "path": "engines/kvmem",
+    "upstream": "https://github.com/kvmem/kvmem.git",
+    "base_commit": "v0.18.0",
+    "note": "headers + libkvmem.a for the native extension; fetched at the pinned tag, never vendored"
+  }
+}

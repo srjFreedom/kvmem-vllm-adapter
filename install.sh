@@ -22,25 +22,36 @@ say() { printf '\n[install] %s\n' "$*"; }
 
 say "1/5 检查外部件"
 [ -d "$VLLM_ROOT/vllm" ] || { echo "缺 vLLM fork: $VLLM_ROOT"; exit 1; }
-[ -f "$KVMA_SRC/kvmem/include/kvmem/kvmem_runtime.hpp" ] || { echo "缺 kvmem 源码: $KVMA_SRC"; exit 1; }
+if [ ! -f "$KVMA_SRC/kvmem/include/kvmem/kvmem_runtime.hpp" ]; then
+  echo "  kvmem 源码不在 $KVMA_SRC，按 versions.json 拉取固定 tag"
+  python3 "$ROOT/scripts/prepare-backends.py" --engine kvmem
+  KVMA_SRC="$ROOT/engines/kvmem"
+fi
 [ -x "$PY" ] || { echo "缺 venv python: $PY"; exit 1; }
 echo "  vLLM   : $VLLM_ROOT"
 echo "  kvmem  : $KVMA_SRC"
 echo "  python : $PY"
 
-say "2/5 放入 vLLM 侧的 query bridge（本仓库 vendor/ 下的副本）"
-cp "$ROOT/vendor/vllm/kvmem_bridge.py" "$VLLM_ROOT/vllm/kvmem_bridge.py"
-echo "  -> $VLLM_ROOT/vllm/kvmem_bridge.py"
-
-say "3/5 打 8 行 capture 补丁（已打过则跳过）"
-if grep -q "kvmem_bridge" "$TARGET"; then
-  echo "  已有 kvmem 调用，跳过"
+say "2/5 固定引擎版本 + 应用 KVMem 集成补丁（kvmem 同款：子模块 + 补丁）"
+# 已经在这台机器上装好的 fork 直接打补丁；否则由 prepare-backends 拉取固定 commit 再打。
+if [ "${USE_LOCAL_FORK:-1}" = "1" ] && [ -d "$VLLM_ROOT/.git" ]; then
+  if (cd "$VLLM_ROOT" && git diff --quiet -- vllm/model_executor/models/qwen3_next.py) \
+     || ! grep -q kvmem_bridge "$TARGET"; then
+    cp "$ROOT/vendor/vllm/kvmem_bridge.py" "$VLLM_ROOT/vllm/kvmem_bridge.py"
+    if ! grep -q "kvmem_bridge" "$TARGET"; then
+      git -C "$VLLM_ROOT" apply "$PATCH" || { echo "  补丁冲突，请检查 $VLLM_ROOT"; exit 1; }
+    fi
+  fi
+  cp "$ROOT/vendor/vllm/kvmem_bridge.py" "$VLLM_ROOT/vllm/kvmem_bridge.py"
+  echo "  本地 fork 已就绪: $VLLM_ROOT"
 else
-  git -C "$VLLM_ROOT" apply "$PATCH"
-  echo "  已应用 $PATCH"
+  python3 "$ROOT/scripts/prepare-backends.py" --engine vllm --check-tree
+  VLLM_ROOT="$ROOT/engines/vllm"
+  PY="$VLLM_ROOT/.venv/bin/python"
+  [ -x "$PY" ] || { echo "  请先在 $VLLM_ROOT 建好 venv（参考该 fork 的 README）"; exit 1; }
 fi
 
-say "4/5 安装插件包（editable）"
+say "3/5 安装插件包（editable）"
 if command -v uv >/dev/null 2>&1; then
   uv pip install -e "$ROOT/plugin" --python "$PY" --no-deps -q
 else
@@ -48,7 +59,7 @@ else
 fi
 echo "  -> $(cat "$VLLM_ROOT"/.venv/lib/python3.12/site-packages/vllm_kvmem_plugin-*.dist-info/entry_points.txt | grep -c '=') 个入口点"
 
-say "5/5 编译原生扩展"
+say "4/5 编译原生扩展"
 if [ -f "$ROOT/build/python/vllm_kvmem_ext.cpython-312-x86_64-linux-gnu.so" ]; then
   echo "  已有构建产物，跳过（要重编先删 build/）"
 else
@@ -57,7 +68,7 @@ else
   echo "  -> build/python/"
 fi
 
-say "自检"
+say "5/5 自检"
 PYTHONPATH="$ROOT/build/python:$ROOT/src:$ROOT/plugin" "$PY" - <<'PYCHECK'
 import importlib.metadata as md
 eps = md.distribution("vllm-kvmem-plugin").entry_points

@@ -312,12 +312,23 @@ scripts/wait_ready.sh 18200 900 --smoke  # 就绪检查：短轮询 + 日志触�
 | kvmem 源码 | `/home/srj/src/kvmem-v018rc1` | 头文件与 `kvmem` 静态库（编译原生扩展）|
 | 模型权重 | `/home/srj/models/Coder390/FP8-fp8mtp` | FP8 + MTP + vision |
 
-一条命令完成：放 bridge → 打补丁 → 装插件 → 编扩展 → 自检：
+引擎源码**不 vendored**，由 `scripts/prepare-backends.py` 按 `backends/versions.json` 拉取固定版本
+（kvmem 官方对 llama.cpp / ninfer 用的是同样的「固定版本 + 整份集成补丁」布局，这里只是把子模块换成了
+显式 fetch，仓库保持轻量）：
+
+| 引擎 | 固定版本 | 处理 |
+|---|---|---|
+| `engines/vllm` | `93c9013e375b…` | 拉取后应用 `backends/patches/vllm-kvmem.patch`，并用 `patched_tree` 校验结果 |
+| `engines/kvmem` | tag `v0.18.0` | 只拉取（编译原生扩展需要头文件与库）|
+
+补丁覆盖了 vLLM 侧的全部改动（query bridge + `qwen3_next.py` 的 capture 调用 + 本机跑起来所用的
+SM75/FP8 profile），所以"clone → prepare → 与产线源码逐字节一致"是可验证的。
+
+一条命令完成：拉引擎 → 打补丁 → 装插件 → 编扩展 → 自检：
 
 ```bash
-./install.sh
-# 或
-VLLM_ROOT=/path/to/vllm KVMA_SRC=/path/to/kvmem ./install.sh
+./install.sh                          # 机器上已有 vLLM fork 时直接在它上面打补丁
+USE_LOCAL_FORK=0 ./install.sh          # 全新机器：按 versions.json 拉取固定版本后打补丁
 ```
 
 然后：
