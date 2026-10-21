@@ -58,15 +58,15 @@ exec ./launcher.sh \
   --profile "${PROFILE:-2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env}" \
   --mode fast --gpu-devices 0,1 --tp-size 2 --pp-size 1 \
   --set MAX_MODEL_LEN=204800 \
-  --set GPU_UTIL=0.98 \
-  --set MAX_BATCHED_TOKENS=4096 \
+  --set GPU_UTIL="${GPU_UTIL:-0.98}" \
+  --set MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-4096}" \
   --set MAX_NUM_SEQS=${MAX_NUM_SEQS:-1} \
   --set SERVED_NAME=KVMEM-SPARSE \
   --set CHAT_TEMPLATE_FILE="${CHAT_TEMPLATE_FILE:-/home/srj/models/Coder390/FP8/chat_template.jinja}" \
-  --set MESSAGE_TYPE=text+image \
-  --set MM_IMAGE_LIMIT=64 \
-  --set SPECULATIVE_TOKENS=4 \
-  --set SERVICE_SCOPE=lan \
+  --set MESSAGE_TYPE="${MESSAGE_TYPE:-text+image}" \
+  --set MM_IMAGE_LIMIT="${MM_IMAGE_LIMIT:-64}" \
+  --set SPECULATIVE_TOKENS="${SPECULATIVE_TOKENS:-4}" \
+  --set SERVICE_SCOPE="${SERVICE_SCOPE:-lan}" \
   --set DISABLE_LOG_STATS=0 \
   --set PER_REQUEST_SPEC_DECODE_METRICS=detailed \
   --set ENABLE_AUTO_TOOL_CHOICE=1 \

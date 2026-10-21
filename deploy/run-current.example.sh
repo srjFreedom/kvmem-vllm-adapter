@@ -20,6 +20,14 @@ N=2                     # 并发请求数；引擎窗口 = N x (B + R)，自动�
 PORT=18200              # kvmem 官方端口
 CAPTURE_TOKENS=512      # 每步为检索捕获的 query token 数（官方 query_max_tokens 默认 512）
 
+# ---- 引擎/硬件（换卡、换机器时需要调）----
+GPU_UTIL=0.98           # vLLM 显存占用比例；22GB 卡用 0.98，小卡适当降低，OOM 时先降这个
+MAX_BATCHED_TOKENS=4096 # 单步 prefill 的 token 上限；调大可减 chunk 数，但吃显存
+SPECULATIVE_TOKENS=4    # MTP 投机 token 数；0 = 关闭投机（显存/速度之间取舍）
+MESSAGE_TYPE=text+image # text | text+image，是否启用视觉塔
+MM_IMAGE_LIMIT=64       # 每个 prompt 允许的图片数
+SERVICE_SCOPE=lan       # lan = 监听 0.0.0.0；local = 只监听 127.0.0.1
+
 # ---- 权重（改这里换模型）----
 MODEL=/home/srj/models/Coder390/FP8-fp8mtp
 # 换模型时通常还要一起改：chat template、launcher profile（量化/KV/上下文档）、SERVED_NAME
@@ -35,6 +43,7 @@ DISABLE_PREFIX_CACHING=0       # 1 = 关前缀缓存（仅 in-request compaction
 # ---------------------------------------------------------------------------
 
 export B R CTX SINK RECENT SESSIONS HOST_MIB N PORT CAPTURE_TOKENS
+export GPU_UTIL MAX_BATCHED_TOKENS SPECULATIVE_TOKENS MESSAGE_TYPE MM_IMAGE_LIMIT SERVICE_SCOPE
 export MODEL SERVED_NAME CHAT_TEMPLATE_FILE PROFILE
 export KVMEM_ENTRY_MODE KVMEM_ENTRY_SELECT DISABLE_PREFIX_CACHING KVMEM_UI_DIR
 

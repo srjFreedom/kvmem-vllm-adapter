@@ -52,6 +52,20 @@ N=4: 窗口 393,216  → 装不下 → 必须把 B 降到 ~26K 或 R 降到 ~19K
 | `HOST_MIB` | `49152` | H 层（主机内存）KV 预算，48 GiB。会话间按 `SESSIONS` 平分 |
 | `SESSIONS` | `4` | H 池的**并发会话**份数（注意：语义是把 H 平分给活请求，不是"保留 N 个非活跃历史"）|
 
+### 引擎与硬件（换卡、换机器时调）
+
+| 参数 | 默认 | 含义 | 什么时候改 |
+|---|---|---|---|
+| `GPU_UTIL` | `0.98` | vLLM 请求的显存占用比例（`--gpu-memory-utilization`）| 22 GB 卡用 0.98；显存更小的卡降低（0.90~0.95），OOM 时**先降这个** |
+| `MAX_BATCHED_TOKENS` | `4096` | 单步 prefill 的 token 上限（chunk 大小）| 调大可减少 chunk 数、提升 prefill 并行度，但吃显存；调大后必须重跑启动 smoke |
+| `SPECULATIVE_TOKENS` | `4` | MTP 投机 token 数 | `0` = 关闭投机：省显存/更稳，但 decode 变慢 |
+| `MESSAGE_TYPE` | `text+image` | 是否加载视觉塔 | 纯文本模型/只跑文本时设 `text`（省 ~0.9 GiB 权重）|
+| `MM_IMAGE_LIMIT` | `64` | 每 prompt 允许图片数 | 与 `MESSAGE_TYPE` 配套 |
+| `SERVICE_SCOPE` | `lan` | 监听范围 | `lan` = `0.0.0.0`；`local` = 只监听 `127.0.0.1` |
+
+这些参数在 `run-kvmem-sparse.sh` 里都有 `${VAR:-默认}` 兜底，所以既可以写进 `run-current.sh`，
+也可以临时 `GPU_UTIL=0.9 ./run-kvmem-vllm.sh` 试。
+
 ### 模型
 
 | 参数 | 默认 | 含义 |
@@ -77,6 +91,7 @@ N=4: 窗口 393,216  → 装不下 → 必须把 B 降到 ~26K 或 R 降到 ~19K
 | `VLLM_ROOT` | `/home/srj/vLLM-2080Ti-Definitive` | vLLM fork 路径（`USE_LOCAL_FORK=1` 时）|
 | `KVMA_SRC` | `/home/srj/src/kvmem-v018rc1` | kvmem 源码（编译原生扩展要头文件+库）；不存在会自动拉 `v0.18.0` |
 | `PY` | `$VLLM_ROOT/.venv/bin/python` | 用哪个 Python 环境；**已有可用 venv 时指过来就不用建** |
+| `GPU_UTIL` / `MAX_BATCHED_TOKENS` / … | 见上文"引擎与硬件" | 同样可在这层用环境变量覆盖 |
 | `ENGINE` / `PY_VER` | 由脚本推导 / `3.12` | `setup-venv.sh` 的目标引擎与 Python 版本 |
 
 ```bash

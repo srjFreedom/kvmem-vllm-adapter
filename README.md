@@ -104,7 +104,7 @@ Every runtime knob lives in `run-current.sh`; the full reference is
 
 ```bash
 B=65536 R=32768 CTX=524288 SINK=8192 RECENT=2048 N=2 PORT=18200
-CAPTURE_TOKENS=512
+CAPTURE_TOKENS=512 GPU_UTIL=0.98 MAX_BATCHED_TOKENS=4096
 MODEL=/home/srj/models/Coder390/FP8-fp8mtp
 CHAT_TEMPLATE_FILE=.../chat_template.jinja
 PROFILE=2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env
