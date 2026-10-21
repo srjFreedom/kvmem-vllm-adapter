@@ -611,6 +611,26 @@ class VllmSparseRuntime:
             taken["slots"] = slots
             return slots[:-1]
 
+        # Sweep: pages written during prefill can be skipped by the per-step commit when the
+        # engine had not published their page id yet. They are then absent from the store and the
+        # orchestrator drops them from the view (measured: 475 -> 331 pages, so the compact no
+        # longer covered the prompt and was refused). Commit every page we can still map.
+        try:
+            map_now = self._page_map.setdefault(req, {})
+            known = orch.store.pages
+            upto = -(-int(st.tokens) // self.page_tokens)
+            for lp in range(upto):
+                if lp in known:
+                    continue
+                slot = map_now.get(lp)
+                if slot is None:
+                    continue
+                try:
+                    orch.commit_written_page(lp, int(slot))
+                except Exception:
+                    continue
+        except Exception:
+            pass
         prompt_tokens = int(getattr(orch, "prompt_tokens", 0) or 0)
         mandatory = list(range(0, -(-prompt_tokens // self.page_tokens))) if prompt_tokens else []
         # Force the prompt pages only when the prompt fits the budget. If it does not, the entry

@@ -1212,3 +1212,16 @@ selected: 332   seq_len: 5312   prompt: 5535   mandatory_pages: 346
 - 结论：`selected` 在 planner 之后、`_finish_reselect` 之前被缩小（475 → 332）。
   嫌疑：`slots` 分支/`page_to_slot` 分支/`self.total_tokens` 过滤。下一轮在
   `_finish_reselect` 之前打印 `len(selected)` 并对照 `self.total_tokens`，一次就能抓到。
+
+### Route A 第十三轮：卡死全清；压缩后输出质量下降（RoPE 重打/搬运）
+
+两处修复（都带探针证据）：
+
+| 问题 | 证据 | 修法 |
+|---|---|---|
+| 选中的页在 store 里没有规范字节 → reselect 直接丢弃 → 视图缩到 prompt 以下 → 拒绝/卡死 | `plan.sel_pages=475` 但 `selected=331` | ① 缺失页当场从设备捕获入 store；② 重选前做一次**补提交扫描**（把 `_page_map` 里已知但未提交的页补进 store） |
+| — | 修复后：`selected=507, seq_len=8112 ≥ prompt 5537` | 卡死消失 |
+
+**结果**：2.2K 行用例 121s 跑完（此前必卡），但**输出质量下降**：2415 行里只有 849 行是完整
+LEMON，其余退化成 `w`/`le` 碎片——压缩后 RoPE 重打或页搬运有偏差。下一轮对着
+`rotation_deltas`/`plan_moves`/`order_moves` 逐页核对（离线已有 rotate/needle 单测可复用）。

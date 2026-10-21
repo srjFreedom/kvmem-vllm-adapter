@@ -482,8 +482,30 @@ class SparseOrchestrator:
         # whole reselect: raising here killed the step and left the plan half-applied.
         missing = [p for p in selected if not self.store.has(p)]
         if missing:
+            # A selected page can be missing from the store when its write step was never committed
+            # (the engine had not published its page id yet). Its bytes ARE on the device at
+            # `slot_of`, so capture them now instead of dropping the page: dropping shrank the view
+            # below the prompt and the compact was then refused (measured: 475 -> 332 pages).
+            recovered = []
+            for page in list(missing):
+                slot = self.slot_of.get(page)
+                if slot is None:
+                    continue
+                try:
+                    layers = [kv[int(slot)] for kv in self.kvs]
+                    self.store.put(int(page), layers)
+                    delta = (int(slot) - int(page)) * self.page_tokens
+                    self.store_delta[int(page)] = delta
+                    self.baked_delta[int(page)] = delta
+                    recovered.append(page)
+                except Exception:
+                    continue
+            if recovered:
+                self.last_recovered = len(recovered)
+                missing = [p for p in missing if p not in set(recovered)]
             self.last_missing = len(missing)
-            selected = [p for p in selected if self.store.has(p)]
+            if missing:
+                selected = [p for p in selected if self.store.has(p)]
             if not selected:
                 raise RuntimeError(f"selected pages without canonical bytes: {missing[:4]}")
 
