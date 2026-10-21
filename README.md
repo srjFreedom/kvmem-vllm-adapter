@@ -301,6 +301,8 @@ scripts/wait_ready.sh 18200 900 --smoke  # 就绪检查：短轮询 + 日志触�
 |---|---|---|
 | `--kvmem-capture-tokens` / `KVMEM_CAPTURE_TOKENS` | **512** | 每步为检索捕获的 query 行数（对齐 KVMem `query_max_tokens` 的 512 默认）；每 rank 约 100–200 MiB |
 
+参数一览（每个参数的含义、约束、改大改小的影响）：**[docs/PARAMETERS.md](docs/PARAMETERS.md)**。
+
 ## 从零跑起来（依赖什么）
 
 本仓库是**集成层**：KVMem 的策略层 + vLLM 的适配/插件/入口/部署。它不是自包含的可执行发行版，
