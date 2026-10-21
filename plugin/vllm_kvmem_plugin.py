@@ -903,7 +903,16 @@ def register():
                     continue
                 visible.extend(all_tokens[start:min(start + page_tokens, len(all_tokens))])
             if not visible or len(visible) >= len(all_tokens):
-                return len(visible) == len(all_tokens)
+                # Diagnostic: a no-op here while the WORKER still installs a shorter compacted view
+                # leaves the two books disagreeing (the model computes at compacted positions but
+                # the scheduler keeps the old lengths -> num_tokens == num_computed -> the request
+                # is never scheduled again).
+                _append(_sched_cfg(scheduler).get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "compact_noop", "pid": os.getpid(), "req": request_id,
+                         "visible": len(visible), "all_tokens": len(all_tokens),
+                         "computed": int(req.num_computed_tokens), "pages": len(pages)})
+                return {"ok": len(visible) == len(all_tokens), "truncated": False,
+                        "visible": len(visible)}
             req._all_token_ids[:] = visible
             req.num_computed_tokens = max(0, len(visible) - pending)
             _append(_sched_cfg(scheduler).get("probe_log") or "/tmp/kvmem_sparse.jsonl",
@@ -918,7 +927,7 @@ def register():
                      "pending": int(pending),
                      "after_tokens": len(req._all_token_ids),
                      "after_computed": int(req.num_computed_tokens)})
-            return True
+            return {"ok": True, "truncated": True, "visible": len(visible)}
 
         _channel_state = {"scheduler": None, "server": None}
         original = Scheduler.schedule
@@ -1107,10 +1116,16 @@ def _install(cls, module_name, probe, smoke, state):
                                 rt.release(gone)
                                 _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                                         {"kind": "released", "req": gone, "pid": os.getpid()})
+                            npc = getattr(getattr(self, "req_states", None),
+                                          "num_computed_tokens_np", None)
                             for req in reqs:
                                 row = rt.view.row_index(req)
                                 if row is None:
                                     continue
+                                if npc is not None and int(row) < len(npc):
+                                    # The engine's own count = accepted tokens only. Without this
+                                    # the R cadence counts speculative drafts and fires early.
+                                    rt.note_engine_computed(req, int(npc[int(row)]))
                                 rt.before_step(req, row_index=row,
                                                position_slots=rt.view.query_position_slots(req))
                 except Exception:

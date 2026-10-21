@@ -1123,3 +1123,15 @@ positions 基准改为 `seq_len - n`；压缩只在 decode 步触发；槽位从
 本轮另修：`_absorb_engine_row` 从「每 token 一次 row.tolist()」提到每步一次（长 prefill 原来是 O(n²)）。
 原地重排的实现试过但离线夹具未同步、活引擎仍未通过，已回退，保留设计结论：
 ninfer 对等必须原地复用引擎页，另存副本在 B≈池/2 时物理不可行。
+
+### Route A 第六轮：修掉「未截断也安装视图」的卡死；真截断后仍卡
+
+| 发现 | 证据 | 处理 |
+|---|---|---|
+| 长 prefill 后首次重选**没有截断**（`visible == all_tokens`），worker 仍安装压缩视图 | `compact_noop: visible=8112 all_tokens=8112 computed=8111` | 引擎返回 `truncated` 标志；未截断就不安装（清空 row） |
+| 取消「首次强制重选」，只按 R 节拍重选 | 8K prompt 请求从**卡死**变为 22.9s 正常完成（压缩关基线 22.8s） | 已改 |
+| MTP 下运行时把**草稿 token** 也算进序列长度（引擎只按接受的前进） | runtime tokens=10355 vs 引擎 8192 | 新增 `note_engine_computed()`，用引擎 `num_computed_tokens_np` 每步校正 |
+
+**仍未通过**：本次真截断（`compact_truncated=true`）后请求仍停在 running 不再被调度（GPU 0%）。
+下一步：确认 `note_engine_computed` 是否真的被调用（加探针），再查截断瞬间 `num_computed` 与
+`num_tokens` 的实际关系。

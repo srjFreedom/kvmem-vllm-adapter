@@ -95,6 +95,10 @@ class VllmSparseRuntime:
         self._prev_n = {}
         self._pending_frontier = {}
         self._pending_new = {}
+        # Engine-reported num_computed_tokens per request: authoritative for ACCEPTED tokens.
+        # Counting `num_scheduled_tokens` drifts under MTP (draft tokens that get rejected are
+        # counted but never appended), which fires the R cadence early.
+        self._engine_computed = {}
         self._orch = {}
         self._state = {}
         # row_index -> the compacted length the ATTENTION kernel must read for that row.
@@ -234,6 +238,10 @@ class VllmSparseRuntime:
                 self._slot_owner.pop(slot, None)
         self._page_map.pop(req, None)
         self._dirty_pages.pop(req, None)
+        self._engine_computed.pop(req, None)
+        self._pending_frontier.pop(req, None)
+        self._pending_new.pop(req, None)
+        self._prev_n.pop(req, None)
         if orch is not None and getattr(self, "budget_pool", None) is not None:
             session = getattr(orch, "session_id", None)
             if session is not None:
@@ -309,6 +317,13 @@ class VllmSparseRuntime:
         """Set the request's absolute token frontier from the scheduler (authoritative)."""
         st = self.state(req)
         self._pending_frontier[req] = int(frontier)
+
+    def note_engine_computed(self, req, computed):
+        """The engine's own num_computed_tokens for this request (accepted tokens only)."""
+        try:
+            self._engine_computed[req] = int(computed)
+        except Exception:
+            pass
 
     def note_pending(self, req, n_new):
         """Record the scheduler's token count for this step (seen before the model runs)."""
@@ -399,6 +414,11 @@ class VllmSparseRuntime:
             # Trust the scheduler's absolute frontier; derive this step's delta from it.
             _st = self._state[req]
             _st.tokens = max(_st.tokens, frontier - int(n_new_tokens or 0))
+        engine_c = self._engine_computed.get(req)
+        if engine_c is not None and engine_c > 0:
+            # Reset to the engine's count every step: `num_scheduled_tokens` includes speculative
+            # drafts that may be rejected, so counting them drifts ahead of the real sequence.
+            self._state[req].tokens = int(engine_c)
         pending = int(self._pending_new.get(req, 0) or 0)
         if pending > int(n_new_tokens or 0):
             n_new_tokens = pending            # prefill chunks are visible only via query_start_loc
@@ -503,13 +523,13 @@ class VllmSparseRuntime:
                       "last": orch._tokens_at_reselect, "R": getattr(orch, "gen_reserve", None),
                       "budget": orch.reselect_token_budget,
                       "planner": orch.planner is not None, "due": bool(due)})
-        # With compaction disabled nothing may rewrite the block table: `not st.row` means the sparse
-        # row was never built (that is the point), not that a reselect is owed.
-        # Compaction is DECODE-only: during prefill the prompt is still streaming in, so truncating
-        # it mid-chunk corrupts the tail the engine is about to append (measured: the initial view
-        # built at a 16-token prefill chunk made the second generated line turn into noise).
-        if bool(getattr(self, "inrequest_compaction", False)) and not prefill \
-                and (not st.row or due):
+        # Compaction is DECODE-only and TRUNCATION-driven: reselect when the R cadence is due, which
+        # is exactly when the pool (B history + R output) is full and the visible set must shrink.
+        # Building an "initial view" on the first decode step is NOT done: it truncates nothing
+        # (visible == the whole book) and installing a compacted row anyway desynchronised the two
+        # books - measured as an 8K prompt stalling right after prefill while the same prompt
+        # completed with compaction off.
+        if bool(getattr(self, "inrequest_compaction", False)) and not prefill and due:
             result = self._reselect(req)
             if int(getattr(self, "needle_trace", 0)) > 0:
                 resident = sorted(orch.resident)
@@ -609,7 +629,23 @@ class VllmSparseRuntime:
         ch = getattr(self, "compact_channel", None)
         if ch is not None and selected:
             try:
-                record["compact_applied"] = bool(ch.compact(req, selected, self.page_tokens))
+                res = ch.compact(req, selected, self.page_tokens)
+                if isinstance(res, dict):
+                    record["compact_applied"] = bool(res.get("ok"))
+                    record["compact_truncated"] = bool(res.get("truncated"))
+                    truncated = bool(res.get("truncated"))
+                else:
+                    record["compact_applied"] = bool(res)
+                    truncated = bool(res)
+                if not truncated:
+                    # The engine's book was NOT shortened, so its own view is already correct.
+                    # Installing a compacted row anyway left the two books disagreeing: the model
+                    # computed at compacted positions while the scheduler kept the old lengths,
+                    # num_computed then ran past num_tokens and the request was never scheduled
+                    # again (measured: a long prefill stalled with the GPU idle).
+                    st.row = ()
+                    st.seq_len = 0
+                    st.spare = None
             except Exception as exc:
                 record["compact_error"] = str(exc)[:160]
         self.log(record)

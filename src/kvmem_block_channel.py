@@ -75,7 +75,13 @@ class BlockChannelScheduler:
                                                   [int(p) for p in req.get("pages", [])],
                                                   int(req.get("page_tokens", 0))))
                         self.compacts_applied += 1
-                        conn.sendall(json.dumps({"ok": ok}).encode())
+                        # `ok` = the engine's book is now consistent with the worker's view;
+                        # `truncated` = it actually shortened (so installing the view is needed).
+                        if isinstance(ok, dict):
+                            conn.sendall(json.dumps(ok).encode())
+                        else:
+                            conn.sendall(json.dumps({"ok": bool(ok),
+                                                     "truncated": bool(ok)}).encode())
                     else:
                         blocks = self._allocator(req.get("request"), int(req.get("count", 1)))
                         self.requests_served += 1
@@ -130,4 +136,8 @@ class BlockChannel:
         reply = json.loads(data.decode())
         if "error" in reply:
             raise RuntimeError(f"compact request failed: {reply['error']}")
-        return bool(reply.get("ok", False))
+        # `ok` also covers the "nothing to truncate" case; `truncated` is the signal the worker
+        # needs to decide whether its compacted view may be installed at all.
+        return {"ok": bool(reply.get("ok", False)),
+                "truncated": bool(reply.get("truncated", reply.get("ok", False))),
+                "visible": int(reply.get("visible", 0) or 0)}
