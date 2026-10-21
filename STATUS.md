@@ -1168,3 +1168,15 @@ ninfer 对等必须原地复用引擎页，另存副本在 B≈池/2 时物理�
 `note_engine_computed` 已加但看起来没生效（runtime tokens 9638 vs 引擎 8112）。
 下一轮：确认 `note_engine_computed` 是否被调用（V2 hook 里 `req_states.num_computed_tokens_np`
 是否可读），保证两 rank 的计数一致。
+
+### Route A 第九轮：TP 两 rank 选页一致；剩余「选择器不保证覆盖 prompt」
+
+- 漂移根因确认：`after_step` 先把 `st.tokens` 设成引擎值，提交循环**又加一遍**本步 token
+  → 每步多算 prev（MTP 下 5），累计 9638 vs 引擎 8112，且两卡接受情况不同 → 选页不同
+- 修法：`st.tokens = engine_c - n_new`（提交循环再加回来）
+- 效果：同一请求两个 rank 现在都选 331 页、visible 5296，**完全一致** ✅
+
+仍卡：选择器返回 331 页 < mandatory 346 页（prompt 覆盖页），visible 5296 < prompt 5539 →
+`compact_refused` → 请求停在 running。下一轮两条路：
+1. 选择器/规划器强制覆盖 prompt 页（mandatory 语义修透）；
+2. 或在 worker 侧把「prompt 页」直接并入选择结果再交给编排器（不依赖 C++ 语义）。

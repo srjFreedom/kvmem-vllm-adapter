@@ -418,7 +418,11 @@ class VllmSparseRuntime:
         if engine_c is not None and engine_c > 0:
             # Reset to the engine's count every step: `num_scheduled_tokens` includes speculative
             # drafts that may be rejected, so counting them drifts ahead of the real sequence.
-            self._state[req].tokens = int(engine_c)
+            # `engine_c` already INCLUDES the step being committed here, so subtract it first - the
+            # commit loop below adds it back. Setting it wholesale double-counted every step
+            # (measured: runtime tokens 9638 vs engine 8112, and the two TP ranks disagreed about
+            # which pages to select).
+            self._state[req].tokens = max(0, int(engine_c) - int(n_new_tokens or 0))
         pending = int(self._pending_new.get(req, 0) or 0)
         if pending > int(n_new_tokens or 0):
             n_new_tokens = pending            # prefill chunks are visible only via query_start_loc
