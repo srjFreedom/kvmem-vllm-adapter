@@ -359,6 +359,7 @@ def _attach_sparse(runner, log_path):
         select_block_tokens=int(cfg.get("select_block_tokens", 128)),
         budget_tokens=int(cfg.get("budget_tokens", 32768)),
         gen_reserve=int(cfg.get("gen_reserve_tokens", 16384)),
+        recent_tokens=int(cfg.get("recent_tokens", 1024)),
         host_mib=int(cfg.get("host_mib", 16384)),
         use_kvmem_plan=bool(cfg.get("use_kvmem_plan", False)),
         sessions=int(cfg.get("sessions", 4)),

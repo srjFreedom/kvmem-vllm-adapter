@@ -56,7 +56,7 @@ class _ReqState:
 class VllmSparseRuntime:
     def __init__(self, view: RunnerView, selector, page_tokens, head_dim, rotary_dim, base,
                  k_slice=None, reselect_interval=64, log=None, first_page=0,
-                 select_block_tokens=128, budget_tokens=32768, gen_reserve=16384,
+                 select_block_tokens=128, budget_tokens=32768, gen_reserve=16384, recent_tokens=1024,
                  host_mib=16384, use_kvmem_plan=False, needle_trace=0, use_kvmem_host=True,
                  sessions=4):
         self.view = view
@@ -71,6 +71,7 @@ class VllmSparseRuntime:
         self.select_block_tokens = int(select_block_tokens)
         self.budget_tokens = int(budget_tokens)
         self.gen_reserve = int(gen_reserve)
+        self.recent_tokens = int(recent_tokens)
         self.host_mib = int(host_mib)
         self.use_kvmem_plan = bool(use_kvmem_plan)
         self.needle_trace = int(needle_trace)
@@ -633,6 +634,14 @@ class VllmSparseRuntime:
             pass
         prompt_tokens = int(getattr(orch, "prompt_tokens", 0) or 0)
         mandatory = list(range(0, -(-prompt_tokens // self.page_tokens))) if prompt_tokens else []
+        # The RECENT tail of the OUTPUT must stay too: retrieval has no scores for freshly written
+        # blocks (they are padded with -inf), so without this the model loses the lines it just
+        # produced and the output degenerates into fragments (measured: long context + retrieval).
+        recent = int(getattr(self, "recent_tokens", 0) or 0)
+        if recent > 0 and st.tokens:
+            first = max(0, (int(st.tokens) - recent) // self.page_tokens)
+            last = (int(st.tokens) - 1) // self.page_tokens
+            mandatory = sorted(set(mandatory) | set(range(first, last + 1)))
         # Force the prompt pages only when the prompt fits the budget. If it does not, the entry
         # policy failed to trim it; forcing them would make the view exceed B and the plan would be
         # rejected anyway (the compact also refuses to go below the prompt).
