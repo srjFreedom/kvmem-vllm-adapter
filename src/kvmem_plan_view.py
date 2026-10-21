@@ -11,6 +11,9 @@ Two facts learned the hard way (see NOTES 38):
     per layer, three capability bits, a stamp with all revisions non-zero, a catalog whose blocks
     chain head-to-tail up to the frontier, and a current host copy for every block.
 """
+
+import os
+
 from dataclasses import dataclass
 
 PAGE_TOKENS_DEFAULT = 16
@@ -172,6 +175,15 @@ class KvmemPlanner:
             self.descriptor(),
             self.snapshot(total_tokens, session_id, resident_blocks=set(selected_blocks)),
             selected_blocks, mandatory, budget)
+        if os.environ.get("KVMEM_PLAN_TRACE") == "1":
+            try:
+                import sys as _sys
+                print(f"[kvmem plan] total={int(total_tokens)} sel_blocks={len(selected_blocks)} "
+                      f"sel_tokens={tokens_of(selected_blocks)} mandatory_blocks={len(mandatory)} "
+                      f"visible={int(plan.visible_tokens)} kept_blocks={len(plan.next.blocks)} "
+                      f"budget_tokens={self.budget_tokens}", file=_sys.stderr, flush=True)
+            except Exception:
+                pass
         kept = tuple(vb.block.id for vb in plan.next.blocks)
         pages = []
         for block in kept:

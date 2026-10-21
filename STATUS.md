@@ -1197,3 +1197,18 @@ ninfer 对等必须原地复用引擎页，另存副本在 B≈池/2 时物理�
 - 实跑仍 `visible=5296 < prompt 5541`：选页集合已含 prompt 块，但 planner 返回的
   `next.visible_tokens` 仍少 ~2 个块 → 下一轮在 `plan()` 里打印
   `selected_blocks / plan.next.blocks / visible` 的差集定位
+
+### Route A 第十二轮：缺口定位到 planner 之后、row 构建之前
+
+探针（同一 reselect 记录）：
+
+```
+plan: {visible: 7585, kept_blocks: 60, sel_pages: 475, mandatory: 346}
+selected: 332   seq_len: 5312   prompt: 5535   mandatory_pages: 346
+```
+
+- 规划器**是对的**：60 块 = 475 页 = 7600 token，visible 7585 ≥ prompt 5535 ✅
+- 但 `stats["selected"]` 只有 332 页（5312 token）→ 截断被拒（visible < prompt）
+- 结论：`selected` 在 planner 之后、`_finish_reselect` 之前被缩小（475 → 332）。
+  嫌疑：`slots` 分支/`page_to_slot` 分支/`self.total_tokens` 过滤。下一轮在
+  `_finish_reselect` 之前打印 `len(selected)` 并对照 `self.total_tokens`，一次就能抓到。

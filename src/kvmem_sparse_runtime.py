@@ -197,6 +197,12 @@ class VllmSparseRuntime:
                                        if hasattr(self.view, "num_blocks") else None))
                 except Exception:
                     orch.planner = None
+                    try:
+                        import traceback as _tb
+                        self.log({"kind": "planner_error", "req": req,
+                                  "error": _tb.format_exc()[-600:]})
+                    except Exception:
+                        pass
             if self.retrieval_enabled:
                 from kvmem_retrieval_index import KvmemRetrievalIndex
                 index = KvmemRetrievalIndex(self.select_block_tokens, self.page_tokens,
@@ -389,6 +395,7 @@ class VllmSparseRuntime:
                       "row": len(st.row), "R": getattr(orch, "gen_reserve", None),
                       "budget": orch.reselect_token_budget,
                       "planner": orch.planner is not None,
+                  "plan": getattr(orch, "last_plan", None),
                       "due": bool(orch.should_reselect())})
         return st
 
@@ -531,7 +538,8 @@ class VllmSparseRuntime:
             self.log({"kind": "reselect_check", "req": req, "tokens": st.tokens,
                       "last": orch._tokens_at_reselect, "R": getattr(orch, "gen_reserve", None),
                       "budget": orch.reselect_token_budget,
-                      "planner": orch.planner is not None, "due": bool(due)})
+                      "planner": orch.planner is not None,
+                  "plan": getattr(orch, "last_plan", None), "due": bool(due)})
         # Compaction is DECODE-only and TRUNCATION-driven: reselect when the R cadence is due, which
         # is exactly when the pool (B history + R output) is full and the visible set must shrink.
         # Building an "initial view" on the first decode step is NOT done: it truncates nothing
@@ -629,6 +637,8 @@ class VllmSparseRuntime:
                   "evicted": stats["evicted"], "resident": stats["resident"],
                   "seq_len": st.seq_len, "tokens": st.tokens,
                   "prompt": prompt_tokens, "mandatory_pages": len(mandatory),
+                  "planner": orch.planner is not None,
+                  "plan": getattr(orch, "last_plan", None),
                   "prefill_pressure": stats["prefill_pressure"]}
         cap = getattr(self, "capture", None)
         if cap is not None:

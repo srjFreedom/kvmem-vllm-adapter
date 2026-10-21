@@ -460,6 +460,12 @@ class SparseOrchestrator:
                                      mandatory_pages=list(mandatory_pages))
             selected = [p for p in plan.pages if p * self.page_tokens < max(self.total_tokens, 1)]
             self.last_visible_tokens = plan.visible_tokens
+            # Diagnostic: what the planner actually returned (the compact refuses when the visible
+            # set does not cover the prompt, so these numbers explain a refusal directly).
+            self.last_plan = {"visible": int(plan.visible_tokens),
+                              "kept_blocks": len(plan.kept_blocks),
+                              "sel_pages": len(selected),
+                              "mandatory": len(mandatory_pages)}
         else:
             self.last_visible_tokens = len(selected) * self.page_tokens
         self.steps_since_reselect = 0
