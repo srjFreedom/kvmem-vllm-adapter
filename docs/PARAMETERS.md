@@ -62,6 +62,7 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 | `GPU_UTIL` | `0.97` | vLLM 请求的显存占用比例（`--gpu-memory-utilization`）| 22 GB 卡用 0.97；显存更小的卡降低（0.90~0.95），OOM 时**先降这个** |
 | `MAX_BATCHED_TOKENS` | `4096` | 单步 prefill 的 token 上限（chunk 大小）| 调大可减少 chunk 数、提升 prefill 并行度，但吃显存；调大后必须重跑启动 smoke |
 | `SPECULATIVE_TOKENS` | `4` | MTP 投机 token 数 | `0` = 关闭投机：省显存/更稳，但 decode 变慢 |
+| `NO_ASYNC_SCHEDULING` | `1` | `1` = 同步调度（N>1 的默认），`0` = 异步调度 | 入口选片下没有块表改写，同步不再是安全前提；实测两种模式**同速**，设 `0` 只是去掉约束、不提速。直连引擎内压缩（`inrequest-compaction`）时必须保持 `1` |
 | `MESSAGE_TYPE` | `text+image` | 是否加载视觉塔 | 纯文本模型/只跑文本时设 `text`（省 ~0.9 GiB 权重）|
 | `MM_IMAGE_LIMIT` | `64` | 每 prompt 允许图片数 | 与 `MESSAGE_TYPE` 配套 |
 | `SERVICE_SCOPE` | `lan` | 监听范围 | `lan` = `0.0.0.0`；`local` = 只监听 `127.0.0.1` |

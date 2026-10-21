@@ -31,6 +31,7 @@ export CAPTURE_TOKENS=${CAPTURE_TOKENS:-512}
 export GPU_UTIL=${GPU_UTIL:-0.97}                 # 显存占用比例，OOM 先降这个
 export MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-4096}
 export SPECULATIVE_TOKENS=${SPECULATIVE_TOKENS:-4}
+export NO_ASYNC_SCHEDULING=${NO_ASYNC_SCHEDULING:-1}  # 1=同步（N>1 默认）；入口选片下可设 0（异步），实测同速
 export MESSAGE_TYPE=${MESSAGE_TYPE:-text+image}   # text | text+image
 export MM_IMAGE_LIMIT=${MM_IMAGE_LIMIT:-64}
 export SERVICE_SCOPE=${SERVICE_SCOPE:-lan}        # lan | local
