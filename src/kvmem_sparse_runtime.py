@@ -879,17 +879,8 @@ class VllmSparseRuntime:
         except Exception:
             pass
         forced = mandatory if prompt_tokens and prompt_tokens <= int(self.budget_tokens) else []
-        # The sink pages are re-read from the host store on every reselect: a device move that
-        # touches them is where they were lost (measured: `needle: false` on pages 0/1 after a few
-        # compactions of a 200K prompt, and the answer degenerated into noise).
-        try:
-            _sink_pages = max(0, int(getattr(self, "sink_tokens", 0) or 0) // max(1, self.page_tokens))
-            _force_rebuild = set(range(0, _sink_pages + 8))
-        except Exception:
-            _force_rebuild = set()
         stats = orch.reselect(slots=_take, mandatory_pages=mandatory,
-                              forced_pages=forced, prefill_pressure=prefill_pressure,
-                              rebuild_pages=_force_rebuild)
+                              forced_pages=forced, prefill_pressure=prefill_pressure)
         selected = list(orch.last_view.row_pages)
         used = list(orch.slots[:len(selected)])
         spare = taken["slots"][-1]

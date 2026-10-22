@@ -408,7 +408,7 @@ class SparseOrchestrator:
 
     # --- reselect ---------------------------------------------------------------------
     def reselect(self, mandatory_pages=(), slots=None, page_to_slot=None,
-                 prefill_pressure=False, forced_pages=(), rebuild_pages=()):
+                 prefill_pressure=False, forced_pages=()):
         # The selector works on the token frontier, which can include a partially-filled last
         # selection block; only pages that already hold written tokens may be selected.
         if self.retrieval_index is not None:
@@ -552,7 +552,7 @@ class SparseOrchestrator:
             needed = [delta for _, (_, delta) in zip(selected, rotation_deltas(
                 selected, self.page_tokens))]
             self._needed_delta = dict(zip(selected, needed))
-            moves, rebuild = self.plan_moves(selected, needed, rebuild_pages=rebuild_pages)
+            moves, rebuild = self.plan_moves(selected, needed)
             ordered, cyclic = self.order_moves(moves)
             # Pages that only change slot are copied on the DEVICE (HBM), not re-read over PCIe.
             page_of_src = {self.slot_of[p]: p for p in selected if p in self.slot_of}
@@ -588,27 +588,21 @@ class SparseOrchestrator:
                                     "cyclic": len(cyclic), "selected": len(selected)}
         return self._finish_reselect(selected, evicted, prefill_pressure)
 
-    def plan_moves(self, selected, needed, rebuild_pages=()):
+    def plan_moves(self, selected, needed):
         """Split the rebuild into device-to-device moves and host re-reads.
-
-        `rebuild_pages` are ALWAYS re-read from the host store (never device-moved). The runtime
-        uses it for the sink pages: they are the first pages of the context and every device move
-        that touches them is a chance to lose them, which showed up as `needle: false` on pages 0/1
-        after a few 200K-prompt compactions.
 
         A page that is still resident (bytes valid on the device) with the SAME baked rotation
         only needs to change slots. Copying it on the device costs HBM bandwidth (~600 GB/s)
         instead of a PCIe round trip (~12 GB/s), and it does not add an fp8 rounding step.
         Everything else is rebuilt from the host page store (one hop, never chained).
         """
-        force = set(int(p) for p in rebuild_pages)
         moves, rebuild = [], []
         for rank, page in enumerate(selected):
             dst = self.slots[rank]
             want = needed[rank]
             src = self.slot_of.get(page)
-            if page not in force and (page in self.resident and src is not None
-                                      and self.baked_delta.get(page) == want):
+            if (page in self.resident and src is not None
+                    and self.baked_delta.get(page) == want):
                 if src != dst:
                     moves.append((int(src), int(dst)))
                 continue
