@@ -710,7 +710,7 @@ index 87fdbfb164..374c481070 100644
      # Version of dataclass repr with token IDs obfuscated.
      def anon_repr(self) -> str:
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 253ea9d3ea..66065a043e 100644
+index 253ea9d3ea..56594cc908 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -129,6 +129,14 @@ class Scheduler(SchedulerInterface):
@@ -728,43 +728,66 @@ index 253ea9d3ea..66065a043e 100644
          self.enable_kv_cache_events = (
              self.kv_events_config is not None
              and self.kv_events_config.enable_kv_cache_events
-@@ -650,7 +658,7 @@ class Scheduler(SchedulerInterface):
+@@ -453,6 +461,22 @@ class Scheduler(SchedulerInterface):
+         # async KV loads). Their remaining-block reservation gates async loads.
+         self._inflight_prefills: set[Request] = set()
+ 
++    def _kvmem_prompt_progress(self, request: Request) -> int:
++        """Prompt tokens already accounted for, in the book that is authoritative right now.
++
++        Non-resident (the shipped default): `num_computed_tokens`. It is the only counter that
++        includes a PREFIX-CACHE HIT - `num_logical_tokens` starts at 0 and counts only tokens
++        scheduled for this request, so after a hit it trails by the cached prefix and a finished
++        prefill looks unfinished forever. The prefill barrier then keeps deferring the decode step
++        of its own cohort and the request hangs (measured: every repeated prompt stalled after
++        prefill, engine `running=1/waiting=0`, no tokens).
++        Resident: `num_logical_tokens` (served count), because a compaction rewinds
++        `num_computed_tokens` to the resident book length.
++        """
++        if self.kvmem_resident:
++            return request.num_logical_tokens
++        return request.num_computed_tokens
++
+     def _mamba_block_aligned_split(
+         self,
+         request: Request,
+@@ -650,7 +674,7 @@ class Scheduler(SchedulerInterface):
              prefill_candidates = [
                  request
                  for request in self.running
 -                if request.num_computed_tokens < request.num_prompt_tokens
-+                if request.num_logical_tokens < request.num_prompt_tokens
++                if self._kvmem_prompt_progress(request) < request.num_prompt_tokens
              ]
              # A newly arriving prefill must not pause an already decoding-only
              # batch. The barrier is for aligning an in-flight prefill cohort;
-@@ -668,7 +676,7 @@ class Scheduler(SchedulerInterface):
+@@ -668,7 +692,7 @@ class Scheduler(SchedulerInterface):
                  waiting_candidates = (
                      request
                      for request in self.waiting
 -                    if request.num_computed_tokens < request.num_prompt_tokens
-+                    if request.num_logical_tokens < request.num_prompt_tokens
++                    if self._kvmem_prompt_progress(request) < request.num_prompt_tokens
                      and request.request_id
                      not in self._prefill_barrier_admission_blocked
                  )
-@@ -677,7 +685,7 @@ class Scheduler(SchedulerInterface):
+@@ -677,7 +701,7 @@ class Scheduler(SchedulerInterface):
                  )
  
              remaining_prompts = [
 -                request.num_prompt_tokens - request.num_computed_tokens
-+                request.num_prompt_tokens - request.num_logical_tokens
++                request.num_prompt_tokens - self._kvmem_prompt_progress(request)
                  for request in prefill_candidates
              ]
              if remaining_prompts and barrier_has_running_prefill:
-@@ -740,7 +748,7 @@ class Scheduler(SchedulerInterface):
+@@ -740,7 +764,7 @@ class Scheduler(SchedulerInterface):
                  continue
  
              request_prefill_remaining = max(
 -                request.num_prompt_tokens - request.num_computed_tokens, 0
-+                request.num_prompt_tokens - request.num_logical_tokens, 0
++                request.num_prompt_tokens - self._kvmem_prompt_progress(request), 0
              )
              if (
                  prefill_frontier is not None
-@@ -789,10 +797,14 @@ class Scheduler(SchedulerInterface):
+@@ -789,10 +813,14 @@ class Scheduler(SchedulerInterface):
                  req_index += 1
                  continue
  
@@ -780,7 +803,7 @@ index 253ea9d3ea..66065a043e 100644
              )
              if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                  num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-@@ -804,11 +816,16 @@ class Scheduler(SchedulerInterface):
+@@ -804,11 +832,16 @@ class Scheduler(SchedulerInterface):
  
              # Make sure the input position does not exceed the max model len.
              # This is necessary when using spec decoding.
@@ -800,7 +823,7 @@ index 253ea9d3ea..66065a043e 100644
              )
  
              # Apply Mamba alignment before encoder caps.
-@@ -842,6 +859,21 @@ class Scheduler(SchedulerInterface):
+@@ -842,6 +875,21 @@ class Scheduler(SchedulerInterface):
              )
  
              if num_new_tokens == 0:
@@ -822,16 +845,16 @@ index 253ea9d3ea..66065a043e 100644
                  # The request cannot be scheduled because one of the following
                  # reasons:
                  # 1. No new tokens to schedule. This may happen when
-@@ -1009,7 +1041,7 @@ class Scheduler(SchedulerInterface):
+@@ -1009,7 +1057,7 @@ class Scheduler(SchedulerInterface):
                  request_id = request.request_id
  
                  request_prefill_remaining = max(
 -                    request.num_prompt_tokens - request.num_computed_tokens, 0
-+                    request.num_prompt_tokens - request.num_logical_tokens, 0
++                    request.num_prompt_tokens - self._kvmem_prompt_progress(request), 0
                  )
                  if (
                      prefill_frontier is not None
-@@ -1187,7 +1219,9 @@ class Scheduler(SchedulerInterface):
+@@ -1187,7 +1235,9 @@ class Scheduler(SchedulerInterface):
                      # We use `request.num_tokens` instead of
                      # `request.num_prompt_tokens` to consider the resumed
                      # requests, which have output tokens.
@@ -842,16 +865,16 @@ index 253ea9d3ea..66065a043e 100644
  
                      # Pad new decode requests to uniform spec decoding size to
                      # preserve full cudagraph for this step.
-@@ -1217,7 +1251,7 @@ class Scheduler(SchedulerInterface):
+@@ -1217,7 +1267,7 @@ class Scheduler(SchedulerInterface):
                      if 0 < threshold < num_new_tokens:
                          num_new_tokens = threshold
                      if (
 -                        num_computed_tokens < request.num_prompt_tokens
-+                        request.num_logical_tokens < request.num_prompt_tokens
++                        self._kvmem_prompt_progress(request) < request.num_prompt_tokens
                          and prefill_frontier_step is not None
                      ):
                          num_new_tokens = min(num_new_tokens, prefill_frontier_step)
-@@ -1700,6 +1734,10 @@ class Scheduler(SchedulerInterface):
+@@ -1700,6 +1750,10 @@ class Scheduler(SchedulerInterface):
          self._inflight_prefills.discard(request)
          request.status = RequestStatus.PREEMPTED
          request.num_computed_tokens = 0
@@ -862,7 +885,7 @@ index 253ea9d3ea..66065a043e 100644
          if request.spec_token_ids:
              request.spec_token_ids = []
          # Async scheduling: mark all in-flight output as stale. Its tokens are
-@@ -1736,11 +1774,33 @@ class Scheduler(SchedulerInterface):
+@@ -1736,11 +1790,33 @@ class Scheduler(SchedulerInterface):
          for req_id, num_scheduled_token in num_scheduled_tokens.items():
              request = self.requests[req_id]
              request.num_computed_tokens += num_scheduled_token
@@ -897,7 +920,7 @@ index 253ea9d3ea..66065a043e 100644
                  request.num_tokens + request.num_output_placeholders
              )
              scheduler_output.has_structured_output_requests |= (
-@@ -1828,6 +1888,7 @@ class Scheduler(SchedulerInterface):
+@@ -1828,6 +1904,7 @@ class Scheduler(SchedulerInterface):
          new_block_ids: list[tuple[list[int], ...] | None] = []
          all_token_ids: dict[str, list[int]] = {}
          num_computed_tokens: list[int] = []
@@ -905,7 +928,7 @@ index 253ea9d3ea..66065a043e 100644
          num_output_tokens: list[int] = []
          resumed_req_ids = set()
  
-@@ -1860,6 +1921,7 @@ class Scheduler(SchedulerInterface):
+@@ -1860,6 +1937,7 @@ class Scheduler(SchedulerInterface):
                  req_to_new_blocks[req_id].get_block_ids(allow_none=True)
              )
              num_computed_tokens.append(req.num_computed_tokens)
@@ -913,7 +936,7 @@ index 253ea9d3ea..66065a043e 100644
              num_output_tokens.append(
                  req.num_output_tokens + req.num_output_placeholders
              )
-@@ -1871,6 +1933,7 @@ class Scheduler(SchedulerInterface):
+@@ -1871,6 +1949,7 @@ class Scheduler(SchedulerInterface):
              all_token_ids=all_token_ids,
              new_block_ids=new_block_ids,
              num_computed_tokens=num_computed_tokens,
@@ -921,7 +944,7 @@ index 253ea9d3ea..66065a043e 100644
              num_output_tokens=num_output_tokens,
          )
  
-@@ -2179,6 +2242,22 @@ class Scheduler(SchedulerInterface):
+@@ -2179,6 +2258,22 @@ class Scheduler(SchedulerInterface):
                  sampled_token_ids[req_index] if sampled_token_ids else []
              )
  
@@ -944,7 +967,7 @@ index 253ea9d3ea..66065a043e 100644
              scheduled_spec_token_ids = (
                  scheduler_output.scheduled_spec_decode_tokens.get(req_id)
              )
-@@ -2196,6 +2275,11 @@ class Scheduler(SchedulerInterface):
+@@ -2196,6 +2291,11 @@ class Scheduler(SchedulerInterface):
                  if not output_is_stale:
                      if request.num_computed_tokens > 0:
                          request.num_computed_tokens -= num_rejected
@@ -956,7 +979,7 @@ index 253ea9d3ea..66065a043e 100644
                      if request.num_output_placeholders > 0:
                          request.num_output_placeholders -= num_rejected
                  spec_decoding_stats = self.make_spec_decoding_stats(
-@@ -2246,7 +2330,7 @@ class Scheduler(SchedulerInterface):
+@@ -2246,7 +2346,7 @@ class Scheduler(SchedulerInterface):
                  stopped = True
              elif (
                  self.is_mm_encoder_only
@@ -965,7 +988,7 @@ index 253ea9d3ea..66065a043e 100644
              ):
                  # An encoder instance runs the encoder and publishes the
                  # embeddings instead of sampling, so it stops as soon as the
-@@ -2577,7 +2661,13 @@ class Scheduler(SchedulerInterface):
+@@ -2577,7 +2677,13 @@ class Scheduler(SchedulerInterface):
  
              # Check for stop and update request state.
              # This must be called before we make the EngineCoreOutput.
@@ -980,7 +1003,7 @@ index 253ea9d3ea..66065a043e 100644
              if stopped:
                  del new_token_ids[num_new:]  # Trim new tokens if needed.
                  break
-@@ -3005,6 +3095,16 @@ class Scheduler(SchedulerInterface):
+@@ -3005,6 +3111,16 @@ class Scheduler(SchedulerInterface):
          connector_stats_payload = (
              kv_connector_stats.to_dict() if kv_connector_stats else None
          )
@@ -997,7 +1020,7 @@ index 253ea9d3ea..66065a043e 100644
          return SchedulerStats(
              num_running_reqs=len(self.running),
              num_waiting_reqs=len(self.waiting),
-@@ -3017,6 +3117,8 @@ class Scheduler(SchedulerInterface):
+@@ -3017,6 +3133,8 @@ class Scheduler(SchedulerInterface):
              kv_connector_stats=connector_stats_payload,
              cudagraph_stats=cudagraph_stats,
              perf_stats=perf_stats,
@@ -1006,7 +1029,7 @@ index 253ea9d3ea..66065a043e 100644
          )
  
      def make_spec_decoding_stats(
-@@ -3322,6 +3424,7 @@ class Scheduler(SchedulerInterface):
+@@ -3322,6 +3440,7 @@ class Scheduler(SchedulerInterface):
                      marked_invalid_block_ids |= request_invalid_block_ids
                      total_affected_tokens += req_num_computed_tokens
                      request.num_computed_tokens = 0

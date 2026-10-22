@@ -1545,3 +1545,42 @@ draft 砍掉；下一步 `num_new_tokens = num_tokens_with_spec - num_logical` �
 `i == TOKENS//12`（或 `TOKENS//10`）行，但干草堆只有约 `TOKENS/15` 行 → **key 从未插进去**，
 模型只能瞎猜（曾误判成「引擎在 90% 位置丢 KV」）。现在按行占比（10%/90%）插入；`needle.py`
 同时显式 `enable_thinking: false`，避免思维链吃满 `max_tokens` 导致 `content` 为空。
+
+### 常驻模型（第 11 轮）：前缀缓存命中挂死 —— prefill barrier 用错了计数
+
+**现象**：同一 prompt 第 2 次请求挂死（`Prefill progress: 100%` 之后不再出 token，`running=1/waiting=0`）；
+两个请求挂住后引擎两个槽位都被占死，后续请求全部超时。这正是用户说的「都要全量 prefill / 前缀命中有问题」。
+
+**隔离**（每次重启约 100s，均为经典模式、窗口 172032）：
+
+| 配置 | 结果 |
+|---|---|
+| 经典模式 + 前缀缓存开 | 第 1 次 `created 6464`，第 2 次挂死 |
+| 关掉视图安装（`KVMEM_NO_ROW/SEQ/POS=1`） | 仍挂死 |
+| **纯 vLLM**（`--no-kvmem`） | 仍挂死 → 与 kvmem 插件无关 |
+| 纯 vLLM + `mamba-cache-mode none` | 仍挂死 |
+| 纯 vLLM + 关投机解码（`SPECULATIVE_METHOD=none`） | 仍挂死 |
+
+**根因**：补丁为常驻模式把 6 处 prefill-barrier 判定从 `num_computed_tokens` 换成了
+`num_logical_tokens`，但**没有按 `kvmem_resident` 门控**。前缀缓存命中时 `num_computed_tokens`
+从缓存长度起算（例如 6464），而 `num_logical_tokens` 从 0 起、只累加本次调度的 token，
+于是 `num_logical < num_prompt` 永远成立：
+
+- 请求被永久当成「还在 prefill」→ `barrier_has_running_prefill=True`；
+- `defer_decode_for_prefill_batch` 每步把这个「prefill 同伙」的 decode 延后 → 一步都不跑。
+
+**修复**：新增 `Scheduler._kvmem_prompt_progress(request)`——常驻模式取 `num_logical_tokens`，
+否则取 `num_computed_tokens`（它才是包含前缀命中的那个计数）；6 处判定统一改用它。
+
+**验证**（经典模式、前缀缓存开、N=2、窗口 172032）：
+
+| 用例 | 结果 |
+|---|---|
+| 8.6K prompt ×3 | 6.60s（created 6464）→ **2.33s / 2.30s**（cached 6464） |
+| 57K prompt 冷/热 | 46.7s → **4.5s**（cached 50,096，≈10×） |
+| 并发两条相同 prompt | 3.55s / 3.19s，两条都命中 6464 |
+| 8K needle | ✅ 两把 key，8.1s |
+| 解码质量闸门 | 4/4 ✅ |
+| 补丁 / 树哈希 | `--check-tree` ✅（`patch_sha256 58a987c0…`，`tree a59c7ce2…`） |
+
+常驻模式（压缩开）仍保持强制关闭前缀缓存：块哈希按逻辑 token、KV 布局是压缩后的，两者不兼容。
