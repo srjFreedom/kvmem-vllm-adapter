@@ -1269,3 +1269,13 @@ mandatory（与 prompt 页同等对待）。
   长上下文从 849/2415 提升到 1889/1892 行
 - 输出长度接近 `max_tokens` 时模型自身会跑偏（与压缩无关）
 - 压缩期间 `st.seq_len` 不能低于 prompt（vLLM 由 `num_tokens - prompt_len` 推导输出长度）
+
+### 单开关收敛（0.2.0 内）
+
+超 R 生成本来横跨两个进程：入口上限在 API server（env），压缩在 EngineCore/TP worker（CLI）。
+`worker.py` 现在把 CLI 开关作为唯一权威：打开时自动导出 `KVMEM_ENTRY_INREQUEST_COMPACTION=1`
+（API server 继承 worker 的环境），关闭时把该变量压回 0；与 CLI 相反的显式取值会被纠正并打印原因。
+环境变量只保留给「脱离 worker 单独跑入口策略（网关）」的场景。
+
+活引擎验证：**不设环境变量**、只加 `--kvmem-inrequest-compaction` → 输出 3800 token（> R=2048，
+上限确实被抬高），compact_applied 2 次。离线新增 4 条断言（`entry_compaction_env`）。

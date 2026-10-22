@@ -72,6 +72,20 @@ def main():
     check(backend_worker.async_scheduling_mode({"inrequest_compaction": False}, "1") == "1",
           "an explicit sync choice stands without compaction")
 
+    # In-request compaction is ONE feature: the CLI switch also drives the entry-side ceiling.
+    check(backend_worker.entry_compaction_env({"inrequest_compaction": True}, {}) == ("1", None),
+          "compaction on exports the entry flag by itself")
+    check(backend_worker.entry_compaction_env({"inrequest_compaction": True},
+                                              {"KVMEM_ENTRY_INREQUEST_COMPACTION": "0"})
+          == ("1", "entry was off"),
+          "compaction on overrides a stale entry flag of 0")
+    check(backend_worker.entry_compaction_env({"inrequest_compaction": False},
+                                              {"KVMEM_ENTRY_INREQUEST_COMPACTION": "1"})
+          == ("0", "entry was on"),
+          "engine compaction off forces the entry ceiling back to R")
+    check(backend_worker.entry_compaction_env({"inrequest_compaction": False}, {}) == ("0", None),
+          "without compaction the entry flag is off and silent")
+
     print("PASS worker_cli_test" if not failed else "FAILED worker_cli_test")
     sys.exit(0 if not failed else 1)
 

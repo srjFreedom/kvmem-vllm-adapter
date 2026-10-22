@@ -48,6 +48,33 @@ def async_scheduling_mode(cfg, override=None):
     return override or "0"
 
 
+
+def entry_compaction_env(cfg, env):
+    """Keep the ENTRY-side compaction switch in sync with the engine-side one (one knob).
+
+    In-request compaction is a single feature spread over two processes: the generation ceiling is
+    raised inside the API server (the entry policy reads ``KVMEM_ENTRY_*``) while the compaction
+    itself runs in EngineCore / the TP workers (CLI -> ``--additional-config``). ``worker.py`` is
+    the process that spawns the engine and the API server inherits its environment, so the CLI
+    switch is the single authority here and the entry flag is derived from it. The env var stays
+    overridable only for deployments that run the entry policy without this worker (gateway).
+
+    Returns ``(value, note)``; ``note`` is ``"entry was off"``/``"entry was on"`` when the incoming
+    value contradicted the CLI.
+    """
+    on = bool(cfg.get("inrequest_compaction"))
+    current = str(env.get("KVMEM_ENTRY_INREQUEST_COMPACTION", "")).strip().lower()
+    truthy = current in ("1", "true", "yes", "on")
+    falsy = current in ("0", "false", "no", "off")
+    if on:
+        return "1", ("entry was off" if falsy else None)
+    if truthy:
+        # A raised ceiling without engine-side compaction overflows the pool (B + R cannot hold
+        # the output), so the CLI wins here as well.
+        return "0", "entry was on"
+    return "0", None
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     module = _cli_module()
@@ -78,6 +105,16 @@ def main(argv=None) -> int:
     # Sync scheduling keeps every step self-contained, so compaction FORCES it back on; without
     # compaction an explicit NO_ASYNC_SCHEDULING still wins and async remains the default.
     _seqs = int(env.get("MAX_NUM_SEQS", "1") or "1")
+    # One switch for the whole feature: the CLI flag also drives the entry-side ceiling.
+    _entry_flag, _entry_note = entry_compaction_env(cfg, env)
+    env["KVMEM_ENTRY_INREQUEST_COMPACTION"] = _entry_flag
+    if _entry_note == "entry was off":
+        print("[kvmem backends/vllm] --kvmem-inrequest-compaction overrides "
+              "KVMEM_ENTRY_INREQUEST_COMPACTION=0: the entry ceiling must match the engine")
+    elif _entry_note == "entry was on":
+        print("[kvmem backends/vllm] KVMEM_ENTRY_INREQUEST_COMPACTION was on but "
+              "--kvmem-inrequest-compaction is off -> forcing the entry ceiling back to R "
+              "(a raised ceiling without engine compaction overflows B + R)")
     _async_override = env.get("NO_ASYNC_SCHEDULING", "").strip()
     env["NO_ASYNC_SCHEDULING"] = async_scheduling_mode(cfg, _async_override)
     if cfg.get("inrequest_compaction"):
