@@ -629,7 +629,7 @@ class VllmSparseRuntime:
                 and bool(getattr(self, "inrequest_compaction", False))):
             high = self.prefill_high_watermark
             finishing = bool(prompt_len) and (st.tokens + int(n_new_tokens or 0)) >= prompt_len
-            if (finishing and not getattr(st, "query_reselected", False)
+            if (finishing and st.row and not st.query_reselected
                     and getattr(orch, "retrieval_index", None) is not None):
                 # The prompt is about to be complete, so the question is inside the captured
                 # query window: reselect ONCE with retrieval now. Without this a prompt that was
