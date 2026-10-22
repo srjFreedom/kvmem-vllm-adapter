@@ -76,7 +76,7 @@ Prefix cache: re-sending the same 57K-token prompt costs 2.1 s TTFT instead of 5
 | Component | Role |
 |---|---|
 | `plugin/kvmem_entry_middleware.py` → `KvmemEntryPlugin` | `attach_router`: installs the middleware and mounts the UI |
-| middleware (default `mode=middleware`) | standard Starlette body rewrite through the `request._body` cache: select history to B, clamp `max_tokens` to R, enforce CTX, H/D history-block cache |
+| middleware (default `mode=middleware`) | standard Starlette body rewrite through the `request._body` cache: select history to B, cap `max_tokens` at **R** (or **`CTX − B`** with in-request compaction on), enforce CTX, H/D history-block cache |
 | `mode=hook` (fallback) | wraps `OpenAIServingChat.create_chat_completion` and applies the same policy to the parsed request |
 | `src/kvmem_entry_policy.py` | the single policy implementation both modes share |
 
@@ -85,10 +85,27 @@ The response path is never touched, so **streaming, CORS and error handling are 
 ### Why selection happens at the entry
 
 vLLM indexes KV blocks by logical position and assumes a monotonically growing sequence: truncating
-mid-request desynchronises its scheduler (measured: the `num_scheduled_tokens >= num_logits` assertion,
-then a hang once speculative decoding is off). kvmem's "keep only B" therefore has to be decided
-**before the request reaches the engine**; inside the engine, kvmem's own per-page policy
-(`prepare_reselect`) does the rest.
+mid-request naively desynchronises its scheduler (measured: the `num_scheduled_tokens >= num_logits`
+assertion, then a hang once speculative decoding is off). By default kvmem therefore decides "keep only
+B" **before the request reaches the engine**, and the engine's sequence only grows.
+
+### Super-R generation (opt-in, `--kvmem-inrequest-compaction`)
+
+With that flag the engine-side compaction is enabled as well: a request may generate past R up to
+**`CTX − B`**. When the pool fills (B history + R new tokens) the runtime reselects, spills the pages
+that are no longer needed to the host tier, and tells EngineCore to truncate the request's token book
+in place (`_all_token_ids` → visible set, `num_computed_tokens` rewound) over a worker → EngineCore
+channel, so the scheduler sees no gap and the sequence keeps growing while the physical pool stays
+`B + R`.
+
+- **Default (flag absent): the generation ceiling is R.** `max_tokens` is clamped to R and a request
+  stops there; the sequence is monotone and the pool is never recycled.
+- **With the flag: the ceiling is `CTX − B`.** One switch drives everything: the entry ceiling, the
+  engine-side compaction, the block channel and synchronous scheduling. The prompt stays immutable
+  (vLLM derives the output length from `num_tokens − prompt_len`), so only generated tokens are
+  compacted and the most recent `RECENT` tokens are always kept.
+- Reaching `CTX − B` is an ordinary `max_tokens` stop (`finish_reason=length`); the response text is
+  never truncated, because compaction only rewrites the engine's token book, not the output tokens.
 
 ### Where the retrieval query comes from
 
@@ -179,6 +196,15 @@ CHAT_TEMPLATE_FILE=                      # only if the model has no built-in tem
 KVMEM_UI_DIR=                            # optional static UI mounted at /
 ```
 
+Generation ceiling: **R by default** (`max_tokens` is clamped to R). Pass
+`--kvmem-inrequest-compaction` to the worker to enable super-R generation, which raises the ceiling to
+`CTX − B`, compacts the live context when the pool fills and forces synchronous scheduling — one flag
+for the whole feature, no environment variable to set:
+
+```bash
+./backends/vllm/worker.py --model "$MODEL" --port 18200 ... --kvmem-inrequest-compaction
+```
+
 The constraint that bites: **engine window = `N × (B + R)` must fit the KV pool** (210,651 tokens on
 this box). Defaults (`N=1, B+R=53,248`) leave a large margin; `N=2` → 106,496, `N=3` → 159,744,
 `N=4` → 212,992 which needs a smaller B (≈26K) or R.
@@ -246,8 +272,10 @@ INTEGRATION-SURFACE.md      touch-point list and source-change registry
 - **Entry-side text selection is a stopgap** (vLLM cannot truncate KV mid-request), not kvmem's own
   policy; when history and question share one message the trailing-paragraph heuristic is used, so a
   very long question whose topic sits in an earlier paragraph may lose blocks
-- **No in-request compaction** (continue past R into the budget): vLLM's monotonic-length assumption
-  makes it assert or hang; upstream also has it experimental and off by default
+- **In-request compaction is opt-in** (`--kvmem-inrequest-compaction`) and, by design, more delicate
+  than the default path: the prompt must fit in B, retrieval has no score for freshly generated blocks
+  (the runtime keeps the recent tail mandatory), and compaction is not combined with speculative
+  drafts on the same step
 - `SESSIONS` splits the H pool across **live** requests; a finished request releases its share, which
   is not the reference backends' "retain N inactive histories"
 - No tiered disk / session cold store (`nvme-gb`, `session-cache-dir`) and no NVMe page tier
