@@ -108,6 +108,13 @@ def main(argv=None) -> int:
     # One switch for the whole feature: the CLI flag also drives the entry-side ceiling.
     _entry_flag, _entry_note = entry_compaction_env(cfg, env)
     env["KVMEM_ENTRY_INREQUEST_COMPACTION"] = _entry_flag
+    # The logical context cap (kvmem CTX) is not the engine window any more: with the resident
+    # model the engine holds B+R of KV while the conversation may grow to CTX. The fork reads this
+    # to size its request-length check, so export it (falling back to the site's CTX).
+    if _entry_flag == "1":
+        _ctx = str(env.get("CTX") or env.get("KVMEM_ENTRY_CTX") or "").strip()
+        if _ctx.isdigit() and int(_ctx) > 0:
+            env["KVMEM_ENTRY_CTX"] = _ctx
     if _entry_note == "entry was off":
         print("[kvmem backends/vllm] --kvmem-inrequest-compaction overrides "
               "KVMEM_ENTRY_INREQUEST_COMPACTION=0: the entry ceiling must match the engine")

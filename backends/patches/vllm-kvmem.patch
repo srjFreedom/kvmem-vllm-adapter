@@ -137,6 +137,150 @@ index 39d670c019..36cd9bac61 100644
      from vllm.entrypoints.serve.sagemaker.api_router import (
          attach_router as register_sagemaker_api_router,
      )
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+index b7b292e835..0adceeb720 100644
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -51,6 +51,7 @@ from vllm.sampling_params import (
+     ThinkingTokenBudget,
+ )
+ from vllm.utils import random_uuid
++from vllm.kvmem_limits import logical_max_len  # KVMem logical cap
+ 
+ logger = init_logger(__name__)
+ 
+@@ -623,7 +624,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
+             max_output_tokens_param = "max_tokens"
+ 
+         return TokenizeParams(
+-            max_total_tokens=model_config.max_model_len,
++            max_total_tokens=logical_max_len(model_config.max_model_len),
+             max_output_tokens=max_output_tokens or 0,
+             truncate_prompt_tokens=self.truncate_prompt_tokens,
+             truncation_side=self.truncation_side,
+diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
+index 54da5329fd..ddbdd01553 100644
+--- a/vllm/entrypoints/openai/chat_completion/serving.py
++++ b/vllm/entrypoints/openai/chat_completion/serving.py
+@@ -69,6 +69,7 @@ from vllm.tokenizers import TokenizerLike
+ from vllm.tool_parsers.streaming import extract_named_tool_call_streaming
+ from vllm.utils.collection_utils import as_list
+ from vllm.utils.serial_utils import numpy2base64
++from vllm.kvmem_limits import logical_max_len  # KVMem logical cap
+ 
+ logger = init_logger(__name__)
+ 
+@@ -297,7 +298,7 @@ class OpenAIServingChat(GenerateBaseServing):
+         data_parallel_rank = self._get_data_parallel_rank(raw_request)
+ 
+         # Schedule the request and get the result generator.
+-        max_model_len = self.model_config.max_model_len
++        max_model_len = logical_max_len(self.model_config.max_model_len)
+         generators: list[AsyncGenerator[RequestOutput, None]] = []
+         mm_token_counts: dict[str, int] | None = None
+         for i, engine_input in enumerate(engine_inputs):
+diff --git a/vllm/entrypoints/openai/completion/protocol.py b/vllm/entrypoints/openai/completion/protocol.py
+index 6d7a49bacd..678364a31f 100644
+--- a/vllm/entrypoints/openai/completion/protocol.py
++++ b/vllm/entrypoints/openai/completion/protocol.py
+@@ -35,6 +35,7 @@ from vllm.sampling_params import (
+ )
+ from vllm.utils import random_uuid
+ from vllm.utils.collection_utils import is_list_of
++from vllm.kvmem_limits import logical_max_len  # KVMem logical cap
+ 
+ logger = init_logger(__name__)
+ 
+@@ -264,7 +265,7 @@ class CompletionRequest(OpenAIBaseModel):
+ 
+     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
+         return TokenizeParams(
+-            max_total_tokens=model_config.max_model_len,
++            max_total_tokens=logical_max_len(model_config.max_model_len),
+             max_output_tokens=self.max_tokens or 0,
+             truncate_prompt_tokens=self.truncate_prompt_tokens,
+             truncation_side=self.truncation_side,
+diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
+index 2fa01478ce..c857a47708 100644
+--- a/vllm/entrypoints/openai/completion/serving.py
++++ b/vllm/entrypoints/openai/completion/serving.py
+@@ -48,6 +48,7 @@ from vllm.tokenizers import TokenizerLike
+ from vllm.utils.async_utils import merge_async_iterators
+ from vllm.utils.collection_utils import as_list
+ from vllm.utils.serial_utils import numpy2base64
++from vllm.kvmem_limits import logical_max_len  # KVMem logical cap
+ 
+ logger = init_logger(__name__)
+ 
+@@ -153,7 +154,7 @@ class OpenAIServingCompletion(GenerateBaseServing):
+         data_parallel_rank = self._get_data_parallel_rank(raw_request)
+ 
+         # Schedule the request and get the result generator.
+-        max_model_len = self.model_config.max_model_len
++        max_model_len = logical_max_len(self.model_config.max_model_len)
+         generators: list[AsyncGenerator[RequestOutput, None]] = []
+         for i, engine_input in enumerate(engine_inputs):
+             max_tokens = get_max_tokens(
+diff --git a/vllm/entrypoints/openai/responses/protocol.py b/vllm/entrypoints/openai/responses/protocol.py
+index 27c60967e5..6984872154 100644
+--- a/vllm/entrypoints/openai/responses/protocol.py
++++ b/vllm/entrypoints/openai/responses/protocol.py
+@@ -71,6 +71,7 @@ from vllm.sampling_params import (
+     StructuredOutputsParams,
+ )
+ from vllm.utils import random_uuid
++from vllm.kvmem_limits import logical_max_len  # KVMem logical cap
+ 
+ logger = init_logger(__name__)
+ 
+@@ -354,7 +355,7 @@ class ResponsesRequest(OpenAIBaseModel):
+ 
+     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
+         return TokenizeParams(
+-            max_total_tokens=model_config.max_model_len,
++            max_total_tokens=logical_max_len(model_config.max_model_len),
+             max_output_tokens=self.max_output_tokens or 0,
+             truncate_prompt_tokens=-1 if self.truncation != "disabled" else None,
+             max_total_tokens_param="max_model_len",
+diff --git a/vllm/entrypoints/openai/responses/serving.py b/vllm/entrypoints/openai/responses/serving.py
+index 2c61205e22..e4de8c73a0 100644
+--- a/vllm/entrypoints/openai/responses/serving.py
++++ b/vllm/entrypoints/openai/responses/serving.py
+@@ -88,6 +88,7 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
+ from vllm.tokenizers import TokenizerLike
+ from vllm.utils import random_uuid
+ from vllm.utils.collection_utils import as_list
++from vllm.kvmem_limits import logical_max_len  # KVMem logical cap
+ 
+ logger = init_logger(__name__)
+ 
+@@ -220,7 +221,7 @@ class OpenAIServingResponses(GenerateBaseServing):
+     ) -> ErrorResponse | None:
+         """Add validations to the input to the generator here."""
+         prompt_len = self._extract_prompt_len(engine_input)
+-        max_model_len = self.model_config.max_model_len
++        max_model_len = logical_max_len(self.model_config.max_model_len)
+ 
+         if prompt_len >= max_model_len:
+             error_message = (
+@@ -363,7 +364,7 @@ class OpenAIServingResponses(GenerateBaseServing):
+             raw_request.state.request_metadata = request_metadata
+ 
+         # Schedule the request and get the result generator.
+-        max_model_len = self.model_config.max_model_len
++        max_model_len = logical_max_len(self.model_config.max_model_len)
+         generators: list[AsyncGenerator[ConversationContext, None]] = []
+ 
+         # Only include builtin tools that the request actually asked for.
+@@ -617,7 +618,7 @@ class OpenAIServingResponses(GenerateBaseServing):
+         session_id: str | None = None,
+         reasoning_parser_kwargs: dict[str, Any] | None = None,
+     ):
+-        max_model_len = self.model_config.max_model_len
++        max_model_len = logical_max_len(self.model_config.max_model_len)
+         cache_salt = cast(str | None, engine_input.get("cache_salt"))
+ 
+         orig_priority = priority
 diff --git a/vllm/entrypoints/serve/speedmeter/__init__.py b/vllm/entrypoints/serve/speedmeter/__init__.py
 new file mode 100644
 index 0000000000..e69de29bb2
@@ -310,6 +454,33 @@ index 0000000000..a2990acd60
 +
 +def read_all():
 +    return {layer: read(layer) for layer in list(_query)}
+diff --git a/vllm/kvmem_limits.py b/vllm/kvmem_limits.py
+new file mode 100644
+index 0000000000..913486700a
+--- /dev/null
++++ b/vllm/kvmem_limits.py
+@@ -0,0 +1,21 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Logical context cap for KVMem's resident-book mode.
++
++With in-request compaction the engine holds only `B + R` of KV per request while the conversation
++may grow to kvmem's logical ceiling (CTX). The request-length checks in the OpenAI entrypoints must
++therefore compare against CTX, not against the engine window (`max_model_len`), which is sized for
++the resident pool.
++"""
++import os
++
++
++def logical_max_len(max_model_len: int) -> int:
++    """`max_model_len`, or kvmem's CTX when in-request compaction is on."""
++    try:
++        if os.environ.get("KVMEM_ENTRY_INREQUEST_COMPACTION", "").strip().lower() not in (
++                "1", "true", "yes", "on"):
++            return int(max_model_len)
++        ctx = int(os.environ.get("KVMEM_ENTRY_CTX") or 0)
++    except Exception:
++        return int(max_model_len)
++    return ctx if ctx > 0 else int(max_model_len)
 diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
 index e3e8b37369..c7c84707a3 100644
 --- a/vllm/model_executor/layers/quantization/modelopt.py
@@ -359,6 +530,36 @@ index 495650eb19..70711540d2 100644
          return q, k, v, gate
  
      def forward(
+diff --git a/vllm/renderers/base.py b/vllm/renderers/base.py
+index 4aca17fa43..08d70fa4b6 100644
+--- a/vllm/renderers/base.py
++++ b/vllm/renderers/base.py
+@@ -57,6 +57,7 @@ from .inputs import (
+ )
+ from .inputs.preprocess import extract_target_prompt
+ from .params import ChatParams, TokenizeParams
++from vllm.kvmem_limits import logical_max_len  # KVMem logical cap
+ 
+ if TYPE_CHECKING:
+     from vllm.config import VllmConfig
+@@ -438,7 +439,7 @@ class BaseRenderer(ABC, Generic[_T]):
+         encoder_config = model_config.encoder_config or {}
+ 
+         return TokenizeParams(
+-            max_total_tokens=model_config.max_model_len,
++            max_total_tokens=logical_max_len(model_config.max_model_len),
+             do_lower_case=encoder_config.get("do_lower_case", False),
+             add_special_tokens=True,
+         )
+@@ -453,7 +454,7 @@ class BaseRenderer(ABC, Generic[_T]):
+         encoder_config = model_config.encoder_config or {}
+ 
+         return TokenizeParams(
+-            max_total_tokens=model_config.max_model_len,
++            max_total_tokens=logical_max_len(model_config.max_model_len),
+             do_lower_case=encoder_config.get("do_lower_case", False),
+             add_special_tokens=False,
+         )
 diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
 index 87fdbfb164..374c481070 100644
 --- a/vllm/v1/core/sched/output.py
@@ -399,7 +600,7 @@ index 87fdbfb164..374c481070 100644
      # Version of dataclass repr with token IDs obfuscated.
      def anon_repr(self) -> str:
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 253ea9d3ea..0b3fbcf16b 100644
+index 253ea9d3ea..a746802860 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -129,6 +129,14 @@ class Scheduler(SchedulerInterface):
@@ -469,7 +670,29 @@ index 253ea9d3ea..0b3fbcf16b 100644
              )
              if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                  num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-@@ -1009,7 +1021,7 @@ class Scheduler(SchedulerInterface):
+@@ -842,6 +854,21 @@ class Scheduler(SchedulerInterface):
+             )
+ 
+             if num_new_tokens == 0:
++                if self.kvmem_resident:
++                    # KVMem diagnostic: a stalled request shows its two counters here (logical =
++                    # served, computed = resident KV). One line per request.
++                    _seen = getattr(self, "_kvmem_zero_logged", None)
++                    if _seen is None:
++                        _seen = self._kvmem_zero_logged = set()
++                    if request.request_id not in _seen:
++                        _seen.add(request.request_id)
++                        logger.info(
++                            "kvmem: no new tokens req=%s logical=%d computed=%d tokens=%d "
++                            "prompt=%d placeholders=%d in_flight=%d status=%s",
++                            request.request_id, request.num_logical_tokens,
++                            request.num_computed_tokens, request.num_tokens,
++                            request.num_prompt_tokens, request.num_output_placeholders,
++                            getattr(request, "num_in_flight_tokens", -1), request.status)
+                 # The request cannot be scheduled because one of the following
+                 # reasons:
+                 # 1. No new tokens to schedule. This may happen when
+@@ -1009,7 +1036,7 @@ class Scheduler(SchedulerInterface):
                  request_id = request.request_id
  
                  request_prefill_remaining = max(
@@ -478,7 +701,7 @@ index 253ea9d3ea..0b3fbcf16b 100644
                  )
                  if (
                      prefill_frontier is not None
-@@ -1187,7 +1199,9 @@ class Scheduler(SchedulerInterface):
+@@ -1187,7 +1214,9 @@ class Scheduler(SchedulerInterface):
                      # We use `request.num_tokens` instead of
                      # `request.num_prompt_tokens` to consider the resumed
                      # requests, which have output tokens.
@@ -489,7 +712,7 @@ index 253ea9d3ea..0b3fbcf16b 100644
  
                      # Pad new decode requests to uniform spec decoding size to
                      # preserve full cudagraph for this step.
-@@ -1217,7 +1231,7 @@ class Scheduler(SchedulerInterface):
+@@ -1217,7 +1246,7 @@ class Scheduler(SchedulerInterface):
                      if 0 < threshold < num_new_tokens:
                          num_new_tokens = threshold
                      if (
@@ -498,7 +721,7 @@ index 253ea9d3ea..0b3fbcf16b 100644
                          and prefill_frontier_step is not None
                      ):
                          num_new_tokens = min(num_new_tokens, prefill_frontier_step)
-@@ -1700,6 +1714,9 @@ class Scheduler(SchedulerInterface):
+@@ -1700,6 +1729,9 @@ class Scheduler(SchedulerInterface):
          self._inflight_prefills.discard(request)
          request.status = RequestStatus.PREEMPTED
          request.num_computed_tokens = 0
@@ -508,7 +731,7 @@ index 253ea9d3ea..0b3fbcf16b 100644
          if request.spec_token_ids:
              request.spec_token_ids = []
          # Async scheduling: mark all in-flight output as stale. Its tokens are
-@@ -1736,6 +1753,7 @@ class Scheduler(SchedulerInterface):
+@@ -1736,6 +1768,7 @@ class Scheduler(SchedulerInterface):
          for req_id, num_scheduled_token in num_scheduled_tokens.items():
              request = self.requests[req_id]
              request.num_computed_tokens += num_scheduled_token
@@ -516,7 +739,7 @@ index 253ea9d3ea..0b3fbcf16b 100644
              request.num_in_flight_tokens += num_scheduled_token
              if self.defer_block_free:
                  # Record the in-flight step, to fence deferred block freeing.
-@@ -1828,6 +1846,7 @@ class Scheduler(SchedulerInterface):
+@@ -1828,6 +1861,7 @@ class Scheduler(SchedulerInterface):
          new_block_ids: list[tuple[list[int], ...] | None] = []
          all_token_ids: dict[str, list[int]] = {}
          num_computed_tokens: list[int] = []
@@ -524,7 +747,7 @@ index 253ea9d3ea..0b3fbcf16b 100644
          num_output_tokens: list[int] = []
          resumed_req_ids = set()
  
-@@ -1860,6 +1879,7 @@ class Scheduler(SchedulerInterface):
+@@ -1860,6 +1894,7 @@ class Scheduler(SchedulerInterface):
                  req_to_new_blocks[req_id].get_block_ids(allow_none=True)
              )
              num_computed_tokens.append(req.num_computed_tokens)
@@ -532,7 +755,7 @@ index 253ea9d3ea..0b3fbcf16b 100644
              num_output_tokens.append(
                  req.num_output_tokens + req.num_output_placeholders
              )
-@@ -1871,6 +1891,7 @@ class Scheduler(SchedulerInterface):
+@@ -1871,6 +1906,7 @@ class Scheduler(SchedulerInterface):
              all_token_ids=all_token_ids,
              new_block_ids=new_block_ids,
              num_computed_tokens=num_computed_tokens,
@@ -540,7 +763,7 @@ index 253ea9d3ea..0b3fbcf16b 100644
              num_output_tokens=num_output_tokens,
          )
  
-@@ -2196,6 +2217,11 @@ class Scheduler(SchedulerInterface):
+@@ -2196,6 +2232,11 @@ class Scheduler(SchedulerInterface):
                  if not output_is_stale:
                      if request.num_computed_tokens > 0:
                          request.num_computed_tokens -= num_rejected
@@ -552,7 +775,7 @@ index 253ea9d3ea..0b3fbcf16b 100644
                      if request.num_output_placeholders > 0:
                          request.num_output_placeholders -= num_rejected
                  spec_decoding_stats = self.make_spec_decoding_stats(
-@@ -2246,7 +2272,7 @@ class Scheduler(SchedulerInterface):
+@@ -2246,7 +2287,7 @@ class Scheduler(SchedulerInterface):
                  stopped = True
              elif (
                  self.is_mm_encoder_only
@@ -561,7 +784,7 @@ index 253ea9d3ea..0b3fbcf16b 100644
              ):
                  # An encoder instance runs the encoder and publishes the
                  # embeddings instead of sampling, so it stops as soon as the
-@@ -2577,7 +2603,13 @@ class Scheduler(SchedulerInterface):
+@@ -2577,7 +2618,13 @@ class Scheduler(SchedulerInterface):
  
              # Check for stop and update request state.
              # This must be called before we make the EngineCoreOutput.
@@ -576,7 +799,7 @@ index 253ea9d3ea..0b3fbcf16b 100644
              if stopped:
                  del new_token_ids[num_new:]  # Trim new tokens if needed.
                  break
-@@ -3005,6 +3037,16 @@ class Scheduler(SchedulerInterface):
+@@ -3005,6 +3052,16 @@ class Scheduler(SchedulerInterface):
          connector_stats_payload = (
              kv_connector_stats.to_dict() if kv_connector_stats else None
          )
@@ -593,7 +816,7 @@ index 253ea9d3ea..0b3fbcf16b 100644
          return SchedulerStats(
              num_running_reqs=len(self.running),
              num_waiting_reqs=len(self.waiting),
-@@ -3017,6 +3059,8 @@ class Scheduler(SchedulerInterface):
+@@ -3017,6 +3074,8 @@ class Scheduler(SchedulerInterface):
              kv_connector_stats=connector_stats_payload,
              cudagraph_stats=cudagraph_stats,
              perf_stats=perf_stats,
@@ -602,7 +825,7 @@ index 253ea9d3ea..0b3fbcf16b 100644
          )
  
      def make_spec_decoding_stats(
-@@ -3322,6 +3366,7 @@ class Scheduler(SchedulerInterface):
+@@ -3322,6 +3381,7 @@ class Scheduler(SchedulerInterface):
                      marked_invalid_block_ids |= request_invalid_block_ids
                      total_affected_tokens += req_num_computed_tokens
                      request.num_computed_tokens = 0
@@ -640,6 +863,39 @@ index ffc9a5de7e..82a5eff626 100644
      @contextmanager
      def log_error_detail(self, scheduler_output: SchedulerOutput):
          """Execute the model and log detailed info on failure."""
+diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
+index 4cc433cbfe..28db4e3537 100644
+--- a/vllm/v1/engine/input_processor.py
++++ b/vllm/v1/engine/input_processor.py
+@@ -31,6 +31,7 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
+ from vllm.utils.async_utils import make_async
+ from vllm.utils.jsontree import json_iter_leaves
+ from vllm.v1.engine import EngineCoreRequest
++from vllm.kvmem_limits import logical_max_len  # KVMem logical cap
+ 
+ logger = init_logger(__name__)
+ 
+@@ -359,7 +360,8 @@ class InputProcessor:
+                 seq_len = length_from_prompt_token_ids_or_embeds(
+                     prompt_token_ids, prompt_embeds
+                 )
+-                sampling_params.max_tokens = self.model_config.max_model_len - seq_len
++                sampling_params.max_tokens = (logical_max_len(self.model_config.max_model_len)
++                                              - seq_len)
+ 
+             sampling_params.update_from_generation_config(
+                 self.generation_config_fields,
+@@ -446,7 +448,9 @@ class InputProcessor:
+ 
+         model_config = self.model_config
+         max_prompt_len = (
+-            model_config.max_model_len
++            # KVMem: with the resident model the engine holds B+R of KV while the conversation
++            # may grow to CTX, so the input limit is the logical cap, not the engine window.
++            logical_max_len(model_config.max_model_len)
+             if prompt_type == "decoder"
+             else self.mm_encoder_cache_size
+         )
 diff --git a/vllm/v1/engine/llm_engine.py b/vllm/v1/engine/llm_engine.py
 index 32096079e0..c2e8543ddd 100644
 --- a/vllm/v1/engine/llm_engine.py
@@ -940,7 +1196,7 @@ index 481da2016b..f12cc9426b 100644
          LOOKAHEAD_BLOCK=triton.next_power_of_2(num_lookahead),
      )
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 0422c9e885..5b6937da59 100644
+index 0422c9e885..682354c244 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -1157,6 +1157,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
@@ -951,7 +1207,7 @@ index 0422c9e885..5b6937da59 100644
              )
              req_index = self.req_states.req_id_to_index[req_id]
              if self.adaptive_verification is not None:
-@@ -1204,11 +1205,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1204,11 +1205,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              if (idx := self.req_states.req_id_to_index.get(req_id)) is not None:
                  self.block_tables.append_block_ids(idx, block_ids, overwrite=True)
          num_computed_tokens_np = self.req_states.num_computed_tokens_np
@@ -965,41 +1221,79 @@ index 0422c9e885..5b6937da59 100644
 +            else [None] * len(reqs.req_ids),
          ):
              req_index = self.req_states.req_id_to_index[req_id]
-             num_computed_tokens_np[req_index] = num_computed_tokens
+-            num_computed_tokens_np[req_index] = num_computed_tokens
++            # KVMem: the host mirror carries the SERVED count. With a resident book the scheduler's
++            # `num_computed_tokens` is the compacted KV length, and using it here makes the runner
++            # believe the prefill never finished (no logits, no sampled token, request stalls).
++            num_computed_tokens_np[req_index] = (
++                int(num_logical) if num_logical is not None else num_computed_tokens)
 +            if num_logical is not None:
++                # UVA: the kernel reads this same host memory, no staged write needed.
 +                num_logical_tokens_np[req_index] = int(num_logical)
-+                self.req_states.num_logical_tokens.stage_write_elem(
-+                    req_index, int(num_logical))
              if req_new_block_ids is not None and req_id not in table_updates:
                  self.block_tables.append_block_ids(
                      req_index, req_new_block_ids, overwrite=False
-@@ -1399,7 +1408,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1399,7 +1411,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  query_start_loc,
                  self.req_states.all_token_ids.gpu,
                  self.req_states.prefill_len.gpu,
 -                self.req_states.num_computed_tokens.gpu,
-+                self.req_states.num_logical_tokens.gpu,
++                self.req_states.num_logical_tokens,
              )
  
          # Prepare positions and seq_lens.
 diff --git a/vllm/v1/worker/gpu/states.py b/vllm/v1/worker/gpu/states.py
-index 434fb80582..7636ef2c83 100644
+index 434fb80582..e521ede0f6 100644
 --- a/vllm/v1/worker/gpu/states.py
 +++ b/vllm/v1/worker/gpu/states.py
-@@ -60,6 +60,12 @@ class RequestState:
+@@ -3,7 +3,7 @@
+ import numpy as np
+ import torch
+ 
+-from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
++from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor, UvaBuffer
+ 
+ 
+ class RequestState:
+@@ -19,6 +19,13 @@ class RequestState:
+     ):
+         self.max_num_reqs = max_num_reqs
+         self.max_model_len = max_model_len
++        # KVMem resident-book mode: the token-id table must hold the LOGICAL book, which may grow
++        # to kvmem's CTX while the engine window only covers the resident B + R.
++        from vllm.kvmem_limits import logical_max_len
++        self.logical_max_len = max(
++            logical_max_len(max_model_len),
++            int(max_model_len),
++        )
+         self.max_num_batched_tokens = max_num_batched_tokens
+         self.num_speculative_steps = num_speculative_steps
+         self.vocab_size = vocab_size
+@@ -32,7 +39,7 @@ class RequestState:
+         # depending on the configured max_num_reqs and max_model_len.
+         # To save GPU memory, we use UVA instead of GPU for this tensor.
+         self.all_token_ids = StagedWriteTensor(
+-            (self.max_num_reqs, self.max_model_len),
++            (self.max_num_reqs, self.logical_max_len),
+             dtype=torch.int32,
+             device=device,
+             uva_instead_of_gpu=True,
+@@ -60,6 +67,14 @@ class RequestState:
          )
          # Optimistic CPU mirror of num_computed_tokens (upper bound on GPU value).
          self.num_computed_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
 +        # KVMem: served-token count. Equals num_computed_tokens unless an in-request compaction
 +        # rewound the resident book; the prefill input window is sliced with THIS count.
-+        self.num_logical_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
-+        self.num_logical_tokens = StagedWriteTensor(
-+            self.max_num_reqs, dtype=torch.int32, device=device
-+        )
++        # It is a UVA buffer (like the token table): the scheduler's value is written from Python
++        # on every step and the prefill kernel reads the same pinned memory, so no staged write is
++        # needed for requests that are already running.
++        self._num_logical_buf = UvaBuffer(self.max_num_reqs, torch.int32)
++        self.num_logical_tokens_np = self._num_logical_buf.np
++        self.num_logical_tokens = self._num_logical_buf.uva
  
          # Last sampled tokens.
          self.last_sampled_tokens = torch.zeros(
-@@ -104,6 +110,7 @@ class RequestState:
+@@ -104,6 +119,7 @@ class RequestState:
          all_token_ids: list[int],
          num_computed_tokens: int,
          max_tokens: int,
@@ -1007,22 +1301,13 @@ index 434fb80582..7636ef2c83 100644
      ) -> None:
          assert len(self.free_indices) > 0, "No free indices"
          req_idx = self.free_indices.pop()
-@@ -123,6 +130,10 @@ class RequestState:
+@@ -123,6 +139,9 @@ class RequestState:
          self.num_computed_tokens_np[req_idx] = num_computed_tokens
          self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
          self.num_cached_tokens.stage_write_elem(req_idx, num_computed_tokens)
 +        _logical = (num_computed_tokens if num_logical_tokens is None
 +                    else int(num_logical_tokens))
 +        self.num_logical_tokens_np[req_idx] = _logical
-+        self.num_logical_tokens.stage_write_elem(req_idx, _logical)
  
          self.draft_tokens[req_idx].zero_()
  
-@@ -133,6 +144,7 @@ class RequestState:
-         self.all_token_ids.apply_write()
-         self.num_computed_tokens.apply_write()
-         self.num_cached_tokens.apply_write()
-+        self.num_logical_tokens.apply_write()
- 
-     def remove_request(self, req_id: str) -> int | None:
-         """Return the freed slot index, or None if the request was not found."""

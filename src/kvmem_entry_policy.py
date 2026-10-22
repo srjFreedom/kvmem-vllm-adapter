@@ -33,6 +33,13 @@ from kvmem_prompt_select import _blocks, question_tail, select_history
 ENV_PREFIX = "KVMEM_ENTRY_"
 
 
+def _resident_prefill_enabled() -> bool:
+    """Long prompts are prefilled whole (lossless) only when this is explicitly on."""
+    import os
+    return os.environ.get("KVMEM_ENTRY_RESIDENT_PREFILL", "").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 class ContextTooLong(Exception):
     """The history exceeds ``CTX``, the logical context KVMem was sized for."""
 
@@ -291,11 +298,12 @@ def _select_in_messages(payload: dict, policy: EntryPolicy,
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         return None
-    if policy.inrequest_compaction:
+    if policy.inrequest_compaction and _resident_prefill_enabled():
         # Resident model: the engine prefills the WHOLE history in chunks and keeps only B+R of it
         # in VRAM, spilling the rest to the host tier. Trimming here would throw away tokens the
         # decode-time retrieval could still bring back, so the entry only enforces CTX and the
-        # output ceiling.
+        # output ceiling. OPT-IN until the long-prompt prefill path is verified end to end: the
+        # default stays "select to B", which is the behaviour every released version had.
         return None
     threshold = max(1, policy.budget) * max(1e-9, policy.chars_per_token)
     best = None
