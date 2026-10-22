@@ -91,7 +91,7 @@ RUN=(env MAX_NUM_SEQS="$N" \
     --kvmem-sink-tokens "$SINK" --kvmem-recent-tokens "$RECENT" \
     --kvmem-sessions "$SESSIONS" --kvmem-host-mib "$HOST_MIB" \
     --kvmem-capture-tokens "$CAPTURE_TOKENS" \
-    --kvmem-block-tokens 128 \
+    --kvmem-block-tokens 32 \
     --kvmem-lrfu-lambda 0.5 --kvmem-lrfu-top-frac 0.9 \
     --kvmem-score-aggregation max --kvmem-retrieval)
 

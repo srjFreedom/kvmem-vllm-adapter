@@ -62,6 +62,7 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 |---|---|---|---|
 | `GPU_UTIL` | `0.97` | vLLM 请求的显存占用比例（`--gpu-memory-utilization`）| 22 GB 卡用 0.97；显存更小的卡降低（0.90~0.95），OOM 时**先降这个** |
 | `MAX_BATCHED_TOKENS` | `4096` | 单步 prefill 的 token 上限（chunk 大小）| 调大可减少 chunk 数、提升 prefill 并行度，但吃显存；调大后必须重跑启动 smoke |
+| `--kvmem-block-tokens` | `32` | 选片块大小（必须是最小 KV 页 16 的整数倍）| 32 是修复值：检索按块取 pre-RoPE key 的**均值**打分，128 会让一条关键行（key/id/罕见词）被同块另外 ~127 个 token 稀释 —— 实测 200K prompt 在 50%~73% 换出时，128 答非所问、32 两把 needle 全中。调回 128 只在上下文很短（<32K）且不需要精确召回时才有意义 |
 | `SPECULATIVE_TOKENS` | `4` | MTP 投机 token 数 | `0` = 关闭投机：省显存/更稳，但 decode 变慢 |
 | `NO_ASYNC_SCHEDULING` | `0` | `0` = 异步调度（默认），`1` = 强制同步 | 入口选片下引擎无块表改写，异步调度安全；两种模式实测**同速**。开 `inrequest-compaction` 时 worker **强制写回 `1`**（显式 `0` 会被覆盖并打印原因：异步预排下一步会与块表改写冲突） |
 | `--kvmem-inrequest-compaction` | 关 | **常驻工作区的唯一开关**：入口上限 `R`→`CTX`（自动导出给入口进程）+ 入口不再裁剪历史 + 引擎内压缩（prefill 与 decode 都做）+ block 通道 + 强制同步调度 + 关闭前缀缓存。默认关闭 = 完全走 vLLM 原始路径（入口裁到 B、上限 R） | 加这一个参数，显存就是每请求 `B+R`（与上下文长度无关）；显式把 `KVMEM_ENTRY_INREQUEST_COMPACTION` 设成相反值会被它纠正并打印原因 |

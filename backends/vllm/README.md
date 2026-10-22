@@ -15,7 +15,7 @@
 python3 backends/vllm/worker.py --model /path/to/model --port 8000 \
   --kvmem-budget 32768 --kvmem-gen-reserve 16384 \
   --kvmem-sink-tokens 8192 --kvmem-recent-tokens 1024 \
-  --kvmem-sessions 4 --kvmem-host-mib 16384 --kvmem-block-tokens 128 \
+  --kvmem-sessions 4 --kvmem-host-mib 16384 --kvmem-block-tokens 32 \
   --no-kvmem-lrfu --max-model-len 204800 --tensor-parallel-size 2
 ```
 

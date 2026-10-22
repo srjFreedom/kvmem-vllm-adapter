@@ -8,7 +8,7 @@ anything, which is how the mapping is tested.
 
     kvmem-vllm-worker.py --model /path/to/model --kvmem-budget 32768 \
         --kvmem-gen-reserve 16384 --kvmem-sink-tokens 8192 --kvmem-recent-tokens 1024 \
-        --kvmem-block-tokens 128 --kvmem-host-mib 16384 --kvmem-sessions 4 \
+        --kvmem-block-tokens 32 --kvmem-host-mib 16384 --kvmem-sessions 4 \
         --kvmem-disk-mib 0 --no-kvmem-lrfu --tensor-parallel-size 2
 """
 from __future__ import annotations
@@ -86,7 +86,11 @@ def build_config(a) -> dict:
     if a.kvmem_disk_mib and not a.kvmem_disk_path:
         raise SystemExit("--kvmem-disk-mib > 0 requires --kvmem-disk-path")
     # A selection block must be a whole number of native pages (16 tokens on this model).
-    block = a.kvmem_block_tokens or 128
+    # 32 is the default because retrieval scores a block by the MEAN of its pre-RoPE keys: with
+    # 128-token blocks a single distinctive line (a key, an id, a rare term) is diluted by the
+    # other ~127 tokens, and long prompts then lose exactly the needles that matter (measured:
+    # a 200K prompt at 50-73% eviction answered with noise at 128 and correctly at 32).
+    block = a.kvmem_block_tokens or 32
     if block % 16:
         raise SystemExit(f"--kvmem-block-tokens {block} is not a multiple of the native page (16)")
     if a.kvmem_sink_tokens % 16 or a.kvmem_recent_tokens % 16:
