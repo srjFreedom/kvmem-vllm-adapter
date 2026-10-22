@@ -141,6 +141,89 @@ def apply_generation_budget(payload: dict, reserve: int) -> dict | None:
     return {"kind": "gen_budget", "field": "max_tokens", "requested": None, "applied": reserve}
 
 
+def _content_text(content) -> str | None:
+    """The text of a message content: a plain string, or a list of OpenAI content parts.
+
+    Clients that attach an image / file send ``content`` as ``[{"type": "text", ...}, ...]``.
+    Treating that as "not a string" silently skipped the selection, so an attached document
+    bypassed B entirely (measured live: a 143,216-token prefill on a B=53,248 engine).
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for part in content:
+            if isinstance(part, str):
+                texts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                texts.append(part["text"])
+        return "\n".join(texts) if texts else None
+    return None
+
+
+def _rewrite_content(message: dict, selected: str) -> None:
+    """Put the selected text back, keeping non-text parts (images) in their order."""
+    content = message.get("content")
+    if isinstance(content, str):
+        message["content"] = selected
+        return
+    parts = [{"type": "text", "text": selected}]
+    for part in content:
+        if isinstance(part, str):
+            continue
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            continue
+        parts.append(part)
+    message["content"] = parts
+
+
+def _token_count(counter, text: str) -> int | None:
+    if counter is None:
+        return None
+    try:
+        return len(counter.encode(text, add_special_tokens=False))
+    except TypeError:
+        try:
+            return len(counter.encode(text))
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _fit_tokens(counter, text: str, question: str, policy: EntryPolicy,
+                selected: str, stats: dict) -> tuple[str, dict]:
+    """Shrink a selection until its REAL token count fits B.
+
+    The selection works in character space (its budget is converted with ``chars_per_token``),
+    so the re-tokenized text can still land above B - most visibly on Chinese history, where the
+    measured ratio is ~1.1-1.7 chars/token rather than the 3.0 estimate (measured live: an entry
+    that believed it sent B delivered 143,216 tokens and every engine-side compaction was then
+    refused for cutting below the prompt). When the tokenizer is reachable the real count is
+    checked and the selection is re-run with the measured ratio until it fits.
+    """
+    if counter is None or not selected:
+        return selected, stats
+    tokens = _token_count(counter, selected)
+    for attempt in range(3):
+        if tokens is None or tokens <= policy.budget:
+            break
+        ratio = max(1e-6, len(selected) / max(1, tokens))
+        # First correction: the ratio is now MEASURED, so asking for B tokens in char space is exact.
+        # Later rounds scale by the remaining overshoot (block granularity / mandatory windows).
+        target = (max(1, int(policy.budget)) if attempt == 0
+                  else max(1, int(policy.budget * policy.budget / max(1, tokens))))
+        selected, stats = select_history(text, question, target,
+                                         sink_tokens=policy.sink_tokens,
+                                         recent_tokens=policy.recent_tokens,
+                                         chars_per_token=ratio,
+                                         method=policy.select)
+        stats["token_fit"] = {"tokens": tokens, "target": target, "ratio": round(ratio, 3)}
+        tokens = _token_count(counter, selected)
+    stats["tokens_after"] = tokens
+    return selected, stats
+
+
 def _check_ctx(text: str, policy: EntryPolicy) -> None:
     limit = int(policy.ctx or 0)
     if limit <= 0:
@@ -153,18 +236,20 @@ def _check_ctx(text: str, policy: EntryPolicy) -> None:
 
 
 def rewrite_payload(payload: dict, policy: EntryPolicy,
-                    cache: HistoryCache | None = None) -> tuple[bool, dict | None]:
+                    cache: HistoryCache | None = None,
+                    counter=None) -> tuple[bool, dict | None]:
     """Apply the generation budget and, when needed, the history selection.
 
     Returns ``(changed, stats)``; a rewrite that throws must be caught by the caller and the
-    original payload forwarded untouched.
+    original payload forwarded untouched. ``counter`` is the tokenizer when the caller has one:
+    with it B is enforced in REAL tokens, without it in estimated ones.
     """
     changed = False
     stats = apply_generation_budget(payload, policy.generation_ceil())
     if stats is not None:
         changed = True
 
-    selection = _select_in_messages(payload, policy, cache)
+    selection = _select_in_messages(payload, policy, cache, counter)
     if selection is not None:
         changed = True
         stats = _merge(stats, selection)
@@ -194,21 +279,24 @@ def _question_for(messages: list, content_index: int, content: str,
             last_user = message
             break
     if last_user is not None and messages.index(last_user) != content_index:
-        text = last_user.get("content")
+        text = _content_text(last_user.get("content"))
         if isinstance(text, str) and text.strip():
             return text[-policy.question_tail_chars:] if len(text) > policy.question_tail_chars else text
     return question_tail(content, policy.question_tail_chars, policy.question_paragraphs)
 
 
 def _select_in_messages(payload: dict, policy: EntryPolicy,
-                        cache: HistoryCache | None) -> dict | None:
+                        cache: HistoryCache | None,
+                        counter=None) -> dict | None:
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         return None
     threshold = max(1, policy.budget) * max(1e-9, policy.chars_per_token)
     best = None
     for index, message in enumerate(messages):
-        content = message.get("content")
+        if not isinstance(message, dict):
+            continue
+        content = _content_text(message.get("content"))
         if not isinstance(content, str) or len(content) <= threshold:
             continue
         _check_ctx(content, policy)
@@ -218,15 +306,17 @@ def _select_in_messages(payload: dict, policy: EntryPolicy,
                 content = "\n".join(cached)
             else:
                 cache.put_blocks(content, _blocks(content))
+        question = _question_for(messages, index, content, policy)
         selected, stats = select_history(
-            content, _question_for(messages, index, content, policy),
+            content, question,
             policy.budget,
             sink_tokens=policy.sink_tokens,
             recent_tokens=policy.recent_tokens,
             chars_per_token=policy.chars_per_token,
             method=policy.select)
+        selected, stats = _fit_tokens(counter, content, question, policy, selected, stats)
         if stats.get("trimmed") and selected.strip():
-            message["content"] = selected
+            _rewrite_content(message, selected)
             stats["message_index"] = index
             stats["kind"] = "prompt_selected"
             if best is None or stats["chars_after"] < best["chars_after"]:

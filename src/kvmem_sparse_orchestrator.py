@@ -556,6 +556,12 @@ class SparseOrchestrator:
                                                        if s in page_of_src]
             rebuild_dst = [d for _, d in rebuild] + [self._needed_delta and self.slots[
                 selected.index(page_of_src[s])] for s, _ in cyclic if s in page_of_src]
+            # DEVICE MOVES FIRST, rebuild writes second: a rebuild destination can be the source
+            # of another page's move, and writing the rebuilt bytes first clobbered them (the
+            # store copy is read into its own tensor below, so the move order is unaffected).
+            for layer, kv in enumerate(self.kvs):
+                for src, dst in ordered:
+                    kv[dst].copy_(kv[src])
             if rebuild_pages:
                 dst_t = torch.tensor(rebuild_dst, dtype=torch.long, device=self.kvs[0].device)
                 deltas = [self._needed_delta[p] - self.store_delta.get(p, 0)
@@ -570,9 +576,6 @@ class SparseOrchestrator:
                     if same:
                         rotated[same] = stacked[same]
                     kv[dst_t] = rotated
-            for layer, kv in enumerate(self.kvs):
-                for src, dst in ordered:
-                    kv[dst].copy_(kv[src])
             for rank, page in enumerate(selected):
                 self.resident.add(page)
                 self.slot_of[page] = self.slots[rank]

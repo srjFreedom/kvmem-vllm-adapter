@@ -53,12 +53,12 @@ _POLICY = None
 _CACHE = None
 
 
-def apply_to_messages(messages, policy: EntryPolicy, cache=None) -> dict | None:
+def apply_to_messages(messages, policy: EntryPolicy, cache=None, counter=None) -> dict | None:
     """B selection over a list of chat messages, in place. Returns stats or None."""
     if not isinstance(messages, list) or not messages:
         return None
     payload = {"messages": [dict(m) if isinstance(m, dict) else m for m in messages]}
-    _, selection = rewrite_payload(payload, policy, cache)
+    _, selection = rewrite_payload(payload, policy, cache, counter)
     if isinstance(selection, dict) and selection.get("kind") != "prompt_selected":
         selection = selection.get("selection")
     if not (isinstance(selection, dict) and selection.get("kind") == "prompt_selected"):
@@ -76,7 +76,7 @@ def _budget_field(request):
     return getattr(request, "max_tokens", None)
 
 
-def apply_policy(request, policy: EntryPolicy, cache=None) -> dict | None:
+def apply_policy(request, policy: EntryPolicy, cache=None, counter=None) -> dict | None:
     """Apply B selection and the R ceiling to an already parsed chat request.
 
     Raises ContextTooLong when the history is above CTX (a configuration error, not a silent trim).
@@ -94,7 +94,8 @@ def apply_policy(request, policy: EntryPolicy, cache=None) -> dict | None:
             stats["gen_budget"] = {"field": "max_completion_tokens", "requested": requested,
                                    "applied": ceil}
 
-    selection = apply_to_messages(getattr(request, "messages", None) or [], policy, cache)
+    selection = apply_to_messages(getattr(request, "messages", None) or [], policy, cache,
+                                  counter)
     if selection:
         stats["selection"] = selection
 
@@ -113,24 +114,44 @@ def apply_policy(request, policy: EntryPolicy, cache=None) -> dict | None:
 CHAT_SUFFIX = "/v1/chat/completions"
 
 
+_TOKENIZER_PATHS = (
+    ("openai_serving_chat", "renderer", "tokenizer"),
+    ("openai_serving_chat", "renderer", "renderer", "tokenizer"),
+    ("openai_serving_chat", "renderer", "get_tokenizer"),
+    ("openai_serving_chat", "renderer", "renderer", "get_tokenizer"),
+    ("openai_serving_completion", "renderer", "tokenizer"),
+    ("engine_client", "renderer", "tokenizer"),
+    ("engine_client", "renderer", "renderer", "tokenizer"),
+    ("engine_client", "input_processor", "renderer", "tokenizer"),
+)
+
+
 def _resolve_tokenizer(app):
     """Find the model tokenizer reachable from the app state (None when unavailable).
 
     B is a token budget, so estimating it with a fixed chars/token ratio over-sends by however far
-    that ratio is off (measured: 1.83x on code-like history). When the tokenizer is reachable we
-    calibrate the ratio per request from the actual history.
+    that ratio is off (measured: 1.83x on code-like history, 2.7x on dense Chinese). When the
+    tokenizer is reachable we calibrate the ratio per request and enforce B in real tokens.
     """
     state = getattr(app, "state", None)
-    for path in (("openai_serving_chat", "renderer", "tokenizer"),
-                 ("openai_serving_completion", "renderer", "tokenizer"),
-                 ("engine_client", "renderer", "tokenizer")):
+    for path in _TOKENIZER_PATHS:
         obj = state
         for attr in path:
             obj = getattr(obj, attr, None)
             if obj is None:
                 break
-        if obj is not None and callable(getattr(obj, "encode", None)):
+        if obj is None:
+            continue
+        if callable(getattr(obj, "get_tokenizer", None)):
+            try:
+                obj = obj.get_tokenizer()
+            except Exception:
+                pass
+        if callable(getattr(obj, "encode", None)):
             return obj
+    _log.warning("kvmem entry: no tokenizer reachable from the app state; "
+                 "B is enforced in ESTIMATED tokens (the engine refuses to compact a prompt "
+                 "above B, so a long history may run without compaction)")
     return None
 
 
@@ -143,8 +164,11 @@ def _calibrated(policy: EntryPolicy, messages, counter):
         content = message.get("content") if isinstance(message, dict) else None
         if isinstance(content, str) and len(content) > len(longest):
             longest = content
-    threshold = max(1, policy.budget) * max(1e-9, policy.chars_per_token)
-    if len(longest) <= threshold:
+    # Calibrate whenever the message could plausibly approach B. The old gate used the ESTIMATE
+    # (budget x 3.0 chars/token), so a dense Chinese message whose real ratio is ~1.2 chars/token
+    # stayed below it and was never measured - the entry then sent 2.7x B tokens (measured live:
+    # 143,216 tokens to a B=53,248 engine) and every engine-side compaction was refused.
+    if len(longest) <= max(4096, policy.budget // 2):
         return policy
     try:
         tokens = len(counter.encode(longest, add_special_tokens=False))
@@ -192,7 +216,7 @@ def _install_middleware_class():
                 self._counter = _resolve_tokenizer(request.app)
             policy = _calibrated(self.policy, payload.get("messages"), self._counter)
             try:
-                changed, stats = rewrite_payload(payload, policy, self.cache)
+                changed, stats = rewrite_payload(payload, policy, self.cache, self._counter)
             except ContextTooLong as exc:
                 STATE["ctx_rejected"] += 1
                 _log.warning("kvmem entry: rejected request: %s", exc)
@@ -260,7 +284,7 @@ def install(serving_cls=None) -> bool:
         try:
             counter = getattr(getattr(self, "renderer", None), "tokenizer", None)
             apply_policy(request, _calibrated(_POLICY, getattr(request, "messages", None), counter),
-                         _CACHE)
+                         _CACHE, counter)
         except ContextTooLong as exc:
             STATE["ctx_rejected"] += 1
             _log.warning("kvmem entry: rejected request: %s", exc)

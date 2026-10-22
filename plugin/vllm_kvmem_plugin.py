@@ -1139,6 +1139,8 @@ def _install(cls, module_name, probe, smoke, state):
                                         {"kind": "released", "req": gone, "pid": os.getpid()})
                             npc = getattr(getattr(self, "req_states", None),
                                           "num_computed_tokens_np", None)
+                            _pl = getattr(getattr(self, "req_states", None), "prompt_len", None)
+                            plen = getattr(_pl, "np", None)
                             for req in reqs:
                                 row = rt.view.row_index(req)
                                 if row is None:
@@ -1147,6 +1149,11 @@ def _install(cls, module_name, probe, smoke, state):
                                     # The engine's own count = accepted tokens only. Without this
                                     # the R cadence counts speculative drafts and fires early.
                                     rt.note_engine_computed(req, int(npc[int(row)]))
+                                if plen is not None and int(row) < len(plen):
+                                    # The engine's post-tokenizer prompt length: the runtime refuses
+                                    # to compact a request whose prompt is above B (the engine would
+                                    # refuse every round and the slot churn corrupted the view).
+                                    rt.note_prompt_len(req, int(plen[int(row)]))
                                 rt.before_step(req, row_index=row,
                                                position_slots=rt.view.query_position_slots(req))
                 except Exception:

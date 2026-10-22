@@ -1290,3 +1290,34 @@ mandatory（与 prompt 页同等对待）。
 
 CTX 修正是 0.2.0 的 bugfix，不应移动 0.2.0。0.2.0 恢复为原始发布（d4c2be4，上限 CTX−B，
 原 tag 对象 f31f3f9 原样恢复），修正提交 a712280 单独打 **0.2.1**（上限 CTX）。
+
+### Bugfix：中文 prompt 超过 B → prefill 超预算 → 乱码 / 前缀缓存失效
+
+活引擎日志（N=2）里的直接证据：某个请求 `prompt_len = 143216`（B=53248），prefill 期间
+`compact_refused` 连发 12 轮（每轮都先分配 3327 个 device slot 并搬页），随后 sink 页 0/1 的
+needle 校验开始失败（`ok:false`），输出变成噪声。三个独立缺陷叠在一起：
+
+1. **入口按「估算 token」限 B**：B 用 `chars_per_token=3.0` 换算成字符预算，中文实测约
+   1.1–1.7 字符/token，于是「B tokens」实际送进引擎 143216 tokens（2.7 倍）。校准函数只在
+   文本超过 3.0 估算阈值时才启用，所以绝大多数长中文根本不校准。
+   修：只要有 tokenizer 就在 `> max(4096, B/2)` 字符时校准；选完之后再用真实 tokenizer
+   复核，超了就把预算按实测比例重选，直到 ≤ B。
+2. **多模态 content 被整段跳过**：`content` 是 parts 数组（带图片）时 `_select_in_messages`
+   只认字符串，整条消息不裁剪 → 附件长文原样进引擎。
+   修：`_content_text` 取 text parts 参与选择，回写时保留 image parts。
+3. **引擎对超预算 prompt 仍然尝试压缩**：压缩不能低于 prompt（vLLM 要求
+   `num_tokens >= prompt_len`），于是每轮都「先搬页、后被拒」，把 view 弄坏。
+   修：`note_prompt_len`（V2 hook 从 `req_states.prompt_len` 取）→ 超 B 的请求一律不再
+   尝试压缩，只打一次 `prompt_over_budget`。
+4. **并发下的槽位复用**（N=2 才暴露）：`_reselect` 一开始就把本请求的 slot 全部释放，
+   而 `orch.slot_of` 仍指向它们 —— 另一个请求立刻可以把这些 slot 占走，随后的「设备内搬页」
+   就把**别人的字节**拷进自己的 view（sink 页 needle 失败的另一种成因）。
+   修：重选期间不释放旧 slot（`_take_slots(keep=...)` 只允许复用本请求的非源 slot），
+   重选结束后再回收；拒绝路径只回收本轮新拿的。
+5. **rebuild 写入早于设备搬页**：rebuild 的目标可能是另一页搬移的源，先写就把源覆盖了。
+   修：先做设备搬页，再写 rebuild。
+
+离线：`entry_parts_test`（中文 1.1 字符/token + parts 附件）、`prefill_over_budget_test`
+（超预算不再动 view）、`reselect_write_order_test`（rebuild/搬页顺序）三条新回归，
+40/42 通过（`gpu_real_tensor_test` 因活引擎占用显存、`sparse_rope_test` 需 KVMEM_TEST_CONFIG，
+两者在改动前同样失败）。

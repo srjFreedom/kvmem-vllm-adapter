@@ -100,6 +100,11 @@ class VllmSparseRuntime:
         # Counting `num_scheduled_tokens` drifts under MTP (draft tokens that get rejected are
         # counted but never appended), which fires the R cadence early.
         self._engine_computed = {}
+        # Engine-reported PROMPT length per request (immutable for the request's life). The
+        # entry policy is supposed to keep it <= B; when it does not, compaction cannot shorten
+        # the book below the prompt, so the runtime must not churn slots trying.
+        self._prompt_len = {}
+        self._over_budget_logged = set()
         self._orch = {}
         self._state = {}
         # row_index -> the compacted length the ATTENTION kernel must read for that row.
@@ -246,6 +251,8 @@ class VllmSparseRuntime:
         self._page_map.pop(req, None)
         self._dirty_pages.pop(req, None)
         self._engine_computed.pop(req, None)
+        self._prompt_len.pop(req, None)
+        self._over_budget_logged.discard(req)
         self._pending_frontier.pop(req, None)
         self._pending_new.pop(req, None)
         self._prev_n.pop(req, None)
@@ -324,6 +331,13 @@ class VllmSparseRuntime:
         """Set the request's absolute token frontier from the scheduler (authoritative)."""
         st = self.state(req)
         self._pending_frontier[req] = int(frontier)
+
+    def note_prompt_len(self, req, tokens):
+        """The request's prompt length as the ENGINE counts it (post tokenizer)."""
+        try:
+            self._prompt_len[req] = int(tokens)
+        except Exception:
+            pass
 
     def note_engine_computed(self, req, computed):
         """The engine's own num_computed_tokens for this request (accepted tokens only)."""
@@ -521,13 +535,25 @@ class VllmSparseRuntime:
             # compaction may only ever drop GENERATED tokens. Remember the prefill length here so
             # every reselect can declare the prompt pages mandatory.
             orch.prompt_tokens = max(0, st.tokens - n_new_tokens)
+        # Compaction cannot shorten the book below the PROMPT (vLLM requires num_tokens >=
+        # prompt_len), so a prompt above B is not compactable at all: the engine would refuse every
+        # round while the worker kept taking slots and moving pages (measured live: 12 refused
+        # rounds during one 143K prefill, sink pages corrupted, gibberish output). The entry policy
+        # is the owner of "prompt <= B"; here we only refuse to do damage.
+        prompt_len = int(self._prompt_len.get(req, 0) or 0)
+        over_budget = bool(prompt_len and prompt_len > int(self.budget_tokens))
+        if over_budget and req not in self._over_budget_logged:
+            self._over_budget_logged.add(req)
+            self.log({"kind": "prompt_over_budget", "req": req, "prompt_tokens": prompt_len,
+                      "budget_tokens": int(self.budget_tokens),
+                      "note": "entry did not trim to B; compaction disabled for this request"})
         # During a long prefill the resident set must stay bounded even though relevance is not
         # meaningful yet: keep the sink prefix + newest tail and spill the middle (kvmem's
         # prefill-pressure selection). Without this a 200K prefill would consume the whole pool.
         if (prefill and st.tokens and orch.selector is not None
                 and bool(getattr(self, "inrequest_compaction", False))):
             high = self.prefill_high_watermark
-            if len(orch.resident) > high:
+            if not over_budget and len(orch.resident) > high:
                 self._reselect(req, prefill_pressure=True)
                 if int(getattr(self, "needle_trace", 0)) > 0:
                     resident = sorted(orch.resident)
@@ -547,7 +573,8 @@ class VllmSparseRuntime:
         # (visible == the whole book) and installing a compacted row anyway desynchronised the two
         # books - measured as an 8K prompt stalling right after prefill while the same prompt
         # completed with compaction off.
-        if bool(getattr(self, "inrequest_compaction", False)) and not prefill and due:
+        if (bool(getattr(self, "inrequest_compaction", False)) and not prefill and due
+                and not over_budget):
             result = self._reselect(req)
             if int(getattr(self, "needle_trace", 0)) > 0:
                 resident = sorted(orch.resident)
@@ -599,16 +626,19 @@ class VllmSparseRuntime:
         except Exception:
             pass
         orch = self._orch[req]
-        for slot in self._owned_slots[req]:
-            self._slot_owner.pop(slot, None)
-        self._owned_slots[req] = set()
+        # Do NOT release the request's slots here: `orch.slot_of` still points at them and they are
+        # the SOURCES of this reselect's device moves. Releasing first let a concurrent request take
+        # them (`_slot_owner` cleared), so the moves copied the other request's bytes into this
+        # view - measured live as sink pages failing the needle check and gibberish output.
+        old_owned = set(self._owned_slots.get(req, ()))
+        keep = {int(slot) for slot in orch.slot_of.values()}
         # Reserve exactly what the selection needs (+1 spare for the next token page). Asking for
         # the whole budget (budget_pages()+1 = 3329 pages at B=53248) drained the pool for every
         # request and left later requests reading pages they did not own.
         taken = {}
 
         def _take(needed):
-            slots = self._take_slots(req, int(needed) + 1)
+            slots = self._take_slots(req, int(needed) + 1, keep=keep)
             taken["slots"] = slots
             return slots[:-1]
 
@@ -704,6 +734,11 @@ class VllmSparseRuntime:
                     st.spare = None
             except Exception as exc:
                 record["compact_error"] = str(exc)[:160]
+        # Slots this request no longer references go back to the pool. On a refusal only the slots
+        # taken in this round are dropped; the old sources stay because the orchestrator still
+        # points at them (the engine's own row was not touched).
+        st_keep = set(st.row) if st.row else old_owned
+        self._release_slots(req, st_keep)
         self.log(record)
         return st
 
@@ -752,7 +787,7 @@ class VllmSparseRuntime:
             return set()
         return used
 
-    def _take_slots(self, req, count):
+    def _take_slots(self, req, count, keep=()):
         # Allocate DOWNWARD from the top of the pool: the engine allocates its own blocks
         # bottom-up, so scanning up (the old behaviour) handed us pages the engine was still
         # using for this very request. A batched page move then had overlapping source and
@@ -764,12 +799,29 @@ class VllmSparseRuntime:
         while len(slots) < count:
             if candidate < self.first_page:
                 raise RuntimeError("device slot pool exhausted")
-            if candidate not in self._slot_owner and candidate not in avoid:
+            owner = self._slot_owner.get(candidate)
+            # Another request's slot is off limits; one of OUR slots may be reused only when it is
+            # not a live source (`keep` = the pages still referenced by slot_of).
+            usable = candidate not in avoid and (
+                owner is None or (owner == req and candidate not in keep))
+            if usable:
                 self._slot_owner[candidate] = req
-                self._owned_slots[req].add(candidate)
+                self._owned_slots.setdefault(req, set()).add(candidate)
                 slots.append(candidate)
             candidate -= 1
         return slots
+
+    def _release_slots(self, req, keep):
+        """Drop the request's slots that are not in `keep`, returning them to the shared pool."""
+        owned = self._owned_slots.get(req)
+        if not owned:
+            return
+        for slot in list(owned):
+            if slot in keep:
+                continue
+            owned.discard(slot)
+            if self._slot_owner.get(slot) == req:
+                self._slot_owner.pop(slot, None)
 
     def _free_slots(self, req, selected, count):
         """Physical slots not holding a selected page (the spare for a new token page)."""
