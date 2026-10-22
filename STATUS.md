@@ -1352,3 +1352,25 @@ needle 校验开始失败（`ok:false`），输出变成噪声。三个独立缺
 改到常驻语义。42/43 通过（`gpu_real_tensor_test` 需空闲显存）。
 补丁重新生成：`backends/patches/vllm-kvmem.patch` 新增 speedmeter 两个模块（routers.py 依赖它），
 `prepare-backends.py --check-tree` 通过（tree 4133af45…）。
+
+### 常驻模型进展（本轮）：prefill 期压缩的修复与边界
+
+本轮修了五处，并给出可用边界：
+
+| 修复 | 说明 |
+|---|---|
+| 在途 chunk 提交 | prefill 期重选时，当前 chunk（~8K token）已写入但未提交；`page_map` 在压缩后按秩索引查不到它们 → 整块从上下文消失（这是「有时对有时错」的根源）。改为从**行**按秩提交，并把选择前沿推进到 `tokens + inflight` |
+| recent 覆盖在途 | recent 窗口按 `tokens + inflight` 计算，最新 chunk 不再被挤出 |
+| mandatory 夹取 + planner 容错 | mandatory 超过预算时被 planner 拒绝（`mandatory blocks must appear exactly once`）→ 夹到预算内，并在 `plan()` 里丢弃已被选择丢掉的 mandatory 块 |
+| 压缩失败软着陆 | `_reselect` 抛异常不再中断 `after_step`（记账继续），只记录 `*_reselect_error` |
+| 压缩长度对齐 | 压缩消息带上运行时的 `visible`（`st.seq_len`），引擎的 `num_computed` 与安装的行严格一致 |
+| 位置上限 | 调度器 `max_model_len - 位置` 的上限改用**服务位置**，否则 199K prompt 会停在 180,000；`ctx` 随 additional_config 下发 |
+
+验证（`KVMEM_ENTRY_RESIDENT_PREFILL=1`，窗口 180K）：
+- 4K / 80K / 170K 单请求：未裁剪、两把 needle key 全中
+- N=2 × 40K：通过；N=2 × 80K 早期通过一次，本轮未复测
+- 200K：prefill 期压缩可跑到 90% 但不稳定（有时输出噪声、planner 偶发拒绝），**未通过**
+- N=2 × 60K：超时（单请求 60K/80K 正常），**未通过**
+
+结论：**默认（prefill 不压缩）路径稳定可用，覆盖到引擎窗口（~180K，单请求）**；prefill 期压缩仍是实验性的
+（`KVMEM_RESIDENT_PREFILL_COMPACT=1` 才开），200K 与 N=2 长并发在此路径上未达标。

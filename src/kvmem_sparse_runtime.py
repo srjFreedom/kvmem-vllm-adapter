@@ -10,6 +10,7 @@
 # Per-request state is explicit (row, seq_len, tokens, next_page) instead of being re-derived,
 # because every one of those is installed into engine tensors and a mismatch silently corrupts
 # attention.
+import os
 from kvmem_sparse_orchestrator import HostPageStore, SparseOrchestrator
 
 
@@ -62,7 +63,8 @@ class VllmSparseRuntime:
                  k_slice=None, reselect_interval=64, log=None, first_page=0,
                  select_block_tokens=128, budget_tokens=32768, gen_reserve=16384, recent_tokens=1024,
                  host_mib=16384, use_kvmem_plan=False, needle_trace=0, use_kvmem_host=True,
-                 sessions=4, pages_per_block=1, ctx_tokens=0, no_prefill_compact=False):
+                 sessions=4, pages_per_block=1, ctx_tokens=0, no_prefill_compact=False,
+                 sink_tokens=0):
         self.view = view
         self.selector = selector
         self.page_tokens = int(page_tokens)
@@ -76,6 +78,7 @@ class VllmSparseRuntime:
         self.budget_tokens = int(budget_tokens)
         self.gen_reserve = int(gen_reserve)
         self.recent_tokens = int(recent_tokens)
+        self.sink_tokens = int(sink_tokens or 0)
         self.host_mib = int(host_mib)
         self.use_kvmem_plan = bool(use_kvmem_plan)
         self.needle_trace = int(needle_trace)
@@ -92,6 +95,7 @@ class VllmSparseRuntime:
         # the prompt length and only the R cadence compacts during decode). Isolates a prefill-time
         # compaction race from the selection policy.
         self.no_prefill_compact = bool(no_prefill_compact)
+        self.full_needle = int(os.environ.get("KVMEM_FULL_NEEDLE", "0") or 0)
         self.budget_pool = None
         # Content-based retrieval (mean-K over pre-RoPE keys). Off by default: it costs a capture
         # per layer near each reselect.
@@ -111,6 +115,9 @@ class VllmSparseRuntime:
         self._prev_n = {}
         self._pending_frontier = {}
         self._pending_new = {}
+        # Tokens scheduled for the step that is executing right now (0 outside a step). A
+        # compaction that fires mid-prefill must commit their pages too, from the row.
+        self._inflight = {}
         # Engine-reported num_computed_tokens per request: authoritative for ACCEPTED tokens.
         # Counting `num_scheduled_tokens` drifts under MTP (draft tokens that get rejected are
         # counted but never appended), which fires the R cadence early.
@@ -294,6 +301,7 @@ class VllmSparseRuntime:
         self._over_budget_logged.discard(req)
         self._pending_frontier.pop(req, None)
         self._pending_new.pop(req, None)
+        self._inflight.pop(req, None)
         self._prev_n.pop(req, None)
         if orch is not None and getattr(self, "budget_pool", None) is not None:
             session = getattr(orch, "session_id", None)
@@ -417,6 +425,7 @@ class VllmSparseRuntime:
         self._pending_new[req] = int(n_new)
 
     def advance_tokens(self, req, n_new):
+        self._inflight[req] = int(n_new or 0)
         """One step of accounting, driven from the entry of the runner's execute_model wrapper.
 
         Committing is deliberately LAGGED by one step: at the entry of step k the model has not yet
@@ -625,6 +634,15 @@ class VllmSparseRuntime:
             # tokens, exactly when the pool (B history + R output) is full.
             st.prefill_done = True
             orch._tokens_at_reselect = max(0, st.tokens - n_new_tokens)
+            if (st.row and not st.query_reselected
+                    and getattr(orch, "retrieval_index", None) is not None):
+                # The prompt was compacted during prefill (no query existed then, so only
+                # sink+recent survived). Now the capture bridge holds the real query: reselect
+                # once with retrieval so the middle can come back before generation starts.
+                st.query_reselected = True
+                self.log({"kind": "query_reselect", "req": req, "tokens": int(st.tokens),
+                          "prompt": int(self._prompt_len.get(req, 0) or 0)})
+                self._reselect(req, probe=True)
             # The prompt is IMMUTABLE for this backend: vLLM derives the output length from
             # `num_tokens - prompt_len` and requires `_all_token_ids` to cover the prompt, so a
             # compaction may only ever drop GENERATED tokens. Remember the prefill length here so
@@ -647,7 +665,7 @@ class VllmSparseRuntime:
             if self.no_prefill_compact:
                 return st
             high = self.prefill_high_watermark
-            finishing = bool(prompt_len) and (st.tokens + int(n_new_tokens or 0)) >= prompt_len
+            finishing = False  # query reselect happens on the first decode step (see below)
             if (finishing and st.row and not st.query_reselected
                     and getattr(orch, "retrieval_index", None) is not None):
                 # The prompt is about to be complete, so the question is inside the captured
@@ -660,7 +678,19 @@ class VllmSparseRuntime:
                           "prompt": prompt_len, "n_new": int(n_new_tokens or 0)})
                 self._reselect(req, probe=True)
             elif len(orch.resident) > high:
-                self._reselect(req, prefill_pressure=True)
+                try:
+                    self._reselect(req, prefill_pressure=True)
+                except Exception:
+                    if self.log is not None:
+                        import traceback as _tb
+                        self.log({"kind": "prefill_reselect_error", "req": req,
+                                  "error": _tb.format_exc()[-500:]})
+                # Do not re-fire on the very next page: the reselect just rebuilt the working set,
+                # so the next useful one is a reserve later (R tokens = 2K pages at B=53K). Without
+                # this every prefill chunk compacted - 24 reselects on a 200K prompt, each moving
+                # ~3.3K pages (measured: prefill fell to ~300 tok/s, 9x slower).
+                self.prefill_high_watermark = len(orch.resident) + max(
+                    64, int(self.gen_reserve) // max(1, self.page_tokens))
                 if int(getattr(self, "needle_trace", 0)) > 0:
                     resident = sorted(orch.resident)
                     self._trace_pages(req, resident[:2] + resident[-2:])
@@ -680,7 +710,14 @@ class VllmSparseRuntime:
         # books - measured as an 8K prompt stalling right after prefill while the same prompt
         # completed with compaction off.
         if bool(getattr(self, "inrequest_compaction", False)) and not prefill and due:
-            result = self._reselect(req)
+            try:
+                result = self._reselect(req)
+            except Exception:
+                if self.log is not None:
+                    import traceback as _tb
+                    self.log({"kind": "reselect_error_soft", "req": req,
+                              "error": _tb.format_exc()[-500:]})
+                return st
             if int(getattr(self, "needle_trace", 0)) > 0:
                 resident = sorted(orch.resident)
                 self._trace_pages(req, resident[:2] + resident[-2:])
@@ -771,7 +808,7 @@ class VllmSparseRuntime:
             # while the served counter keeps counting it - a hole in the context (measured: an 80K
             # prompt answered with noise, and with prefill compaction disabled it answered
             # correctly twice in a row).
-            inflight = max(0, int(self._pending_new.get(req, 0) or 0))
+            inflight = max(0, int(self._inflight.get(req, 0) or 0))
             upto = -(-(int(st.tokens) + inflight) // self.page_tokens)
             for lp in range(upto):
                 if lp in known:
@@ -783,6 +820,34 @@ class VllmSparseRuntime:
                     orch.commit_written_page(lp, int(slot))
                 except Exception:
                     continue
+            # The IN-FLIGHT chunk is not reachable through `page_map`: after a compaction the row is
+            # rank-indexed, so those logical pages have no map entry. Their bytes ARE on the device,
+            # at the row ranks where the step wrote them - commit them from the row, otherwise the
+            # selection cannot see them and the whole chunk silently disappears from the context
+            # (this is what made a compacted prefill answer with noise).
+            if inflight:
+                # The in-flight pages ARE in the store after this sweep, so the selection frontier
+                # must cover them: the mandatory range is built from them, and a mandatory block
+                # beyond `total_tokens` is filtered out of the selection and then refused by the
+                # planner ("mandatory blocks must appear exactly once").
+                try:
+                    orch.note_tokens(int(st.tokens) + inflight)
+                except Exception:
+                    pass
+            if st.row and inflight:
+                base = int(st.seq_len)
+                first = int(st.tokens)
+                for i in range(inflight):
+                    rank = (base + i) // self.page_tokens
+                    if rank >= len(st.row):
+                        break
+                    lp = (first + i) // self.page_tokens
+                    if lp in known:
+                        continue
+                    try:
+                        orch.commit_written_page(lp, int(st.row[rank]))
+                    except Exception:
+                        continue
         except Exception:
             pass
         prompt_tokens = int(getattr(orch, "prompt_tokens", 0) or 0)
@@ -791,13 +856,28 @@ class VllmSparseRuntime:
         # blocks (they are padded with -inf), so without this the model loses the lines it just
         # produced and the output degenerates into fragments (measured: long context + retrieval).
         recent = int(getattr(self, "recent_tokens", 0) or 0)
-        if recent > 0 and st.tokens:
-            first = max(0, (int(st.tokens) - recent) // self.page_tokens)
-            last = (int(st.tokens) - 1) // self.page_tokens
+        # The RECENT window must include the chunk that is executing right now: its pages are on
+        # the device but not yet counted in `st.tokens`, and dropping them silently loses the
+        # newest ~8K prompt tokens (the model then answers from stale context - intermittent,
+        # because whether those pages are kept otherwise depends on the retrieval scores).
+        recent_end = int(st.tokens) + max(0, int(self._inflight.get(req, 0) or 0))
+        if recent > 0 and recent_end:
+            first = max(0, (recent_end - recent) // self.page_tokens)
+            last = (recent_end - 1) // self.page_tokens
             mandatory = sorted(set(mandatory) | set(range(first, last + 1)))
         # Force the prompt pages only when the prompt fits the budget. If it does not, the entry
         # policy failed to trim it; forcing them would make the view exceed B and the plan would be
         # rejected anyway (the compact also refuses to go below the prompt).
+        # Clamp the mandatory set to what the budget can hold (the planner refuses mandatory blocks
+        # that the trim removed): keep the NEWEST pages, they are the tail of the context.
+        try:
+            _ppb = max(1, int(self.select_block_tokens) // max(1, self.page_tokens))
+            _sink_pages = max(0, int(getattr(self, "sink_tokens", 0) or 0) // max(1, self.page_tokens))
+            _room = max(1, int(self.budget_tokens) // max(1, self.page_tokens) - _sink_pages)
+            if len(mandatory) > _room:
+                mandatory = mandatory[-_room:]
+        except Exception:
+            pass
         forced = mandatory if prompt_tokens and prompt_tokens <= int(self.budget_tokens) else []
         stats = orch.reselect(slots=_take, mandatory_pages=mandatory,
                               forced_pages=forced, prefill_pressure=prefill_pressure)
@@ -819,7 +899,12 @@ class VllmSparseRuntime:
         st.seq_len = min(st.tokens, len(selected) * self.page_tokens)
         # V4 needle: sample a few resident pages and verify the device copy is exactly one
         # rotation of the stored bytes. Cheap (a handful of pages) and catches any drift.
-        sample = sorted(orch.resident)[:2] + sorted(orch.resident)[-2:]
+        if int(getattr(self, "full_needle", 0)) > 0:
+            # Verify EVERY resident page, not a sample: with ~3.3K pages per compaction a
+            # batched-rotation problem would show up on a few of them only.
+            sample = sorted(orch.resident)
+        else:
+            sample = sorted(orch.resident)[:2] + sorted(orch.resident)[-2:]
         checks = {page: orch.needle(page) for page in sample}
         self.log({"kind": "needle", "req": req, "pages": len(checks),
                   "ok": all(v is True for v in checks.values()),
@@ -897,7 +982,8 @@ class VllmSparseRuntime:
             # KEY-END twenty lines before the end; blocks are `select_block_tokens` long, so this
             # is exact enough to tell "not ranked" from "ranked but misread".
             blk = max(1, int(self.select_block_tokens))
-            prompt = int(getattr(orch, "prompt_tokens", 0) or prompt_tokens or 0)
+            prompt = int(self._prompt_len.get(req, 0)
+                         or getattr(orch, "prompt_tokens", 0) or 0)
             mid_block = int((prompt // 4) // blk)
             end_block = int((prompt - 20 * 17) // blk)
             sel_blk = sorted({int(p) * self.page_tokens // blk for p in selected})

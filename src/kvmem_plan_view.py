@@ -165,6 +165,13 @@ class KvmemPlanner:
             else:
                 break                       # only mandatory blocks left: let kvmem report it
         selected_blocks = sorted(trimmed)
+        # kvmem requires every mandatory block to appear in the selection; a mandatory page that
+        # the selector dropped (beyond the frontier, or trimmed away) must not be announced as
+        # mandatory, otherwise the plan aborts with "mandatory blocks must appear exactly once"
+        # and the whole reselect is lost (measured: prefill compaction silently stopped, the
+        # resident book grew to the pool and the answer degenerated).
+        _sel = set(selected_blocks)
+        mandatory = [b for b in mandatory if b in _sel]
         # The host budget must cover EVERY retained cold block, not just the new spills: the plan
         # reports host_payload_bytes_required over all blocks that are not kept resident.
         total_blocks = -(-int(total_tokens) // self.block_tokens)

@@ -86,6 +86,15 @@ def main(argv=None) -> int:
     # from this flag; the worker's compact signal connects to it.
     if cfg['inrequest_compaction']:
         cfg['block_channel'] = True
+        # The logical ceiling must travel WITH the config: the fork's scheduler and the runtime both
+        # need it to distinguish "resident KV length" from "served position" (a 199K prompt stalled
+        # at 180,000 = max_model_len because ctx was missing and the cap fell back to the window).
+        try:
+            _ctx = int(str(os.environ.get("CTX") or os.environ.get("KVMEM_ENTRY_CTX") or "0"))
+        except Exception:
+            _ctx = 0
+        if _ctx > 0:
+            cfg['ctx'] = _ctx
     payload = json.dumps({"kvmem": cfg}, separators=(",", ":"))
     if "--dry-run" in argv:
         json.dump({"additional_config": payload, "plugin_config": cfg}, sys.stdout,

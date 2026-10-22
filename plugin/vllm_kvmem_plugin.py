@@ -221,6 +221,7 @@ def _attach_adapter(runner, log_path):
         async_transfer=bool(cfg.get("async_transfer", False)),
         pages_per_block=pages_per_block,
         ctx_tokens=int(cfg.get("ctx") or 0),
+        sink_tokens=int(cfg.get("sink_tokens", 0) or 0),
         # Lossless long prompts default to "no compaction while prefilling": that path is verified
         # (80K/170K/N=2 answers exact) while compacting mid-prefill is not (measured: noise from
         # the first token). The prompt then stays resident up to the engine window, which the
@@ -395,6 +396,7 @@ def _attach_sparse(runner, log_path):
         sessions=int(cfg.get("sessions", 4)),
         pages_per_block=pages_per_block,
         ctx_tokens=int(cfg.get("ctx") or 0),
+        sink_tokens=int(cfg.get("sink_tokens", 0) or 0),
         # Lossless long prompts default to "no compaction while prefilling": that path is verified
         # (80K/170K/N=2 answers exact) while compacting mid-prefill is not (measured: noise from
         # the first token). The prompt then stays resident up to the engine window, which the
