@@ -1374,3 +1374,17 @@ needle 校验开始失败（`ok:false`），输出变成噪声。三个独立缺
 
 结论：**默认（prefill 不压缩）路径稳定可用，覆盖到引擎窗口（~180K，单请求）**；prefill 期压缩仍是实验性的
 （`KVMEM_RESIDENT_PREFILL_COMPACT=1` 才开），200K 与 N=2 长并发在此路径上未达标。
+
+### 常驻模型（第 2 轮）：服务计数钳制 + 200K 单请求打通
+
+- **服务计数钳制**（fork）：`num_logical_tokens` 永远不得超过已产出 token（`tokens-1`）。一轮 MTP 草稿
+  计数未回滚会让它超前 4，`num_new_tokens = tokens - served` 变负 → 请求永远排不上（N=2 长 prompt 卡死的真凶）。
+- **窗口放大**：`GPU_UTIL=0.98` + `KVMEM_RESIDENT_MAX_MODEL_LEN=205000` → 池 209,330 tokens，
+  199,466-token prompt 可整条常驻。
+
+验证（无损模式）：
+- 4K / 60K / 80K / 170K 单请求：✅ 未裁剪、两把 key 全中
+- 200K 单请求（不压缩 prefill）：✅ 199,465 tokens、两把 key、297 秒
+- N=2 × 40K / 60K / 80K：✅ 两条都两把 key（160 秒@80K）
+- 200K × N=2：请求能跑完不卡，但**内容错乱** —— 必须走 prefill 期压缩（2×199K > 209K 池），
+  该路径在 60K/80K 正常、200K 仍不稳。

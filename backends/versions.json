@@ -7,8 +7,8 @@
     "license_file": "engines/vllm/LICENSE",
     "local_changes": "KVMem integration (query bridge + capture_q call sites) and the SM75/FP8 profiles this deployment runs with are maintained in the versioned patch; the submodule stays pinned to base_commit",
     "patch": "backends/patches/vllm-kvmem.patch",
-    "patch_sha256": "4aa4f07037dd8cdcc259422659d75434e5cf9cd3b60322a73eef241387885a49",
-    "patched_tree": "a37d4ebd110c7f8b22fdb00687252e6bbc3b0ac7"
+    "patch_sha256": "60178aad1d3c1cd2720c0a87f35fd5191e19ac9ea4ac3e0d0b079c775a086cd2",
+    "patched_tree": "e8482e53fefe265e5f80a889717e363add2fc667"
   },
   "model": {
     "note": "weights are not in git (tens of GB); point MODEL at an FP8+MTP export"
