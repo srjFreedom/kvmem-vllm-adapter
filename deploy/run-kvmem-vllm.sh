@@ -26,6 +26,14 @@ SESSIONS=${SESSIONS:-4}
 HOST_MIB=${HOST_MIB:-49152}
 N=${N:-1}
 CTX=${CTX:-524288}
+# In-request compaction and resident prefill are ONE feature, not two switches: compaction alone
+# trims the entry to B and compacts WHILE the prompt is still being prefilled - that combination is
+# the one that answered with noise. Resident prefill keeps the whole prompt resident up to the
+# engine window and only compacts during decode, which is the verified path (80K/200K prompts answer
+# exactly at N=1 and N=2). Default them together; override with 0 only when debugging that path.
+INREQUEST_COMPACTION=${INREQUEST_COMPACTION:-1}
+KVMEM_ENTRY_RESIDENT_PREFILL=${KVMEM_ENTRY_RESIDENT_PREFILL:-1}
+export KVMEM_ENTRY_RESIDENT_PREFILL
 # 检索用的 query 捕获窗口（KVMem query_max_tokens 的官方默认是 512）
 CAPTURE_TOKENS=${CAPTURE_TOKENS:-512}
 MODEL=${MODEL:?未设置 MODEL：指向你的权重目录，例如 MODEL=$HOME/models/<你的模型>}
@@ -75,6 +83,11 @@ export KVMEM_ENTRY_HISTORY_DISK_PATH=${KVMEM_ENTRY_HISTORY_DISK_PATH:-/tmp/kvmem
   echo "CTX(logical)=$CTX  B=$B  R=$R  sink=$SINK  recent=$RECENT  sessions=$SESSIONS  H=${HOST_MIB}MiB  N=$N"
   echo "engine window = N x (B+R) = $(( N * (B + R) ))   port=$PORT   served=$SERVED_NAME"
   echo "entry policy = in-process, mode=$KVMEM_ENTRY_MODE (vllm.endpoint_plugins: kvmem_entry)  select=$KVMEM_ENTRY_SELECT"
+  if [ "$INREQUEST_COMPACTION" = "1" ]; then
+    echo "in-request compaction: ON -> logical ceiling = CTX = $CTX (B is only the resident window); resident prefill = $KVMEM_ENTRY_RESIDENT_PREFILL"
+  else
+    echo "in-request compaction: OFF -> classic path (entry trims to B, ceiling R = $R)"
+  fi
   echo "query capture = last $CAPTURE_TOKENS tokens per step (KVMEM_CAPTURE_TOKENS)"
 } >> "$LOG"
 
@@ -94,6 +107,7 @@ RUN=(env MAX_NUM_SEQS="$N" \
     --kvmem-block-tokens 32 \
     --kvmem-lrfu-lambda 0.5 --kvmem-lrfu-top-frac 0.9 \
     --kvmem-score-aggregation max --kvmem-retrieval)
+if [ "$INREQUEST_COMPACTION" = "1" ]; then RUN+=(--kvmem-inrequest-compaction); fi
 
 if [ "${FOREGROUND:-0}" = "1" ]; then
   echo "foreground mode (systemd); log: $LOG"

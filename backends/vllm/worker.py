@@ -124,6 +124,17 @@ def main(argv=None) -> int:
         _ctx = str(env.get("CTX") or env.get("KVMEM_ENTRY_CTX") or "").strip()
         if _ctx.isdigit() and int(_ctx) > 0:
             env["KVMEM_ENTRY_CTX"] = _ctx
+        # Compaction and resident prefill are one feature: compaction alone trims the entry to B and
+        # compacts while the prompt is still being prefilled, which is the combination that answered
+        # with noise. Turn the resident path on with it unless the operator explicitly disabled it.
+        _res = str(env.get("KVMEM_ENTRY_RESIDENT_PREFILL", "")).strip().lower()
+        if _res in ("", "1", "true", "yes", "on"):
+            env["KVMEM_ENTRY_RESIDENT_PREFILL"] = "1"
+        else:
+            print("[kvmem backends/vllm] KVMEM_ENTRY_RESIDENT_PREFILL is explicitly off while "
+                  "--kvmem-inrequest-compaction is on: the prompt will be trimmed to B and compacted "
+                  "during prefill (the path that produced wrong answers); keep it on unless you are "
+                  "debugging that path")
     if _entry_note == "entry was off":
         print("[kvmem backends/vllm] --kvmem-inrequest-compaction overrides "
               "KVMEM_ENTRY_INREQUEST_COMPACTION=0: the entry ceiling must match the engine")
