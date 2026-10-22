@@ -1457,3 +1457,15 @@ needle 校验开始失败（`ok:false`），输出变成噪声。三个独立缺
 | 全量针检 | 0 失败 |
 | 抢占 / 二次 prefill / 卡死 | 无 |
 | 离线 | **43/43** |
+
+### 去掉 `KVMEM_RESIDENT_MAX_MODEL_LEN`（第 8 轮尾）
+
+它是绕 launcher 校验的权宜常量（launcher 要 `N x MAX_MODEL_LEN <= 池`，而常驻模式真正想要的是
+「窗口 = 池」，即 `MAX_MODEL_LEN=-1`）。
+
+- launcher：`MAX_MODEL_LEN` 为非正数时视为「自动适配池」并跳过 `N x` 校验（打印 INFO）
+- worker：常驻模式直接传 `MAX_MODEL_LEN=-1`；该环境变量与文档行一起删除
+- 结果（`GPU_UTIL=0.97`、`MAX_BATCHED_TOKENS=4096`、仓库默认、不带任何环境变量）：
+  - 自动窗口 **202,000**（池 203,442），比原来硬编码 180,000 多 22K
+  - 200K prompt：✅ 199,467 tokens、两把 key、301 秒（**不再需要 0.98**）
+  - 4K ✅ 3.2 秒 / 80K ✅ 83 秒；离线 43/43

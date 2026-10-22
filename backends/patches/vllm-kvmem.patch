@@ -1,8 +1,22 @@
 diff --git a/launcher.sh b/launcher.sh
-index 293891285b..2b0eb3e777 100755
+index 293891285b..4c2f9e5b45 100755
 --- a/launcher.sh
 +++ b/launcher.sh
-@@ -192,7 +192,9 @@ validate_configured_kv_concurrency() {
+@@ -183,6 +183,13 @@ validate_configured_kv_concurrency() {
+     return 0
+   fi
+   if [[ ! "$max_model_len" =~ ^[1-9][0-9]*$ ]]; then
++    # Negative/zero means "let vLLM auto-fit the window to the profiled KV pool" (the KVMem resident
++    # mode relies on this: the window is the physical pool, not N x (B+R), so there is no static
++    # number to validate against). Accept it and skip the concurrency arithmetic.
++    if [[ "$max_model_len" =~ ^-?[0-9]+$ ]]; then
++      echo "INFO: MAX_MODEL_LEN=$max_model_len (auto): the engine window is fitted from the KV pool; skipping the N x window check" >&2
++      return 0
++    fi
+     echo "ERROR: cannot validate KV concurrency: invalid MAX_MODEL_LEN=$max_model_len" >&2
+     return 1
+   fi
+@@ -192,7 +199,9 @@ validate_configured_kv_concurrency() {
      return 1
    fi
  
@@ -13,7 +27,7 @@ index 293891285b..2b0eb3e777 100755
    if (( total < required )); then
      echo "ERROR: configured concurrency cannot be admitted by the allocated GPU KV cache." >&2
      echo "  GPU KV tokens: $total" >&2
-@@ -4963,6 +4965,7 @@ build_args() {
+@@ -4963,6 +4972,7 @@ build_args() {
      VLLM_ARGS+=(--disable-custom-all-reduce)
    fi
    [[ "${DISABLE_LOG_STATS:-0}" == "1" ]] && VLLM_ARGS+=(--disable-log-stats)

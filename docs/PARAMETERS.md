@@ -62,8 +62,7 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 |---|---|---|---|
 | `GPU_UTIL` | `0.97` | vLLM 请求的显存占用比例（`--gpu-memory-utilization`）| 22 GB 卡用 0.97；显存更小的卡降低（0.90~0.95），OOM 时**先降这个** |
 | `MAX_BATCHED_TOKENS` | `4096` | 单步 prefill 的 token 上限（chunk 大小）| 调大可减少 chunk 数、提升 prefill 并行度，但吃显存；调大后必须重跑启动 smoke |
-| `KVMEM_ENTRY_RESIDENT_PREFILL` | `1`（随内压缩自动打开）| 常驻工作区：入口不裁剪、整条 prompt 常驻到引擎窗口（默认 180K），压缩只在 decode 发生；与 `--kvmem-inrequest-compaction` 成对使用 | 只有调试 prefill 期压缩时才设 `0`（那条路径会答错） |
-| `KVMEM_RESIDENT_MAX_MODEL_LEN` | `180000` | 常驻模式的引擎窗口（自动适配池）| 池够大时可调到接近池容量（如 `GPU_UTIL=0.98` + 205000 可跑 200K prompt）|
+| `KVMEM_ENTRY_RESIDENT_PREFILL` | `1`（随内压缩自动打开）| 常驻工作区：入口不裁剪、整条 prompt 常驻到**引擎窗口 = 物理 KV 池**（`MAX_MODEL_LEN` 自动适配，没有单独旋钮），压缩只在 decode 发生；与 `--kvmem-inrequest-compaction` 成对使用 | 只有调试 prefill 期压缩时才设 `0`（那条路径会答错） |
 | `--kvmem-block-tokens` | `32` | 选片块大小（必须是最小 KV 页 16 的整数倍）| 32 是修复值：检索按块取 pre-RoPE key 的**均值**打分，128 会让一条关键行（key/id/罕见词）被同块另外 ~127 个 token 稀释 —— 实测 200K prompt 在 50%~73% 换出时，128 答非所问、32 两把 needle 全中。调回 128 只在上下文很短（<32K）且不需要精确召回时才有意义 |
 | `SPECULATIVE_TOKENS` | `4` | MTP 投机 token 数 | `0` = 关闭投机：省显存/更稳，但 decode 变慢 |
 | `NO_ASYNC_SCHEDULING` | `0` | `0` = 异步调度（默认），`1` = 强制同步 | 入口选片下引擎无块表改写，异步调度安全；两种模式实测**同速**。开 `inrequest-compaction` 时 worker **强制写回 `1`**（显式 `0` 会被覆盖并打印原因：异步预排下一步会与块表改写冲突） |

@@ -206,13 +206,16 @@ def main(argv=None) -> int:
         # not N x (B+R). A whole prompt up to that window stays resident, so no compaction has to
         # happen while the prompt is still being prefilled (that path is not reliable yet); the
         # entry's CTX remains the logical ceiling.
-        # A concrete window is required: the launcher validates N x MAX_MODEL_LEN against the
-        # profiled KV pool and refuses -1. 180K fits this model's pool (~189K tokens) with margin.
-        _wanted = int(env.get("KVMEM_RESIDENT_MAX_MODEL_LEN", "180000") or "180000")
+        # The window is the PHYSICAL pool, so let vLLM fit it: -1 = auto. No static number, no
+        # separate knob - whatever the card/pool can hold is exactly what one request may keep
+        # resident. The launcher treats a non-positive MAX_MODEL_LEN as "auto" and skips its
+        # N x window check (that check assumes the static N x (B+R) scheme).
         env["KV_CONCURRENCY_EFFECTIVE_LEN"] = str(int(ns.kvmem_budget))
-        print(f"[kvmem backends/vllm] KVMEM_ENTRY_RESIDENT_PREFILL=1 -> "
-              f"MAX_MODEL_LEN={_wanted} (engine window = physical pool), prefill stays resident, "
-              f"compaction is decode-only")
+        args += ["--set", "MAX_MODEL_LEN=-1"]
+        env["MAX_MODEL_LEN"] = "-1"
+        print("[kvmem backends/vllm] KVMEM_ENTRY_RESIDENT_PREFILL=1 -> MAX_MODEL_LEN auto "
+              "(engine window = KV pool), prefill stays resident, compaction is decode-only")
+        _wanted = 0
     if _wanted <= 0 and not _resident:
         _wanted = max(1, int(ns.max_num_seqs)) * (int(ns.kvmem_budget) + int(ns.kvmem_gen_reserve))
         print(f"[kvmem backends/vllm] max_model_len auto = {ns.max_num_seqs} x "
