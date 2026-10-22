@@ -49,7 +49,8 @@ class FakeView(RunnerView):
 
 
 def engine_write(view, row, seq_len, counter):
-    page_slot = row[seq_len // PAGE]
+    # The real engine writes at kv[block_table[pos // PAGE]] - the PAGE ID, not the row index.
+    page_slot = int(row[seq_len // PAGE])
     g = torch.Generator().manual_seed(counter[0])
     counter[0] += 1
     k = torch.randn(HEADS, PAGE, HEAD_DIM, generator=g) * 0.5
@@ -80,6 +81,8 @@ def main():
     # Request A prefills, then request B prefills (as the engine would schedule them).
     # The engine allocates a page per logical page and records it in the batch row.
     rows = view.block_table_rows()[0]
+    rt.before_step(req_a, 1, row_index=0)
+    rt.before_step(req_b, 1, row_index=1)
     for step in range(each_tokens // PAGE):
         rows[0, step] = 101 + step
         rt.after_step(req_a, PAGE, prefill=True)
@@ -96,8 +99,14 @@ def main():
     b_slots = set(b_state.row)
     check(len(a_slots & b_slots) == 0,
           f"the two requests use disjoint device slots (shared={sorted(a_slots & b_slots)[:4]})")
-    check(len(a_slots) <= 2049 and len(b_slots) <= 2049,
-          f"each working set is the budget plus a spare (A={len(a_slots)}, B={len(b_slots)})")
+    # Resident model: every request compacts INSIDE its own blocks, so each row is that request's
+    # own pages (no fresh slots taken from the shared pool) and the two are disjoint by
+    # construction.
+    check(set(rt.state(req_a).row) <= set(range(101, 101 + each_tokens // PAGE)),
+          "req-a compacts only inside its own pages")
+    check(set(rt.state(req_b).row) <= set(range(101 + each_tokens // PAGE,
+                                             101 + 2 * each_tokens // PAGE)),
+          "req-b compacts only inside its own pages")
 
     # Decode both, interleaved, as a real batch would.
     for step in range(3 * rt.reselect_interval):

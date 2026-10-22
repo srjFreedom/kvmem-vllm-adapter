@@ -91,20 +91,33 @@ B" **before the request reaches the engine**, and the engine's sequence only gro
 
 ### Super-R generation (opt-in, `--kvmem-inrequest-compaction`)
 
-With that flag the engine-side compaction is enabled as well: a request may generate past R up to
-**`CTX`**. B is only the resident window - everything else in the history lives on the host tier, so
-the logical context is what CTX bounds. When the resident pool fills (B + R) the runtime reselects, spills the pages
-that are no longer needed to the host tier, and tells EngineCore to truncate the request's token book
-in place (`_all_token_ids` → visible set, `num_computed_tokens` rewound) over a worker → EngineCore
-channel, so the scheduler sees no gap and the sequence keeps growing while the physical pool stays
-`B + R`.
+With that flag the engine runs a **resident-book** model: VRAM per request is `B + R` no matter how
+long the conversation is. The request's two counters are split (fork patch, `vllm/v1/core/sched`):
 
-- **Default (flag absent): the generation ceiling is R.** `max_tokens` is clamped to R and a request
-  stops there; the sequence is monotone and the pool is never recycled.
-- **With the flag: the ceiling is `CTX`.** One switch drives everything: the entry ceiling, the
-  engine-side compaction, the block channel and synchronous scheduling. The prompt stays immutable
-  (vLLM derives the output length from `num_tokens − prompt_len`), so only generated tokens are
-  compacted and the most recent `RECENT` tokens are always kept.
+* `num_logical_tokens` — monotone served count (prompt + generated). Drives scheduling.
+* `num_computed_tokens` — the **resident KV book**. Compaction rewinds it while the logical book
+  (`_all_token_ids`) keeps growing, so positions, `seq_lens` and block allocation stay inside the
+  working area.
+
+Because the engine never thinks the request holds more KV than the pool can, it never allocates past
+`B + R` and never preempts a long context:
+
+- **Prefill is chunked and compacted too.** A prompt longer than B is prefilled in chunks; the
+  runtime reselects as the working set grows, spills the pages that are no longer needed to the host
+  tier, and compacts **inside the request's own engine blocks** (never by taking fresh pages from the
+  shared pool). No prompt token is dropped — the entry does not trim when the flag is on.
+- **Decode uses the same working set**, refreshed every R output tokens.
+- EngineCore only agrees on the resident length (`num_computed_tokens` = compacted length) over a
+  worker → EngineCore channel; the row itself is written by the runtime in the request's own pages,
+  padded to the engine's block quantum so its next block append stays contiguous.
+
+- **Default (flag absent): the generation ceiling is R** and the entry selects history down to B.
+  `max_tokens` is clamped to R and a request stops there; the sequence is monotone and the pool is
+  never recycled.
+- **With the flag: the ceiling is `CTX`**, the entry stops trimming, and one switch drives
+  everything: the entry ceiling, the engine-side compaction, the block channel and synchronous
+  scheduling. Prefix caching must stay off with compaction on (the block hashes hash logical tokens
+  while the KV layout is compacted), so the worker forces it off and says so.
 - Reaching `CTX` is an ordinary `max_tokens` stop (`finish_reason=length`); the response text is
   never truncated, because compaction only rewrites the engine's token book, not the output tokens.
 

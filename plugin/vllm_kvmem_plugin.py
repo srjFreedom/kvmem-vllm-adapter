@@ -211,6 +211,7 @@ def _attach_adapter(runner, log_path):
         resident_budget_tokens=budget,
         async_transfer=bool(cfg.get("async_transfer", False)),
         pages_per_block=pages_per_block,
+        ctx_tokens=int(cfg.get("ctx") or 0),
         kv_caches=[tensor for _, tensor, _ in paged],
     ).bind()
     _append(log_path, {"kind": "attached", "pid": os.getpid(),
@@ -338,6 +339,18 @@ def _attach_sparse(runner, log_path):
                            "reason": "no paged attention KV"})
         return None
 
+    # Engine allocation quantum in kernel pages: with a hybrid model under `mamba align` the
+    # attention block is widened (e.g. 1616 tokens = 101 pages of 16) so the block table row is
+    # written a whole block at a time. The runtime must pad the resident row to that quantum.
+    pages_per_block = 1
+    try:
+        bt = getattr(runner, "block_tables", None)
+        bpk = getattr(bt, "blocks_per_kv_block", None)
+        if bpk:
+            pages_per_block = int(max(int(v) for v in bpk))
+    except Exception:
+        pages_per_block = 1
+
     sel_cfg = ext.SparseSelectorConfig()
     sel_cfg.select_block_tokens = int(cfg.get("select_block_tokens", 128))
     sel_cfg.budget_tokens = int(cfg.get("budget_tokens", 32768))
@@ -363,6 +376,8 @@ def _attach_sparse(runner, log_path):
         host_mib=int(cfg.get("host_mib", 16384)),
         use_kvmem_plan=bool(cfg.get("use_kvmem_plan", False)),
         sessions=int(cfg.get("sessions", 4)),
+        pages_per_block=pages_per_block,
+        ctx_tokens=int(cfg.get("ctx") or 0),
         # vLLM's NULL block occupies one aligned unit at the front of the pool.
         first_page=int(cfg.get("first_page", 0)) or
         (int(cfg.get("select_block_tokens", 128)) // max(1, int(view.page_tokens))))
@@ -865,13 +880,16 @@ def register():
             return [int(getattr(b, "block_id", b)) for b in blocks]
 
         def _compact(request_id, pages, page_tokens):
-            """Three-book reconciliation (Route A): the worker selected a working set;
-            truncate the request's `_all_token_ids` to the tokens of those pages (in the
-            compacted order the worker will install) and rewind `num_computed_tokens` to the
-            visible length. In-place slice assignment keeps the `ConstantList` view in sync,
-            so `num_tokens` drops to the visible length and the scheduler sees no gap — it
-            will not recompute the spilled tokens. `_output_token_ids` is untouched, so
-            `num_output_tokens` (the API's generated count) stays correct."""
+            """Resident-book reconciliation (Route A / resident model).
+
+            The worker selected a working set and has ALREADY installed it into the block table row
+            (the row IS the working set). EngineCore only has to agree on how long the resident KV
+            book is: `num_computed_tokens` becomes the compacted length, while the LOGICAL token
+            list (`_all_token_ids`) keeps growing untouched. That decoupling is what lets a long
+            prompt be prefilled in chunks with a working set of B+R: the engine never thinks the
+            request holds more KV than the pool can, so it never allocates past the working area and
+            never preempts.
+            """
             scheduler = _channel_state.get("scheduler")
             if scheduler is None or not pages or page_tokens <= 0:
                 return False
@@ -884,69 +902,29 @@ def register():
                 req = (getattr(scheduler, "requests", None) or {}).get(request_id)
             if req is None:
                 return False
-            all_tokens = req._all_token_ids
-            # The scheduler already built THIS step from the pre-compaction book (accounting in the
-            # worker is one step behind), so its scheduled tokens are still pending: they will be
-            # added to `num_computed_tokens` when the step completes. Set the frontier minus that
-            # pending count, otherwise num_computed catches up to num_tokens and the request is
-            # never scheduled again (measured: generation stalls at 0 tok/s, GPU idle).
-            pending = max(1, len(all_tokens) - int(req.num_computed_tokens))
-            visible = []
-            # `pages` arrives in COMPACTED order, so the visible-space token range of the k-th
-            # page is [k * page_tokens, (k+1) * page_tokens) - NOT [page * page_tokens). The page
-            # id is a LOGICAL page (what the engine wrote before compaction); after the first
-            # compaction the engine's `_all_token_ids` is visible-space, so using the id as an
-            # offset spliced the wrong tokens and corrupted the context from that point on
-            # (measured: a count broke ~50 tokens after the first reselect).
-            for rank, page in enumerate(pages):
-                start = int(rank) * page_tokens
-                if start >= len(all_tokens):
-                    continue
-                visible.extend(all_tokens[start:min(start + page_tokens, len(all_tokens))])
-            if not visible or len(visible) >= len(all_tokens):
-                # Idempotency across TP ranks: each rank reselects and sends its own compact, so the
-                # SECOND rank always arrives after the first one already truncated the book. That
-                # rank must still install its own view (each rank has its own KV tensors and block
-                # table); reporting a plain no-op there made one rank drop its view and the two
-                # ranks diverged - measured as a long-context stall / noise.
-                applied = _compact_state.get(request_id)
-                already = applied == len(visible) and len(all_tokens) == len(visible)
-                _append(_sched_cfg(scheduler).get("probe_log") or "/tmp/kvmem_sparse.jsonl",
-                        {"kind": "compact_noop", "pid": os.getpid(), "req": request_id,
-                         "visible": len(visible), "all_tokens": len(all_tokens),
-                         "computed": int(req.num_computed_tokens), "pages": len(pages),
-                         "peer_applied": bool(already)})
-                return {"ok": len(visible) == len(all_tokens),
-                        "truncated": bool(already),
-                        "visible": len(visible)}
-            # vLLM requires `_all_token_ids` to COVER the prompt (num_tokens >= num_prompt_tokens):
-            # the sampler/stop checker derive the output length from the difference. Truncating
-            # below the prompt leaves num_tokens < prompt_len and the request stops being scheduled
-            # (measured: an 8305-token prompt compacted to 8192 stalled with the GPU idle). The
-            # entry policy is what must keep the prompt <= B; until it always does, refuse here.
-            prompt_len = len(getattr(req, "prompt_token_ids", ()) or ())
-            if prompt_len and len(visible) < prompt_len:
-                _append(_sched_cfg(scheduler).get("probe_log") or "/tmp/kvmem_sparse.jsonl",
-                        {"kind": "compact_refused", "pid": os.getpid(), "req": request_id,
-                         "visible": len(visible), "prompt_len": prompt_len,
-                         "all_tokens": len(all_tokens)})
-                return {"ok": False, "truncated": False, "visible": len(visible)}
-            req._all_token_ids[:] = visible
-            req.num_computed_tokens = max(0, len(visible) - pending)
-            _compact_state[request_id] = len(visible)
-            _append(_sched_cfg(scheduler).get("probe_log") or "/tmp/kvmem_sparse.jsonl",
-                    {"kind": "compact_applied", "pid": os.getpid(),
+            visible = int(len(pages)) * int(page_tokens)
+            before_computed = int(req.num_computed_tokens)
+            applied = _compact_state.get(request_id)
+            already = applied == visible
+            if already and before_computed <= visible:
+                # TP-rank idempotency: the peer rank already applied this compaction. Still report
+                # `truncated` so the second rank installs its own view (each rank owns its KV).
+                return {"ok": True, "truncated": True, "visible": visible}
+            req.num_computed_tokens = max(0, visible)
+            _compact_state[request_id] = visible
+            entry = {"kind": "compact_applied", "pid": os.getpid(),
                      "req": request_id, "pages": len(pages),
-                     "visible_tokens": len(visible),
-                     "was_tokens": len(all_tokens),
-                     # Book reconciliation proof: the scheduler continues with
-                     # num_tokens = after_tokens and num_computed = after_computed; a request with
-                     # zero new tokens is never scheduled again (the GPU idles, client hangs).
-                     "before_computed": int(before_computed),
-                     "pending": int(pending),
-                     "after_tokens": len(req._all_token_ids),
-                     "after_computed": int(req.num_computed_tokens)})
-            return {"ok": True, "truncated": True, "visible": len(visible)}
+                     "visible_tokens": visible,
+                     "before_computed": before_computed,
+                     "after_computed": int(req.num_computed_tokens),
+                     "logical_tokens": int(getattr(req, "num_logical_tokens", 0)),
+                     "num_tokens": int(req.num_tokens)}
+            # The logical book must stay >= the prompt: the sampler derives the output length from
+            # it, and we no longer truncate it - a violation here is a bug, not a config.
+            if entry["num_tokens"] < len(getattr(req, "prompt_token_ids", ()) or ()):
+                entry["WARNING"] = "logical book below the prompt"
+            _append(_sched_cfg(scheduler).get("probe_log") or "/tmp/kvmem_sparse.jsonl", entry)
+            return {"ok": True, "truncated": True, "visible": visible}
 
         _channel_state = {"scheduler": None, "server": None}
         # request_id -> visible length of the last applied compaction (TP-rank idempotency).
@@ -1141,6 +1119,8 @@ def _install(cls, module_name, probe, smoke, state):
                                           "num_computed_tokens_np", None)
                             _pl = getattr(getattr(self, "req_states", None), "prompt_len", None)
                             plen = getattr(_pl, "np", None)
+                            nlg = getattr(getattr(self, "req_states", None),
+                                          "num_logical_tokens_np", None)
                             for req in reqs:
                                 row = rt.view.row_index(req)
                                 if row is None:
@@ -1149,6 +1129,10 @@ def _install(cls, module_name, probe, smoke, state):
                                     # The engine's own count = accepted tokens only. Without this
                                     # the R cadence counts speculative drafts and fires early.
                                     rt.note_engine_computed(req, int(npc[int(row)]))
+                                if nlg is not None and int(row) < len(nlg):
+                                    # Served count: drives the logical bookkeeping; the resident
+                                    # count (`num_computed`) drives positions and seq_lens.
+                                    rt.note_engine_logical(req, int(nlg[int(row)]))
                                 if plen is not None and int(row) < len(plen):
                                     # The engine's post-tokenizer prompt length: the runtime refuses
                                     # to compact a request whose prompt is above B (the engine would

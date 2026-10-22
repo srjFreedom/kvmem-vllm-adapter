@@ -1,7 +1,7 @@
-# A prompt ABOVE B cannot be compacted: vLLM requires num_tokens >= prompt_len, so the engine
-# refuses every compaction while the worker would keep taking slots and moving pages. Measured
-# live (N=2, one 143K-token prefill): 12 refused rounds, sink pages corrupted, gibberish output.
-# The runtime must therefore refuse to touch such a request at all - and say so once.
+# Resident model: a prompt LONGER than B is prefilled in chunks while the resident book stays
+# bounded (the logical book keeps every token). Before this, such a prompt stalled the engine and
+# forced a full re-prefill (measured live: 143,216-token prompt, 12 refused compactions, sink pages
+# corrupted). The runtime must now compact DURING prefill and report the chunked shape once.
 import sys
 
 import torch
@@ -75,27 +75,27 @@ def prefill(rt, req, row, tokens):
 
 
 def main():
-    # Control: the engine does not report a prompt length -> prefill pressure keeps working.
+    # A 64K prompt (2x B) must be compacted WHILE it is prefilled, with the resident book kept
+    # inside the watermark and no page taken from outside the request's own blocks.
     records = []
     rt = build(records.append)
-    prefill(rt, "free", 0, 64 * 1024)
-    check(bool(rt.state("free").row),
-          "a long prefill is compacted when the prompt length is unknown")
-    check(any(r.get("kind") == "reselect" for r in records), "the control request reselects")
+    rt.note_prompt_len("long", 64 * 1024)
+    rt.before_step("long", 1, row_index=0)
+    prefill(rt, "long", 0, 64 * 1024)
+    st = rt.state("long")
+    orch = rt.orchestrator("long")
+    check(bool(st.row), "a long prefill installs a view")
+    check(any(r.get("kind") == "reselect" for r in records), "prefill pressure reselects")
+    check(len(orch.resident) <= rt.prefill_high_watermark + 16,
+          f"the resident book stays bounded (resident={len(orch.resident)})")
+    own = set(range(101, 101 + 64 * 1024 // PAGE))
+    check(set(st.row) <= own, "the row uses only the request's own pages")
+    check(st.tokens == 64 * 1024, f"the logical book keeps every token (got {st.tokens})")
+    logged = [r for r in records if r.get("kind") == "long_prompt_chunked"]
+    check(len(logged) == 1 and logged[0].get("prompt_tokens") == 64 * 1024,
+          f"the chunked shape is logged once ({len(logged)})")
 
-    # Gated: the engine reports a prompt above B -> nothing is moved, nothing is installed.
-    records = []
-    rt = build(records.append)
-    rt.note_prompt_len("over", 143216)
-    prefill(rt, "over", 1, 64 * 1024)
-    check(not rt.state("over").row, "an over-budget prompt installs no view")
-    check(not rt._owned_slots.get("over"), "an over-budget prompt takes no device slots")
-    check(not any(r.get("kind") == "reselect" for r in records), "no reselect is attempted")
-    over = [r for r in records if r.get("kind") == "prompt_over_budget"]
-    check(len(over) == 1 and over[0].get("prompt_tokens") == 143216,
-          f"the refusal is logged exactly once ({len(over)})")
-
-    print("PASS prefill_over_budget_test" if not failed else "FAILED prefill_over_budget_test")
+    print("PASS prefill_compaction_test" if not failed else "FAILED prefill_compaction_test")
     return 0 if not failed else 1
 
 

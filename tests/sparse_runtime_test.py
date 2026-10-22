@@ -61,11 +61,16 @@ def engine_allocate(view, logical_pages, base):
 
 
 def engine_write(view, row, seq_len, page_tokens, n_tokens, counter):
-    """Model the engine: write deterministic bytes into the slot the installed view reads."""
+    """Model the engine: write deterministic bytes into the page the installed view reads.
+
+    The real engine writes at `kv[block_table[pos // page_tokens]]` (the page ID), not at the row
+    index - with a permuted row those differ, and writing at the index hides exactly the bug this
+    test exists to catch.
+    """
     for i in range(n_tokens):
         pos = seq_len + i
         page = row[pos // page_tokens]
-        slot = row.index(page)
+        slot = int(page)
         g = torch.Generator().manual_seed(counter[0])
         k = torch.randn(HEADS, PAGE, HEAD_DIM, generator=g) * 0.5
         v = torch.randn(HEADS, PAGE, HEAD_DIM, generator=g) * 0.5
@@ -111,7 +116,9 @@ def main():
     st = rt.after_step(0, 0)
     selected = len(rt.orchestrator(0).resident)
     check(selected == 2048, f"working set shrinks to 2048 pages (got {selected})")
-    check(len(st.row) == 2049, f"the row is the selected pages plus one spare (got {len(st.row)})")
+    own = set(range(101, 101 + prefilled // PAGE))
+    check(set(st.row) == own,
+          f"the row is exactly the request's own pages (n={len(st.row)}, budget=2048)")
     check(st.seq_len == min(prefilled, selected * PAGE),
           f"seq_len covers the written tokens (got {st.seq_len})")
 

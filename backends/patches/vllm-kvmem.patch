@@ -137,6 +137,53 @@ index 39d670c019..36cd9bac61 100644
      from vllm.entrypoints.serve.sagemaker.api_router import (
          attach_router as register_sagemaker_api_router,
      )
+diff --git a/vllm/entrypoints/serve/speedmeter/__init__.py b/vllm/entrypoints/serve/speedmeter/__init__.py
+new file mode 100644
+index 0000000000..e69de29bb2
+diff --git a/vllm/entrypoints/serve/speedmeter/api_router.py b/vllm/entrypoints/serve/speedmeter/api_router.py
+new file mode 100644
+index 0000000000..298977f3d8
+--- /dev/null
++++ b/vllm/entrypoints/serve/speedmeter/api_router.py
+@@ -0,0 +1,38 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Speedmeter endpoints: live prefill progress of running requests.
++
++GET /speedmeter/prefill ->
++    {"requests": [{"id": ..., "prompt_len": ..., "computed": ...}, ...]}
++
++`computed` starts at the prefix-cache hit length and only grows, so
++(prompt_len - computed) is the exact remaining prefill work and
++delta(computed)/delta(t) is the live prefill rate.
++"""
++
++from fastapi import APIRouter, FastAPI, Request
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++router = APIRouter()
++
++
++@router.get("/speedmeter/prefill")
++async def speedmeter_prefill(raw_request: Request):
++    """Prefill progress for every running request.
++
++    The data lives in the EngineCore process; we fetch it over the
++    generic UTILITY RPC channel (EngineCore.speedmeter_prefill), so this
++    works for both multiprocess and in-process deployments.
++    """
++    engine_client = raw_request.app.state.engine_client
++    requests = await engine_client.engine_core.call_utility_async(
++        "speedmeter_prefill"
++    )
++    return {"requests": requests}
++
++
++def attach_router(app: FastAPI):
++    app.include_router(router)
 diff --git a/vllm/kvmem_bridge.py b/vllm/kvmem_bridge.py
 new file mode 100644
 index 0000000000..a2990acd60
@@ -312,11 +359,224 @@ index 495650eb19..70711540d2 100644
          return q, k, v, gate
  
      def forward(
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index 87fdbfb164..374c481070 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -2,7 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ from collections.abc import Callable
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from functools import cached_property
+ from typing import TYPE_CHECKING
+ 
+@@ -43,6 +43,8 @@ class NewRequestData:
+     block_ids: tuple[list[int], ...]
+     num_computed_tokens: int
+     lora_request: LoRARequest | None
++    # KVMem: served-token count (== num_computed_tokens unless a compaction rewound the book).
++    num_logical_tokens: int = 0
+     prompt_embeds: "torch.Tensor | None" = None
+     prompt_is_token_ids: list[bool] | None = None
+ 
+@@ -69,6 +71,7 @@ class NewRequestData:
+             pooling_params=request.pooling_params,
+             block_ids=block_ids,
+             num_computed_tokens=request.num_computed_tokens,
++            num_logical_tokens=request.num_logical_tokens,
+             lora_request=request.lora_request,
+             prompt_embeds=request.prompt_embeds,
+             prompt_is_token_ids=request.prompt_is_token_ids,
+@@ -143,6 +146,8 @@ class CachedRequestData:
+     new_block_ids: list[tuple[list[int], ...] | None]
+     num_computed_tokens: list[int]
+     num_output_tokens: list[int]
++    # KVMem: served-token count per request (see NewRequestData.num_logical_tokens).
++    num_logical_tokens: list[int] = field(default_factory=list)
+ 
+     # Version of dataclass repr with token IDs obfuscated.
+     def anon_repr(self) -> str:
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 253ea9d3ea..39e1fda6bd 100644
+index 253ea9d3ea..0b3fbcf16b 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
-@@ -3005,6 +3005,16 @@ class Scheduler(SchedulerInterface):
+@@ -129,6 +129,14 @@ class Scheduler(SchedulerInterface):
+             else self.scheduler_config.max_num_batched_tokens
+         )
+         self.max_model_len = vllm_config.model_config.max_model_len
++        # KVMem resident-book mode: when in-request compaction is on, `num_computed_tokens` is the
++        # RESIDENT KV length (bounded by B+R) and `num_logical_tokens` is the served count, so the
++        # logical context is bounded by `kvmem_ctx`, not by the engine window.
++        _kvmem = ((getattr(vllm_config, "additional_config", None) or {}).get("kvmem")
++                  if isinstance(getattr(vllm_config, "additional_config", None), dict) else None)
++        _kvmem = _kvmem if isinstance(_kvmem, dict) else {}
++        self.kvmem_resident = bool(_kvmem.get("inrequest_compaction"))
++        self.kvmem_ctx = int(_kvmem.get("ctx") or 0) or None
+         self.enable_kv_cache_events = (
+             self.kv_events_config is not None
+             and self.kv_events_config.enable_kv_cache_events
+@@ -650,7 +658,7 @@ class Scheduler(SchedulerInterface):
+             prefill_candidates = [
+                 request
+                 for request in self.running
+-                if request.num_computed_tokens < request.num_prompt_tokens
++                if request.num_logical_tokens < request.num_prompt_tokens
+             ]
+             # A newly arriving prefill must not pause an already decoding-only
+             # batch. The barrier is for aligning an in-flight prefill cohort;
+@@ -668,7 +676,7 @@ class Scheduler(SchedulerInterface):
+                 waiting_candidates = (
+                     request
+                     for request in self.waiting
+-                    if request.num_computed_tokens < request.num_prompt_tokens
++                    if request.num_logical_tokens < request.num_prompt_tokens
+                     and request.request_id
+                     not in self._prefill_barrier_admission_blocked
+                 )
+@@ -677,7 +685,7 @@ class Scheduler(SchedulerInterface):
+                 )
+ 
+             remaining_prompts = [
+-                request.num_prompt_tokens - request.num_computed_tokens
++                request.num_prompt_tokens - request.num_logical_tokens
+                 for request in prefill_candidates
+             ]
+             if remaining_prompts and barrier_has_running_prefill:
+@@ -740,7 +748,7 @@ class Scheduler(SchedulerInterface):
+                 continue
+ 
+             request_prefill_remaining = max(
+-                request.num_prompt_tokens - request.num_computed_tokens, 0
++                request.num_prompt_tokens - request.num_logical_tokens, 0
+             )
+             if (
+                 prefill_frontier is not None
+@@ -789,10 +797,14 @@ class Scheduler(SchedulerInterface):
+                 req_index += 1
+                 continue
+ 
++            # KVMem: the logical frontier minus the SERVED count. `num_computed_tokens` is the
++            # resident KV length and a compaction rewinds it, so using it here would re-schedule
++            # tokens that were already served (and, with a compacted book, the wrong ones).
+             num_new_tokens = (
+                 request.num_tokens_with_spec
+                 + request.num_output_placeholders
+-                - request.num_computed_tokens
++                - (request.num_logical_tokens if self.kvmem_resident
++                   else request.num_computed_tokens)
+             )
+             if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
+                 num_new_tokens = self.scheduler_config.long_prefill_token_threshold
+@@ -1009,7 +1021,7 @@ class Scheduler(SchedulerInterface):
+                 request_id = request.request_id
+ 
+                 request_prefill_remaining = max(
+-                    request.num_prompt_tokens - request.num_computed_tokens, 0
++                    request.num_prompt_tokens - request.num_logical_tokens, 0
+                 )
+                 if (
+                     prefill_frontier is not None
+@@ -1187,7 +1199,9 @@ class Scheduler(SchedulerInterface):
+                     # We use `request.num_tokens` instead of
+                     # `request.num_prompt_tokens` to consider the resumed
+                     # requests, which have output tokens.
+-                    num_new_tokens = request.num_tokens - num_computed_tokens
++                    num_new_tokens = request.num_tokens - (
++                        request.num_logical_tokens if self.kvmem_resident
++                        else num_computed_tokens)
+ 
+                     # Pad new decode requests to uniform spec decoding size to
+                     # preserve full cudagraph for this step.
+@@ -1217,7 +1231,7 @@ class Scheduler(SchedulerInterface):
+                     if 0 < threshold < num_new_tokens:
+                         num_new_tokens = threshold
+                     if (
+-                        num_computed_tokens < request.num_prompt_tokens
++                        request.num_logical_tokens < request.num_prompt_tokens
+                         and prefill_frontier_step is not None
+                     ):
+                         num_new_tokens = min(num_new_tokens, prefill_frontier_step)
+@@ -1700,6 +1714,9 @@ class Scheduler(SchedulerInterface):
+         self._inflight_prefills.discard(request)
+         request.status = RequestStatus.PREEMPTED
+         request.num_computed_tokens = 0
++        # KVMem: a preempted request holds no resident book and no compacted history any more, so
++        # the served counter restarts with it (otherwise the logical window would skip tokens).
++        request.num_logical_tokens = 0
+         if request.spec_token_ids:
+             request.spec_token_ids = []
+         # Async scheduling: mark all in-flight output as stale. Its tokens are
+@@ -1736,6 +1753,7 @@ class Scheduler(SchedulerInterface):
+         for req_id, num_scheduled_token in num_scheduled_tokens.items():
+             request = self.requests[req_id]
+             request.num_computed_tokens += num_scheduled_token
++            request.num_logical_tokens += num_scheduled_token
+             request.num_in_flight_tokens += num_scheduled_token
+             if self.defer_block_free:
+                 # Record the in-flight step, to fence deferred block freeing.
+@@ -1828,6 +1846,7 @@ class Scheduler(SchedulerInterface):
+         new_block_ids: list[tuple[list[int], ...] | None] = []
+         all_token_ids: dict[str, list[int]] = {}
+         num_computed_tokens: list[int] = []
++        num_logical_tokens: list[int] = []
+         num_output_tokens: list[int] = []
+         resumed_req_ids = set()
+ 
+@@ -1860,6 +1879,7 @@ class Scheduler(SchedulerInterface):
+                 req_to_new_blocks[req_id].get_block_ids(allow_none=True)
+             )
+             num_computed_tokens.append(req.num_computed_tokens)
++            num_logical_tokens.append(req.num_logical_tokens)
+             num_output_tokens.append(
+                 req.num_output_tokens + req.num_output_placeholders
+             )
+@@ -1871,6 +1891,7 @@ class Scheduler(SchedulerInterface):
+             all_token_ids=all_token_ids,
+             new_block_ids=new_block_ids,
+             num_computed_tokens=num_computed_tokens,
++            num_logical_tokens=num_logical_tokens,
+             num_output_tokens=num_output_tokens,
+         )
+ 
+@@ -2196,6 +2217,11 @@ class Scheduler(SchedulerInterface):
+                 if not output_is_stale:
+                     if request.num_computed_tokens > 0:
+                         request.num_computed_tokens -= num_rejected
++                    # Rejected draft tokens were never served: the logical counter rolls back
++                    # together with the resident one (their difference only changes on compaction).
++                    if request.num_logical_tokens > 0:
++                        request.num_logical_tokens = max(
++                            0, request.num_logical_tokens - num_rejected)
+                     if request.num_output_placeholders > 0:
+                         request.num_output_placeholders -= num_rejected
+                 spec_decoding_stats = self.make_spec_decoding_stats(
+@@ -2246,7 +2272,7 @@ class Scheduler(SchedulerInterface):
+                 stopped = True
+             elif (
+                 self.is_mm_encoder_only
+-                and request.num_computed_tokens >= request.num_prompt_tokens
++                and request.num_logical_tokens >= request.num_prompt_tokens
+             ):
+                 # An encoder instance runs the encoder and publishes the
+                 # embeddings instead of sampling, so it stops as soon as the
+@@ -2577,7 +2603,13 @@ class Scheduler(SchedulerInterface):
+ 
+             # Check for stop and update request state.
+             # This must be called before we make the EngineCoreOutput.
+-            stopped = check_stop(request, self.max_model_len)
++            # KVMem: with a resident book the engine window (N x (B+R)) bounds the KV, not the
++            # conversation; the logical ceiling is kvmem's CTX.
++            stopped = check_stop(
++                request,
++                self.kvmem_ctx if (self.kvmem_resident and self.kvmem_ctx)
++                else self.max_model_len,
++            )
+             if stopped:
+                 del new_token_ids[num_new:]  # Trim new tokens if needed.
+                 break
+@@ -3005,6 +3037,16 @@ class Scheduler(SchedulerInterface):
          connector_stats_payload = (
              kv_connector_stats.to_dict() if kv_connector_stats else None
          )
@@ -333,7 +593,7 @@ index 253ea9d3ea..39e1fda6bd 100644
          return SchedulerStats(
              num_running_reqs=len(self.running),
              num_waiting_reqs=len(self.waiting),
-@@ -3017,6 +3027,8 @@ class Scheduler(SchedulerInterface):
+@@ -3017,6 +3059,8 @@ class Scheduler(SchedulerInterface):
              kv_connector_stats=connector_stats_payload,
              cudagraph_stats=cudagraph_stats,
              perf_stats=perf_stats,
@@ -342,6 +602,14 @@ index 253ea9d3ea..39e1fda6bd 100644
          )
  
      def make_spec_decoding_stats(
+@@ -3322,6 +3366,7 @@ class Scheduler(SchedulerInterface):
+                     marked_invalid_block_ids |= request_invalid_block_ids
+                     total_affected_tokens += req_num_computed_tokens
+                     request.num_computed_tokens = 0
++                    request.num_logical_tokens = 0
+                     if evict_blocks:
+                         for req_block_ids in req_block_ids_per_group:
+                             blocks_to_evict.update(
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
 index ffc9a5de7e..82a5eff626 100644
 --- a/vllm/v1/engine/core.py
@@ -566,6 +834,25 @@ index 24e07e57cc..29e54838c7 100644
      prefix_cache_stats: PrefixCacheStats = field(default_factory=PrefixCacheStats)
      connector_prefix_cache_stats: PrefixCacheStats | None = None
  
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index 8b453a0906..610a31c020 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -180,6 +180,14 @@ class Request:
+ 
+         self.spec_token_ids: list[int] = []
+         self.num_computed_tokens = 0
++        # KVMem in-request compaction splits the two counters:
++        #   * num_logical_tokens - monotone "served" count (prompt + generated). Drives how many
++        #     new tokens are scheduled, the prefill/decode test and the input-token window.
++        #   * num_computed_tokens - the RESIDENT KV book length. Compaction rewinds it while the
++        #     logical book (`_all_token_ids`) keeps growing, so the KV working set stays bounded
++        #     by B+R instead of the conversation length.
++        # With compaction off the two move in lockstep (the default vLLM behaviour).
++        self.num_logical_tokens = 0
+         self.cache_salt: str | None = cache_salt
+ 
+         # Multi-modal related
 diff --git a/vllm/v1/spec_decode/metrics.py b/vllm/v1/spec_decode/metrics.py
 index a3ccfb29e7..5f6c494890 100644
 --- a/vllm/v1/spec_decode/metrics.py
@@ -610,3 +897,132 @@ index a3ccfb29e7..5f6c494890 100644
          )
          self.reset()
  
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 481da2016b..f12cc9426b 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -271,14 +271,17 @@ def _prepare_prefill_inputs_kernel(
+     all_token_ids_ptr,
+     all_token_ids_stride,
+     prefill_lens_ptr,
+-    num_computed_tokens_ptr,
++    num_logical_tokens_ptr,
+     BLOCK_SIZE: tl.constexpr,
+     LOOKAHEAD_BLOCK: tl.constexpr,
+ ):
+     batch_idx = tl.program_id(0)
+     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
+     prefill_len = tl.load(prefill_lens_ptr + req_state_idx)
+-    num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
++    # KVMem: the window is sliced from the LOGICAL (served) position, not from the resident KV
++    # length. With in-request compaction the two differ: the book is compacted while the prompt
++    # keeps being served, so using the resident count would re-feed already-served tokens.
++    num_computed = tl.load(num_logical_tokens_ptr + req_state_idx)
+     if num_computed >= prefill_len:
+         # Not prefill.
+         return
+@@ -317,7 +320,7 @@ def prepare_prefill_inputs(
+     query_start_loc: torch.Tensor,
+     all_token_ids: torch.Tensor,
+     prefill_len: torch.Tensor,
+-    num_computed_tokens: torch.Tensor,
++    num_logical_tokens: torch.Tensor,
+ ) -> None:
+     num_reqs = idx_mapping.shape[0]
+     num_lookahead = next_prefill_tokens.shape[0]
+@@ -331,7 +334,7 @@ def prepare_prefill_inputs(
+         all_token_ids,
+         all_token_ids.stride(0),
+         prefill_len,
+-        num_computed_tokens,
++        num_logical_tokens,
+         BLOCK_SIZE=1024,
+         LOOKAHEAD_BLOCK=triton.next_power_of_2(num_lookahead),
+     )
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 0422c9e885..5b6937da59 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1157,6 +1157,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 all_token_ids=new_req_data.prefill_token_ids,
+                 num_computed_tokens=new_req_data.num_computed_tokens,
+                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
++                num_logical_tokens=getattr(new_req_data, "num_logical_tokens", None),
+             )
+             req_index = self.req_states.req_id_to_index[req_id]
+             if self.adaptive_verification is not None:
+@@ -1204,11 +1205,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             if (idx := self.req_states.req_id_to_index.get(req_id)) is not None:
+                 self.block_tables.append_block_ids(idx, block_ids, overwrite=True)
+         num_computed_tokens_np = self.req_states.num_computed_tokens_np
+-        for req_id, num_computed_tokens, req_new_block_ids in zip(
+-            reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
++        num_logical_tokens_np = self.req_states.num_logical_tokens_np
++        _logical = getattr(reqs, "num_logical_tokens", None) or []
++        for req_id, num_computed_tokens, req_new_block_ids, num_logical in zip(
++            reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids,
++            _logical if len(_logical) == len(reqs.req_ids)
++            else [None] * len(reqs.req_ids),
+         ):
+             req_index = self.req_states.req_id_to_index[req_id]
+             num_computed_tokens_np[req_index] = num_computed_tokens
++            if num_logical is not None:
++                num_logical_tokens_np[req_index] = int(num_logical)
++                self.req_states.num_logical_tokens.stage_write_elem(
++                    req_index, int(num_logical))
+             if req_new_block_ids is not None and req_id not in table_updates:
+                 self.block_tables.append_block_ids(
+                     req_index, req_new_block_ids, overwrite=False
+@@ -1399,7 +1408,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 query_start_loc,
+                 self.req_states.all_token_ids.gpu,
+                 self.req_states.prefill_len.gpu,
+-                self.req_states.num_computed_tokens.gpu,
++                self.req_states.num_logical_tokens.gpu,
+             )
+ 
+         # Prepare positions and seq_lens.
+diff --git a/vllm/v1/worker/gpu/states.py b/vllm/v1/worker/gpu/states.py
+index 434fb80582..7636ef2c83 100644
+--- a/vllm/v1/worker/gpu/states.py
++++ b/vllm/v1/worker/gpu/states.py
+@@ -60,6 +60,12 @@ class RequestState:
+         )
+         # Optimistic CPU mirror of num_computed_tokens (upper bound on GPU value).
+         self.num_computed_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
++        # KVMem: served-token count. Equals num_computed_tokens unless an in-request compaction
++        # rewound the resident book; the prefill input window is sliced with THIS count.
++        self.num_logical_tokens_np = np.zeros(self.max_num_reqs, dtype=np.int32)
++        self.num_logical_tokens = StagedWriteTensor(
++            self.max_num_reqs, dtype=torch.int32, device=device
++        )
+ 
+         # Last sampled tokens.
+         self.last_sampled_tokens = torch.zeros(
+@@ -104,6 +110,7 @@ class RequestState:
+         all_token_ids: list[int],
+         num_computed_tokens: int,
+         max_tokens: int,
++        num_logical_tokens: int | None = None,
+     ) -> None:
+         assert len(self.free_indices) > 0, "No free indices"
+         req_idx = self.free_indices.pop()
+@@ -123,6 +130,10 @@ class RequestState:
+         self.num_computed_tokens_np[req_idx] = num_computed_tokens
+         self.num_computed_tokens.stage_write_elem(req_idx, num_computed_tokens)
+         self.num_cached_tokens.stage_write_elem(req_idx, num_computed_tokens)
++        _logical = (num_computed_tokens if num_logical_tokens is None
++                    else int(num_logical_tokens))
++        self.num_logical_tokens_np[req_idx] = _logical
++        self.num_logical_tokens.stage_write_elem(req_idx, _logical)
+ 
+         self.draft_tokens[req_idx].zero_()
+ 
+@@ -133,6 +144,7 @@ class RequestState:
+         self.all_token_ids.apply_write()
+         self.num_computed_tokens.apply_write()
+         self.num_cached_tokens.apply_write()
++        self.num_logical_tokens.apply_write()
+ 
+     def remove_request(self, req_id: str) -> int | None:
+         """Return the freed slot index, or None if the request was not found."""

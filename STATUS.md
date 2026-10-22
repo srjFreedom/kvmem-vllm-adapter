@@ -1321,3 +1321,34 @@ needle 校验开始失败（`ok:false`），输出变成噪声。三个独立缺
 （超预算不再动 view）、`reselect_write_order_test`（rebuild/搬页顺序）三条新回归，
 40/42 通过（`gpu_real_tensor_test` 因活引擎占用显存、`sparse_rope_test` 需 KVMEM_TEST_CONFIG，
 两者在改动前同样失败）。
+
+### 常驻工作区（Option B，0.2.2）：prefill 也受 N×(B+R) 约束，长 prompt 无损
+
+活引擎日志暴露的结构问题：引擎的 KV 块是 **1616 tokens = 101 个 16-token page**（`mamba align`），
+池子 188,547 tokens ≈ **116.7 块**；而运行时按 16-token page 从池顶拿页，等于偷了分配器眼里还空着的页
+——两个请求的页重叠（needle 失败/乱码），池子记两遍账（卡死 → 全量重 prefill）。
+
+改成**双计数**（fork 补丁，`vllm/v1/core/sched`）：
+
+- `num_logical_tokens`（新增，单调）：已服务 token 数，决定调度多少新 token、prefill/decode 判定、
+  输入 token 窗口（`_prepare_prefill_inputs_kernel` 新增参数）。
+- `num_computed_tokens`（语义改为**常驻书长度**）：positions / seq_lens / 块分配；压缩只回退它。
+- `_all_token_ids` / `num_tokens` 保持逻辑，永不截断；`check_stop` 在常驻模式下用 `kvmem.ctx`。
+- 引擎只在 `ceil(num_computed/1616)` 增长时分配块 ⇒ 每请求 ≤ 54 块，N=2 ≤ 108/116，不抢占、不释放。
+
+运行时（`src/kvmem_sparse_runtime.py`）：
+
+- 压缩**只在请求自己的页里**做（`_own_pages`，行按块量子补齐），不再从池顶拿页；
+- `_absorb_engine_row` 加吸收游标，避免把自己的打包行当引擎重排读回；
+- `st.tokens` 跟逻辑计数、`st.seq_len` 跟常驻计数；
+- prefill 压力路径对长 prompt 正常压缩（不再按 `prompt_over_budget` 跳过），只记一次
+  `long_prompt_chunked`；`host_share` 日志把每个 session 的 host 预算（tokens）暴露出来。
+
+入口：压缩开启时**不再裁剪** history（`_select_in_messages` 直接返回 None），只保留 CTX 与输出上限；
+前缀缓存在压缩开启时强制关闭（块哈希是逻辑 token、KV 布局是压缩后的）。
+
+离线：新增 `resident_book_test`（双计数契约）、`prefill_compaction_test`（64K prompt 边 prefill 边压缩、
+常驻 ≤ 水位、只用自有页）、`reselect_write_order_test`；`sparse_runtime_test` / `sparse_concurrency_test`
+改到常驻语义。42/43 通过（`gpu_real_tensor_test` 需空闲显存）。
+补丁重新生成：`backends/patches/vllm-kvmem.patch` 新增 speedmeter 两个模块（routers.py 依赖它），
+`prepare-backends.py --check-tree` 通过（tree 4133af45…）。

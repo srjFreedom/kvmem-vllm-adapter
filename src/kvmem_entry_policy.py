@@ -291,6 +291,12 @@ def _select_in_messages(payload: dict, policy: EntryPolicy,
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         return None
+    if policy.inrequest_compaction:
+        # Resident model: the engine prefills the WHOLE history in chunks and keeps only B+R of it
+        # in VRAM, spilling the rest to the host tier. Trimming here would throw away tokens the
+        # decode-time retrieval could still bring back, so the entry only enforces CTX and the
+        # output ceiling.
+        return None
     threshold = max(1, policy.budget) * max(1e-9, policy.chars_per_token)
     best = None
     for index, message in enumerate(messages):

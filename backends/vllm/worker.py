@@ -118,6 +118,11 @@ def main(argv=None) -> int:
     _async_override = env.get("NO_ASYNC_SCHEDULING", "").strip()
     env["NO_ASYNC_SCHEDULING"] = async_scheduling_mode(cfg, _async_override)
     if cfg.get("inrequest_compaction"):
+        # Prefix caching hashes the LOGICAL token stream while the KV layout is compacted, so a hit
+        # would hand back pages that no longer hold those tokens. Force it off and say so.
+        env["DISABLE_PREFIX_CACHING"] = "1"
+        print("[kvmem backends/vllm] inrequest_compaction=on -> prefix caching disabled "
+              "(block hashes are over logical tokens, the KV layout is compacted)")
         if _async_override == "0":
             print("[kvmem backends/vllm] inrequest_compaction=on overrides NO_ASYNC_SCHEDULING=0: "
                   "the compaction rewrite requires sync scheduling")

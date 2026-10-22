@@ -64,7 +64,7 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 | `MAX_BATCHED_TOKENS` | `4096` | 单步 prefill 的 token 上限（chunk 大小）| 调大可减少 chunk 数、提升 prefill 并行度，但吃显存；调大后必须重跑启动 smoke |
 | `SPECULATIVE_TOKENS` | `4` | MTP 投机 token 数 | `0` = 关闭投机：省显存/更稳，但 decode 变慢 |
 | `NO_ASYNC_SCHEDULING` | `0` | `0` = 异步调度（默认），`1` = 强制同步 | 入口选片下引擎无块表改写，异步调度安全；两种模式实测**同速**。开 `inrequest-compaction` 时 worker **强制写回 `1`**（显式 `0` 会被覆盖并打印原因：异步预排下一步会与块表改写冲突） |
-| `--kvmem-inrequest-compaction` | 关 | **超 R 生成的唯一开关**：入口上限 `R`→`CTX`（自动导出给入口进程）+ 引擎内压缩 + block 通道 + 强制同步调度。默认关闭 = 完全走 vLLM 原始路径 | 需要超 R 生成时加这一个参数即可；显式把 `KVMEM_ENTRY_INREQUEST_COMPACTION` 设成相反值会被它纠正并打印原因 |
+| `--kvmem-inrequest-compaction` | 关 | **常驻工作区的唯一开关**：入口上限 `R`→`CTX`（自动导出给入口进程）+ 入口不再裁剪历史 + 引擎内压缩（prefill 与 decode 都做）+ block 通道 + 强制同步调度 + 关闭前缀缓存。默认关闭 = 完全走 vLLM 原始路径（入口裁到 B、上限 R） | 加这一个参数，显存就是每请求 `B+R`（与上下文长度无关）；显式把 `KVMEM_ENTRY_INREQUEST_COMPACTION` 设成相反值会被它纠正并打印原因 |
 | `MESSAGE_TYPE` | `text+image` | 是否加载视觉塔 | 纯文本模型/只跑文本时设 `text`（省 ~0.9 GiB 权重）|
 | `MM_IMAGE_LIMIT` | `64` | 每 prompt 允许图片数 | 与 `MESSAGE_TYPE` 配套 |
 | `SERVICE_SCOPE` | `lan` | 监听范围 | `lan` = `0.0.0.0`；`local` = 只监听 `127.0.0.1` |

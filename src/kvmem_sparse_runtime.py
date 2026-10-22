@@ -58,7 +58,7 @@ class VllmSparseRuntime:
                  k_slice=None, reselect_interval=64, log=None, first_page=0,
                  select_block_tokens=128, budget_tokens=32768, gen_reserve=16384, recent_tokens=1024,
                  host_mib=16384, use_kvmem_plan=False, needle_trace=0, use_kvmem_host=True,
-                 sessions=4):
+                 sessions=4, pages_per_block=1, ctx_tokens=0):
         self.view = view
         self.selector = selector
         self.page_tokens = int(page_tokens)
@@ -77,6 +77,13 @@ class VllmSparseRuntime:
         self.needle_trace = int(needle_trace)
         self.use_kvmem_host = bool(use_kvmem_host)
         self.sessions = int(sessions)
+        # Engine allocation quantum in PAGES (attention block / kernel page). With a hybrid model
+        # under mamba align this is e.g. 1616/16 = 101: the engine hands out 1616-token blocks and
+        # the block table row is written in whole blocks, so the resident row must be padded to a
+        # multiple of that quantum or the engine's next append lands in the middle of the row.
+        self.pages_per_block = max(1, int(pages_per_block or 1))
+        # kvmem's logical ceiling (entry CTX); only used for capacity diagnostics here.
+        self.ctx_tokens = int(ctx_tokens or 0)
         self.budget_pool = None
         # Content-based retrieval (mean-K over pre-RoPE keys). Off by default: it costs a capture
         # per layer near each reselect.
@@ -100,6 +107,9 @@ class VllmSparseRuntime:
         # Counting `num_scheduled_tokens` drifts under MTP (draft tokens that get rejected are
         # counted but never appended), which fires the R cadence early.
         self._engine_computed = {}
+        # Engine-reported SERVED count (num_logical_tokens). Differs from `_engine_computed` once a
+        # compaction rewound the resident book: `st.tokens` tracks this, `st.seq_len` the resident.
+        self._engine_logical = {}
         # Engine-reported PROMPT length per request (immutable for the request's life). The
         # entry policy is supposed to keep it <= B; when it does not, compaction cannot shorten
         # the book below the prompt, so the runtime must not churn slots trying.
@@ -116,6 +126,9 @@ class VllmSparseRuntime:
         # logical page (token page index) -> the ENGINE's physical page id for it. The engine
         # owns allocation; we only reorder its pages inside the request's own row.
         self._page_map = {}         # req -> {logical: engine_page}
+        # Rows the runtime has already absorbed: after a compaction the row is OUR packed layout,
+        # so only entries the engine appended (index >= the cursor) are new.
+        self._absorb_upto = {}
         # Logical pages written since the last reselect. Committing them per step forced a
         # synchronous D2H of 17 layers every step (~272 KiB) which dominated decode latency;
         # they stay on the device until the next reselect reads them in one batch.
@@ -142,13 +155,16 @@ class VllmSparseRuntime:
         except Exception:
             return
         page_map = self._page_map.setdefault(req, {})
-        for logical, page in enumerate(values):
-            page = int(page)
-            if page > 0 and logical not in page_map:
+        start = int(self._absorb_upto.get(req, 0))
+        upto = start
+        for logical in range(max(0, start), len(values)):
+            page = int(values[logical])
+            if page > 0:
                 page_map[logical] = page
-            elif page > 0 and logical in page_map and page_map[logical] != page:
-                # The engine moved this logical page (its own reordering): trust the engine.
-                page_map[logical] = page
+                upto = logical + 1
+        # The row is a fixed-capacity tensor: the cursor follows the WRITTEN prefix, not its
+        # capacity, so the engine's next appends are still picked up.
+        self._absorb_upto[req] = max(start, upto)
 
     def _ensure(self, req):
         if req not in self._orch:
@@ -174,6 +190,19 @@ class VllmSparseRuntime:
                                            page=self.page_tokens, layers=len(kv_tensors),
                                            disk_bytes=int(getattr(self, "disk_mib", 0) or 0) * 1024 * 1024,
                                            disk_dir=getattr(self, "disk_path", None) or None)
+                    # Make the host budget observable: with the resident model a request can spill
+                    # (CTX - B) tokens, so the share must be sized for that (it is per SESSION).
+                    try:
+                        per_page = int(sum(int(t[0].numel()) for t in kv_tensors))
+                        share_tokens = (int(share) // max(1, per_page)) * self.page_tokens
+                        self.log({"kind": "host_share", "req": req,
+                                  "session": session,
+                                  "share_mib": int(share) >> 20,
+                                  "share_tokens": share_tokens,
+                                  "spill_tokens_at_ctx": int(getattr(self, "ctx_tokens", 0) or 0)
+                                  - int(self.budget_tokens)})
+                    except Exception:
+                        pass
                 except Exception:
                     store = None
             orch = SparseOrchestrator(
@@ -249,6 +278,8 @@ class VllmSparseRuntime:
             if self._slot_owner.get(slot) == req:
                 self._slot_owner.pop(slot, None)
         self._page_map.pop(req, None)
+        self._absorb_upto.pop(req, None)
+        self._engine_logical.pop(req, None)
         self._dirty_pages.pop(req, None)
         self._engine_computed.pop(req, None)
         self._prompt_len.pop(req, None)
@@ -280,6 +311,10 @@ class VllmSparseRuntime:
         idx_mapping and query_start_loc)."""
         self._ensure(req)
         st = self._state[req]
+        if row_index is not None:
+            # Bind the ROW even before a view exists: the first reselect must know which block
+            # table row is the request's own (it compacts inside the request's own pages).
+            st.row_index = int(row_index)
         # Without in-request compaction the sparse view must NOT be installed: the block table is
         # vLLM's own, and overriding seq_lens/positions on top of an uncompacted row is exactly the
         # half-initialised state that produced gibberish answers (measured with
@@ -300,6 +335,8 @@ class VllmSparseRuntime:
         # made every chunk's queries blind to their own chunk — the KV was written but never
         # attended, which silently produced gibberish instead of an error.
         self._install(row_index, st.row, st.seq_len + len(position_slots), list(position_slots))
+        if self.install_row:
+            self._absorb_upto[req] = max(int(self._absorb_upto.get(req, 0)), len(st.row))
         return st
 
     def _install(self, row_index, row, seq_len, position_slots):
@@ -331,6 +368,13 @@ class VllmSparseRuntime:
         """Set the request's absolute token frontier from the scheduler (authoritative)."""
         st = self.state(req)
         self._pending_frontier[req] = int(frontier)
+
+    def note_engine_logical(self, req, tokens):
+        """The served-token count (logical frontier) as the ENGINE counts it."""
+        try:
+            self._engine_logical[req] = int(tokens)
+        except Exception:
+            pass
 
     def note_prompt_len(self, req, tokens):
         """The request's prompt length as the ENGINE counts it (post tokenizer)."""
@@ -414,6 +458,34 @@ class VllmSparseRuntime:
                       "due": bool(orch.should_reselect())})
         return st
 
+    def _own_pages(self, req):
+        """Every device page the request's OWN engine blocks already hold, in row order.
+
+        The engine allocates 1616-token blocks (101 pages of 16 tokens) out of a ~117-block pool; a
+        runtime that takes fresh pages from the top of that pool is stealing pages the allocator
+        still considers free. Under N=2 long requests the stolen set and the engine's own
+        allocations overlap: the engine hands the same pages to the second request (needle
+        failures / gibberish) and the pool is accounted twice (stall, then a full re-prefill).
+        Compacting INSIDE the request's own pages keeps the two books identical and adds no memory.
+        """
+        st = self._state.get(req)
+        if st is None or st.row_index is None:
+            return []
+        try:
+            row = self.view.block_table_rows()[0][int(st.row_index)]
+            values = [int(v) for v in row.tolist()]
+        except Exception:
+            return []
+        pages = [v for v in values if v > 0]
+        # Pad to the engine's allocation quantum so its next block append is contiguous with the
+        # row (the append index is len(blocks) * pages_per_block).
+        quantum = int(self.pages_per_block)
+        if quantum > 1 and pages:
+            rem = len(pages) % quantum
+            if rem:
+                pages = pages[: len(pages) - rem]
+        return pages
+
     def _grow_from_engine(self, req, grown, logical):
         """Map a page for `logical` from the engine's own allocation (best effort)."""
         try:
@@ -436,15 +508,17 @@ class VllmSparseRuntime:
             # Trust the scheduler's absolute frontier; derive this step's delta from it.
             _st = self._state[req]
             _st.tokens = max(_st.tokens, frontier - int(n_new_tokens or 0))
+        logical_c = self._engine_logical.get(req)
+        if logical_c is not None and logical_c > 0:
+            # The SERVED count is the logical frontier. It is reset every step because
+            # `num_scheduled_tokens` includes speculative drafts that may be rejected; it already
+            # INCLUDES the step being committed here, so subtract it first (the commit loop adds it
+            # back). With compaction this counter keeps growing while the resident book shrinks.
+            self._state[req].tokens = max(0, int(logical_c) - int(n_new_tokens or 0))
         engine_c = self._engine_computed.get(req)
         if engine_c is not None and engine_c > 0:
-            # Reset to the engine's count every step: `num_scheduled_tokens` includes speculative
-            # drafts that may be rejected, so counting them drifts ahead of the real sequence.
-            # `engine_c` already INCLUDES the step being committed here, so subtract it first - the
-            # commit loop below adds it back. Setting it wholesale double-counted every step
-            # (measured: runtime tokens 9638 vs engine 8112, and the two TP ranks disagreed about
-            # which pages to select).
-            self._state[req].tokens = max(0, int(engine_c) - int(n_new_tokens or 0))
+            # RESIDENT book length (what positions/seq_lens must agree with).
+            self._state[req].seq_len = max(0, int(engine_c) - int(n_new_tokens or 0))
         pending = int(self._pending_new.get(req, 0) or 0)
         if pending > int(n_new_tokens or 0):
             n_new_tokens = pending            # prefill chunks are visible only via query_start_loc
@@ -535,25 +609,22 @@ class VllmSparseRuntime:
             # compaction may only ever drop GENERATED tokens. Remember the prefill length here so
             # every reselect can declare the prompt pages mandatory.
             orch.prompt_tokens = max(0, st.tokens - n_new_tokens)
-        # Compaction cannot shorten the book below the PROMPT (vLLM requires num_tokens >=
-        # prompt_len), so a prompt above B is not compactable at all: the engine would refuse every
-        # round while the worker kept taking slots and moving pages (measured live: 12 refused
-        # rounds during one 143K prefill, sink pages corrupted, gibberish output). The entry policy
-        # is the owner of "prompt <= B"; here we only refuse to do damage.
+        # Resident model: a prompt LONGER than B is the normal case now - it is prefilled in
+        # chunks and the working set is compacted as it grows (the logical book keeps every token,
+        # the resident book stays <= B+R). Log the shape once during diagnosis.
         prompt_len = int(self._prompt_len.get(req, 0) or 0)
-        over_budget = bool(prompt_len and prompt_len > int(self.budget_tokens))
-        if over_budget and req not in self._over_budget_logged:
+        if (prompt_len > int(self.budget_tokens) and req not in self._over_budget_logged):
             self._over_budget_logged.add(req)
-            self.log({"kind": "prompt_over_budget", "req": req, "prompt_tokens": prompt_len,
+            self.log({"kind": "long_prompt_chunked", "req": req, "prompt_tokens": prompt_len,
                       "budget_tokens": int(self.budget_tokens),
-                      "note": "entry did not trim to B; compaction disabled for this request"})
+                      "note": "prefill runs in chunks over the resident window"})
         # During a long prefill the resident set must stay bounded even though relevance is not
         # meaningful yet: keep the sink prefix + newest tail and spill the middle (kvmem's
         # prefill-pressure selection). Without this a 200K prefill would consume the whole pool.
         if (prefill and st.tokens and orch.selector is not None
                 and bool(getattr(self, "inrequest_compaction", False))):
             high = self.prefill_high_watermark
-            if not over_budget and len(orch.resident) > high:
+            if len(orch.resident) > high:
                 self._reselect(req, prefill_pressure=True)
                 if int(getattr(self, "needle_trace", 0)) > 0:
                     resident = sorted(orch.resident)
@@ -573,8 +644,7 @@ class VllmSparseRuntime:
         # (visible == the whole book) and installing a compacted row anyway desynchronised the two
         # books - measured as an 8K prompt stalling right after prefill while the same prompt
         # completed with compaction off.
-        if (bool(getattr(self, "inrequest_compaction", False)) and not prefill and due
-                and not over_budget):
+        if bool(getattr(self, "inrequest_compaction", False)) and not prefill and due:
             result = self._reselect(req)
             if int(getattr(self, "needle_trace", 0)) > 0:
                 resident = sorted(orch.resident)
@@ -637,10 +707,20 @@ class VllmSparseRuntime:
         # request and left later requests reading pages they did not own.
         taken = {}
 
+        own = self._own_pages(req)
+        taken["own"] = own
+
         def _take(needed):
-            slots = self._take_slots(req, int(needed) + 1, keep=keep)
+            need = int(needed)
+            if len(own) > need:
+                slots = list(own[: need + 1])
+                taken["slots"] = slots
+                taken["own_packed"] = True
+                return slots[:need]
+            slots = self._take_slots(req, need + 1, keep=keep)
             taken["slots"] = slots
-            return slots[:-1]
+            taken["own_packed"] = False
+            return slots[:need]
 
         # Sweep: pages written during prefill can be skipped by the per-step commit when the
         # engine had not published their page id yet. They are then absent from the store and the
@@ -681,9 +761,18 @@ class VllmSparseRuntime:
         selected = list(orch.last_view.row_pages)
         used = list(orch.slots[:len(selected)])
         spare = taken["slots"][-1]
-        st.row = tuple(used) + (spare,)
-        st.logical = tuple(selected) + (None,)
-        st.spare = spare
+        if taken.get("own_packed"):
+            # Same memory, new order: the selection occupies ranks 0..n-1 and the request's
+            # remaining own pages fill the rest of the row (unused until new tokens reach them).
+            used_set = set(used)
+            rest = [page for page in own if page not in used_set]
+            st.row = tuple(used) + tuple(rest)
+            st.logical = tuple(selected) + tuple([None] * len(rest))
+            st.spare = None
+        else:
+            st.row = tuple(used) + (spare,)
+            st.logical = tuple(selected) + (None,)
+            st.spare = spare
         st.seq_len = min(st.tokens, len(selected) * self.page_tokens)
         # V4 needle: sample a few resident pages and verify the device copy is exactly one
         # rotation of the stored bytes. Cheap (a handful of pages) and catches any drift.
