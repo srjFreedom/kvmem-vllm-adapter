@@ -179,7 +179,21 @@ def main(argv=None) -> int:
     # concurrent KVMem requests need N x (B + R). Setting the window to that product makes the two
     # requirements equal - never larger than the real need, and large enough to serve all N.
     _wanted = int(getattr(ns, "max_model_len", 0) or 0)
-    if _wanted <= 0:
+    _resident = str(env.get("KVMEM_ENTRY_RESIDENT_PREFILL", "")).strip().lower() in (
+        "1", "true", "yes", "on")
+    if _wanted <= 0 and _resident:
+        # Lossless long prompts: the engine window is the PHYSICAL pool (auto-fitted to the card),
+        # not N x (B+R). A whole prompt up to that window stays resident, so no compaction has to
+        # happen while the prompt is still being prefilled (that path is not reliable yet); the
+        # entry's CTX remains the logical ceiling.
+        # A concrete window is required: the launcher validates N x MAX_MODEL_LEN against the
+        # profiled KV pool and refuses -1. 180K fits this model's pool (~189K tokens) with margin.
+        _wanted = int(env.get("KVMEM_RESIDENT_MAX_MODEL_LEN", "180000") or "180000")
+        env["KV_CONCURRENCY_EFFECTIVE_LEN"] = str(int(ns.kvmem_budget))
+        print(f"[kvmem backends/vllm] KVMEM_ENTRY_RESIDENT_PREFILL=1 -> "
+              f"MAX_MODEL_LEN={_wanted} (engine window = physical pool), prefill stays resident, "
+              f"compaction is decode-only")
+    if _wanted <= 0 and not _resident:
         _wanted = max(1, int(ns.max_num_seqs)) * (int(ns.kvmem_budget) + int(ns.kvmem_gen_reserve))
         print(f"[kvmem backends/vllm] max_model_len auto = {ns.max_num_seqs} x "
               f"({ns.kvmem_budget} + {ns.kvmem_gen_reserve}) = {_wanted}")

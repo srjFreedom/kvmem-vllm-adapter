@@ -62,7 +62,7 @@ class VllmSparseRuntime:
                  k_slice=None, reselect_interval=64, log=None, first_page=0,
                  select_block_tokens=128, budget_tokens=32768, gen_reserve=16384, recent_tokens=1024,
                  host_mib=16384, use_kvmem_plan=False, needle_trace=0, use_kvmem_host=True,
-                 sessions=4, pages_per_block=1, ctx_tokens=0):
+                 sessions=4, pages_per_block=1, ctx_tokens=0, no_prefill_compact=False):
         self.view = view
         self.selector = selector
         self.page_tokens = int(page_tokens)
@@ -88,6 +88,10 @@ class VllmSparseRuntime:
         self.pages_per_block = max(1, int(pages_per_block or 1))
         # kvmem's logical ceiling (entry CTX); only used for capacity diagnostics here.
         self.ctx_tokens = int(ctx_tokens or 0)
+        # Bisect switch: skip compaction during prefill entirely (the resident book then grows to
+        # the prompt length and only the R cadence compacts during decode). Isolates a prefill-time
+        # compaction race from the selection policy.
+        self.no_prefill_compact = bool(no_prefill_compact)
         self.budget_pool = None
         # Content-based retrieval (mean-K over pre-RoPE keys). Off by default: it costs a capture
         # per layer near each reselect.
@@ -309,7 +313,8 @@ class VllmSparseRuntime:
         return orch
 
     # --- hook 1 ------------------------------------------------------------------------
-    def before_step(self, req, n_query_tokens=1, row_index=None, position_slots=None):
+    def before_step(self, req, n_query_tokens=1, row_index=None, position_slots=None,
+                    rows_only=False):
         """Install the request's sparse view. `row_index` is the batch row of the request and
         `position_slots` the positions[] indices of its query tokens (live runner: derived from
         idx_mapping and query_start_loc)."""
@@ -331,6 +336,18 @@ class VllmSparseRuntime:
         if position_slots is None:
             position_slots = [req * n_query_tokens + j for j in range(n_query_tokens)]
         st.row_index = row_index
+        if rows_only:
+            # Pre-gather phase: only the block table row must be in place (the kernel's gathered
+            # copy is taken from it). seq_lens/positions MUST be written after the engine's own
+            # `prepare_pos_seq_lens`, because that runs with the optimistic device counter, which a
+            # compaction does not rewind - writing ours first would be overwritten with a stale
+            # length and the attention would read pages beyond the row.
+            if self.install_row and st.row:
+                import torch
+                for table in self.view.block_table_rows():
+                    table[row_index, :len(st.row)] = torch.tensor(
+                        st.row, dtype=table.dtype, device=table.device)
+            return st
         self._seq_override[row_index] = st.seq_len + len(position_slots)
         if not self.install:
             return st
@@ -627,6 +644,8 @@ class VllmSparseRuntime:
         # prefill-pressure selection). Without this a 200K prefill would consume the whole pool.
         if (prefill and st.tokens and orch.selector is not None
                 and bool(getattr(self, "inrequest_compaction", False))):
+            if self.no_prefill_compact:
+                return st
             high = self.prefill_high_watermark
             finishing = bool(prompt_len) and (st.tokens + int(n_new_tokens or 0)) >= prompt_len
             if (finishing and st.row and not st.query_reselected
@@ -745,7 +764,15 @@ class VllmSparseRuntime:
         try:
             map_now = self._page_map.setdefault(req, {})
             known = orch.store.pages
-            upto = -(-int(st.tokens) // self.page_tokens)
+            # Include the IN-FLIGHT chunk: `advance_tokens` commits the previous step, so at the
+            # moment of a prefill-time reselect the chunk that was just written (up to
+            # max_num_batched_tokens ~8K tokens) is not in the store yet. The selection can only
+            # pick committed pages, so without this the whole chunk is dropped from the visible set
+            # while the served counter keeps counting it - a hole in the context (measured: an 80K
+            # prompt answered with noise, and with prefill compaction disabled it answered
+            # correctly twice in a row).
+            inflight = max(0, int(self._pending_new.get(req, 0) or 0))
+            upto = -(-(int(st.tokens) + inflight) // self.page_tokens)
             for lp in range(upto):
                 if lp in known:
                     continue
@@ -842,7 +869,8 @@ class VllmSparseRuntime:
         ch = getattr(self, "compact_channel", None)
         if ch is not None and selected:
             try:
-                res = ch.compact(req, selected, self.page_tokens)
+                res = ch.compact(req, selected, self.page_tokens,
+                                 visible_tokens=int(st.seq_len))
                 if isinstance(res, dict):
                     record["compact_applied"] = bool(res.get("ok"))
                     record["compact_truncated"] = bool(res.get("truncated"))

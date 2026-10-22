@@ -48,6 +48,15 @@ def _config_from_runner(runner):
     return None
 
 
+def _env_flag(name: str) -> bool:
+    import os
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _resident_prefill_on() -> bool:
+    return _env_flag("KVMEM_ENTRY_RESIDENT_PREFILL")
+
+
 def _config():
     """KVMem settings for this process: additional_config first, a file only as a legacy fallback."""
     if _ACTIVE_CONFIG:
@@ -212,6 +221,14 @@ def _attach_adapter(runner, log_path):
         async_transfer=bool(cfg.get("async_transfer", False)),
         pages_per_block=pages_per_block,
         ctx_tokens=int(cfg.get("ctx") or 0),
+        # Lossless long prompts default to "no compaction while prefilling": that path is verified
+        # (80K/170K/N=2 answers exact) while compacting mid-prefill is not (measured: noise from
+        # the first token). The prompt then stays resident up to the engine window, which the
+        # worker sizes to the physical pool. Opt in to the old behaviour with
+        # KVMEM_RESIDENT_PREFILL_COMPACT=1 when working on that path.
+        no_prefill_compact=(
+            _resident_prefill_on()
+            and not _env_flag("KVMEM_RESIDENT_PREFILL_COMPACT")),
         kv_caches=[tensor for _, tensor, _ in paged],
     ).bind()
     _append(log_path, {"kind": "attached", "pid": os.getpid(),
@@ -378,6 +395,14 @@ def _attach_sparse(runner, log_path):
         sessions=int(cfg.get("sessions", 4)),
         pages_per_block=pages_per_block,
         ctx_tokens=int(cfg.get("ctx") or 0),
+        # Lossless long prompts default to "no compaction while prefilling": that path is verified
+        # (80K/170K/N=2 answers exact) while compacting mid-prefill is not (measured: noise from
+        # the first token). The prompt then stays resident up to the engine window, which the
+        # worker sizes to the physical pool. Opt in to the old behaviour with
+        # KVMEM_RESIDENT_PREFILL_COMPACT=1 when working on that path.
+        no_prefill_compact=(
+            _resident_prefill_on()
+            and not _env_flag("KVMEM_RESIDENT_PREFILL_COMPACT")),
         # vLLM's NULL block occupies one aligned unit at the front of the pool.
         first_page=int(cfg.get("first_page", 0)) or
         (int(cfg.get("select_block_tokens", 128)) // max(1, int(view.page_tokens))))
@@ -879,7 +904,7 @@ def register():
             blocks = mgr.block_pool.get_new_blocks(int(count))
             return [int(getattr(b, "block_id", b)) for b in blocks]
 
-        def _compact(request_id, pages, page_tokens):
+        def _compact(request_id, pages, page_tokens, visible_tokens=0):
             """Resident-book reconciliation (Route A / resident model).
 
             The worker selected a working set and has ALREADY installed it into the block table row
@@ -902,7 +927,12 @@ def register():
                 req = (getattr(scheduler, "requests", None) or {}).get(request_id)
             if req is None:
                 return False
-            visible = int(len(pages)) * int(page_tokens)
+            # The worker's own visible length wins: it is `min(tokens, len(pages)*page)` and can be
+            # a few tokens SHORTER than the page product. Using the product here made the engine's
+            # `num_computed_tokens` disagree with the installed row by up to a page, shifting every
+            # later position and corrupting the context (measured: 80K prompts answered with noise
+            # whenever prefill-time compaction ran).
+            visible = int(visible_tokens or 0) or int(len(pages)) * int(page_tokens)
             before_computed = int(req.num_computed_tokens)
             applied = _compact_state.get(request_id)
             already = applied == visible
@@ -1125,10 +1155,11 @@ def _install(cls, module_name, probe, smoke, state):
                                 row = rt.view.row_index(req)
                                 if row is None:
                                     continue
-                                # Installs the compacted row (and the attention seq_lens) so the
-                                # gather below copies THIS step's layout.
+                                # Only the ROW goes in before the gather (that is what the kernel
+                                # copies); seq_lens/positions are written again after it.
                                 rt.before_step(req, row_index=row,
-                                               position_slots=rt.view.query_position_slots(req))
+                                               position_slots=rt.view.query_position_slots(req),
+                                               rows_only=True)
                 except Exception:
                     _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                             {"kind": "sparse_pre_install_error", "error": traceback.format_exc()})
@@ -1161,6 +1192,10 @@ def _install(cls, module_name, probe, smoke, state):
                                 if plen is not None and int(row) < len(plen):
                                     # The engine's post-tokenizer prompt length (diagnostics).
                                     rt.note_prompt_len(req, int(plen[int(row)]))
+                                # Full install AFTER the engine wrote its (optimistic) seq_lens:
+                                # the resident length and the compacted positions win.
+                                rt.before_step(req, row_index=row,
+                                               position_slots=rt.view.query_position_slots(req))
                 except Exception:
                     _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                             {"kind": "sparse_step_error", "error": traceback.format_exc()})
