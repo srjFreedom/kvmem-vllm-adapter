@@ -93,6 +93,18 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 - **检索打分**需要 pre-RoPE query 钩子，目前只加在 `qwen3_next.py`（Qwen3.5/3.8 架构）；
   换架构要加同样两行。没有钩子时其他能力（入口选片、R 上限、H/D 缓存、前缀缓存）不受影响
 
+### 采样默认值
+
+| 项 | 值 | 说明 |
+|---|---|---|
+| 默认 `temperature` | `0.3` | 仅当请求**不带** `temperature`（或显式 `null`）时生效。实现见补丁里的 `SamplingParams` 默认值、`from_optional` 兜底，以及 chat/completion/responses 三个协议的 `_DEFAULT_SAMPLING_PARAMS` |
+| 请求自带 `temperature` | 原样生效 | `temperature: 0` 仍是贪心，`0.9` 仍是 0.9，不受默认值影响 |
+| 模型 `generation_config.json` 的 `temperature` | **不生效** | `get_diff_sampling_param` 会丢掉它（否则会覆盖后端默认；本部署的模型文件写的是 1.0）。`top_k`/`top_p` 仍沿用模型文件（本部署为 20 / 0.95）|
+| `--override-generation-config` 里的 `temperature` | 生效 | 需要按模型文件走时显式给；这也是唯一能让模型文件温度重新生效的方式 |
+
+> 背景：本机 DSH 客户端不传 `temperature`，上游 vLLM 默认 1.0 → 改代码时温度偏高、输出发散。
+> 后端统一固定在 0.3；需要更高的请求显式带上即可。
+
 ---
 
 ## 二、安装期参数（装机器时一次）

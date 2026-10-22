@@ -1515,3 +1515,33 @@ draft 砍掉；下一步 `num_new_tokens = num_tokens_with_spec - num_logical` �
 | 自由生成 1856 token | ✅ 无重复、正常收尾 |
 | 离线套件 | 43/43 ✅ |
 | 补丁 / 树哈希 | `prepare-backends --check-tree` ✅ |
+
+### 常驻模型（第 10 轮）：后端默认温度固定 0.3，请求自带温度照样覆盖
+
+**需求**：本机 DSH 客户端**不传** `temperature`，vLLM 上游默认 1.0 → 改代码时采样太散。
+要求后端默认固定 0.3，且请求里带的温度必须能覆盖默认值。
+
+**实现**（补丁内 4 个文件）：
+
+| 层 | 改动 | 为什么不够/必要 |
+|---|---|---|
+| `SamplingParams` 数据类默认值、`from_optional` 兜底（`None` → 0.3）| 1.0 → 0.3 | 离线 `LLM.generate`、未走协议层的调用兜底 |
+| chat / completion / responses 三个协议的 `_DEFAULT_SAMPLING_PARAMS["temperature"]` | 1.0 → 0.3 | **真正生效的那层**：请求没带温度时 `to_sampling_params` 先填这个值再进 `SamplingParams` |
+| `model.py::get_diff_sampling_param` | 丢弃模型 `generation_config.json` 的 `temperature` | 否则模型的 1.0 会盖掉上面两处（本部署 `generation_config.json` 写的是 1.0）。`top_k`/`top_p` 仍沿用（20 / 0.95）；`--override-generation-config` 显式给的 temperature 仍生效 |
+
+**验证**：
+
+| 用例 | 结果 |
+|---|---|
+| 解析（补丁树的 `ChatCompletionRequest.to_sampling_params`，default_sampling_params=`{top_k:20,top_p:0.95}`）| 不带 → **0.3**；`0` → **0.0**（贪心）；`0.9` → **0.9**；显式 `null` → **0.3** |
+| 启动日志 | 模型覆盖告警从 `{'temperature': 1.0, 'top_k': 20, 'top_p': 0.95}` 变为 `{'top_k': 20, 'top_p': 0.95}` |
+| 解码质量闸门（`temperature: 0` 显式）| 4/4 ✅ |
+| 4K / 8K needle（修正后的 `needle.py`）| ✅ 4.2s / 8.1s，两把 key |
+| 20K needle | ✅ 两把 key，23.2s |
+| 不带温度连续 3 次（DSH 路径）| 输出略有差异（0.3 随机采样）、无重复、语义正确 |
+| 补丁 / 树哈希 | `prepare-backends --check-tree` ✅（`patch_sha256` `6a123e8…`，`patched_tree` `76e57b9…`）|
+
+**顺带修正测试脚本（此前会误报）**：`routeA-tests/needle.py` 与 `needle2.py` 把 key 插在
+`i == TOKENS//12`（或 `TOKENS//10`）行，但干草堆只有约 `TOKENS/15` 行 → **key 从未插进去**，
+模型只能瞎猜（曾误判成「引擎在 90% 位置丢 KV」）。现在按行占比（10%/90%）插入；`needle.py`
+同时显式 `enable_thinking: false`，避免思维链吃满 `max_tokens` 导致 `content` 为空。
