@@ -76,7 +76,7 @@ Prefix cache: re-sending the same 57K-token prompt costs 2.1 s TTFT instead of 5
 | Component | Role |
 |---|---|
 | `plugin/kvmem_entry_middleware.py` → `KvmemEntryPlugin` | `attach_router`: installs the middleware and mounts the UI |
-| middleware (default `mode=middleware`) | standard Starlette body rewrite through the `request._body` cache: select history to B, cap `max_tokens` at **R** (or **`CTX − B`** with in-request compaction on), enforce CTX, H/D history-block cache |
+| middleware (default `mode=middleware`) | standard Starlette body rewrite through the `request._body` cache: select history to B, cap `max_tokens` at **R** (or **`CTX`** with in-request compaction on), enforce CTX, H/D history-block cache |
 | `mode=hook` (fallback) | wraps `OpenAIServingChat.create_chat_completion` and applies the same policy to the parsed request |
 | `src/kvmem_entry_policy.py` | the single policy implementation both modes share |
 
@@ -92,7 +92,8 @@ B" **before the request reaches the engine**, and the engine's sequence only gro
 ### Super-R generation (opt-in, `--kvmem-inrequest-compaction`)
 
 With that flag the engine-side compaction is enabled as well: a request may generate past R up to
-**`CTX − B`**. When the pool fills (B history + R new tokens) the runtime reselects, spills the pages
+**`CTX`**. B is only the resident window - everything else in the history lives on the host tier, so
+the logical context is what CTX bounds. When the resident pool fills (B + R) the runtime reselects, spills the pages
 that are no longer needed to the host tier, and tells EngineCore to truncate the request's token book
 in place (`_all_token_ids` → visible set, `num_computed_tokens` rewound) over a worker → EngineCore
 channel, so the scheduler sees no gap and the sequence keeps growing while the physical pool stays
@@ -100,11 +101,11 @@ channel, so the scheduler sees no gap and the sequence keeps growing while the p
 
 - **Default (flag absent): the generation ceiling is R.** `max_tokens` is clamped to R and a request
   stops there; the sequence is monotone and the pool is never recycled.
-- **With the flag: the ceiling is `CTX − B`.** One switch drives everything: the entry ceiling, the
+- **With the flag: the ceiling is `CTX`.** One switch drives everything: the entry ceiling, the
   engine-side compaction, the block channel and synchronous scheduling. The prompt stays immutable
   (vLLM derives the output length from `num_tokens − prompt_len`), so only generated tokens are
   compacted and the most recent `RECENT` tokens are always kept.
-- Reaching `CTX − B` is an ordinary `max_tokens` stop (`finish_reason=length`); the response text is
+- Reaching `CTX` is an ordinary `max_tokens` stop (`finish_reason=length`); the response text is
   never truncated, because compaction only rewrites the engine's token book, not the output tokens.
 
 ### Where the retrieval query comes from
@@ -198,7 +199,7 @@ KVMEM_UI_DIR=                            # optional static UI mounted at /
 
 Generation ceiling: **R by default** (`max_tokens` is clamped to R). Pass
 `--kvmem-inrequest-compaction` to the worker to enable super-R generation, which raises the ceiling to
-`CTX − B`, compacts the live context when the pool fills and forces synchronous scheduling — one flag
+`CTX`, compacts the live context when the resident pool fills and forces synchronous scheduling — one flag
 for the whole feature, no environment variable to set:
 
 ```bash

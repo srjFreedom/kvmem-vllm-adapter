@@ -87,21 +87,21 @@ def main():
     check((policy.budget, policy.gen_reserve, policy.ctx, policy.select)
           == (8192, 1024, 65536, "recency"), "the middleware reads its policy from KVMEM_ENTRY_*")
 
-    # --- in-request compaction: the generation ceiling becomes CTX - B -----------------
+    # --- in-request compaction: the generation ceiling becomes CTX ---------------------
     plain = EntryPolicy(budget=36864, gen_reserve=16384, ctx=524288)
     check(plain.inrequest_compaction is False and plain.generation_ceil() == 16384,
           "without compaction the ceiling stays R")
     comp = EntryPolicy(budget=36864, gen_reserve=16384, ctx=524288, inrequest_compaction=True)
-    check(comp.generation_ceil() == 524288 - 36864,
-          "with compaction the ceiling is the logical budget CTX - B")
+    check(comp.generation_ceil() == 524288,
+          "with compaction the ceiling is the logical context CTX")
     check(EntryPolicy(budget=36864, gen_reserve=16384, ctx=0,
                       inrequest_compaction=True).generation_ceil() == 0,
           "compaction with no CTX releases the cap (engine default applies)")
     pl = {"max_tokens": 999999}
     _, stats = rewrite_payload(pl, comp)
-    check(pl["max_tokens"] == 524288 - 36864 and stats.get("kind") == "gen_budget"
-          and stats.get("applied") == 524288 - 36864,
-          "rewrite_payload caps at CTX - B, not R, when compaction is on")
+    check(pl["max_tokens"] == 524288 and stats.get("kind") == "gen_budget"
+          and stats.get("applied") == 524288,
+          "rewrite_payload caps at CTX, not R, when compaction is on")
     pl = {"max_tokens": 1000}
     rewrite_payload(pl, comp)
     check(pl["max_tokens"] == 1000, "a smaller client budget is still honoured under compaction")

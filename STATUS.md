@@ -991,14 +991,14 @@ worker `--kvmem-capture-tokens`、启动脚本 `CAPTURE_TOKENS=`、落盘 `kvmem
 ## Route A：引擎内压缩（ninfer 对等）——实现与验证计划（2026-10-21）
 
 **目标**：把 ninfer 的「超 R 生成」搬进 vLLM。物理池仍是每请求 `B+R`，但请求可以一直生成到
-`CTX-B`：池子填满时重选（sink+media+recent 保留、其余溢写 host 层），并把引擎侧的记账一起截断，
+`CTX`：常驻池填满时重选（sink+media+recent 保留、其余溢写 host 层），并把引擎侧的记账一起截断，
 使 vLLM 认识「被压缩的序列」。
 
 ### 决策项（D1–D6）与状态
 
 | 项 | 决策 | 状态 |
 |---|---|---|
-| D1 入口上限 | 压缩关：`max_tokens` 夹到 R；压缩开：上限 `CTX-B`（逻辑预算），R 退化为重选节拍 | ✅ `EntryPolicy.generation_ceil()`，两条入口（原始 payload + OpenAI 中间件）共用 |
+| D1 入口上限 | 压缩关：`max_tokens` 夹到 R；压缩开：上限 `CTX`（逻辑上下文），R 退化为重选节拍 | ✅ `EntryPolicy.generation_ceil()`，两条入口（原始 payload + OpenAI 中间件）共用 |
 | D2 三本账对账 | worker 重写 block table 后，经 `BlockChannel.compact` 让 EngineCore **原地** `_all_token_ids[:] = visible` 并回退 `num_computed_tokens` | ✅ 通道 + `_compact` 闭包；`ConstantList` 视图同步 |
 | D3 前缀缓存 | 内容寻址（`H(parent_hash, tokens)`）、释放即失效，压缩不污染 | ✅ 无需改动 |
 | D4 引擎窗口 | `max_model_len = N×(B+R)` 已大于单请求可见长度；压缩后 `_all_token_ids` 恒 ≤ B+R，长度上限永不误触发 | ✅ 无需改动 |
@@ -1018,7 +1018,7 @@ worker `--kvmem-capture-tokens`、启动脚本 `CAPTURE_TOKENS=`、落盘 `kvmem
 
 | 开关 | 位置 | 作用 |
 |---|---|---|
-| `KVMEM_ENTRY_INREQUEST_COMPACTION=1` | 入口进程 env | 生成上限从 R 抬到 CTX-B |
+| `KVMEM_ENTRY_INREQUEST_COMPACTION=1` | 入口进程 env | 生成上限从 R 抬到 CTX |
 | `--kvmem-inrequest-compaction` | 引擎 worker CLI | 开启引擎内压缩、block 通道、强制同步 |
 
 只开入口 → 上限放开但引擎不压缩，池会被撑爆；只开引擎 → 入口仍夹 R，压缩永不触发。
@@ -1028,7 +1028,7 @@ worker `--kvmem-capture-tokens`、启动脚本 `CAPTURE_TOKENS=`、落盘 `kvmem
 | 压缩 | 输出上限 | 调度 | 引擎序列 |
 |---|---|---|---|
 | 关（默认） | R（客户端要更多也只到 R，正常 finish） | 异步（显式 `NO_ASYNC_SCHEDULING` 优先） | 单调、block table prefill 后冻结 |
-| 开 | 客户端 `max_tokens`，到顶 `CTX-B`；唯一停止条件是 `max_tokens`/EOS | **强制同步** | 循环回收，`_all_token_ids` 恒 ≤ B+R |
+| 开 | 客户端 `max_tokens`，到顶 `CTX`；唯一停止条件是 `max_tokens`/EOS | **强制同步** | 循环回收，`_all_token_ids` 恒 ≤ B+R |
 
 ### 验证状态
 
@@ -1279,3 +1279,9 @@ mandatory（与 prompt 页同等对待）。
 
 活引擎验证：**不设环境变量**、只加 `--kvmem-inrequest-compaction` → 输出 3800 token（> R=2048，
 上限确实被抬高），compact_applied 2 次。离线新增 4 条断言（`entry_compaction_env`）。
+
+### 修正：超 R 的输出上限是 CTX，不是 CTX−B
+
+之前的推导错在把 `B` 当成了「历史总量」。实际 kvmem 里 `B` 只是**常驻窗口**：其余历史在 host 层，
+逻辑上下文可以一直增长，所以约束是「逻辑上下文 ≤ CTX」，输出上限就是 **CTX**（不是 CTX−B）。
+`EntryPolicy.generation_ceil()` 已改为返回 CTX；文档/测试同步更新。

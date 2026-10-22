@@ -45,7 +45,7 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 | `CAPTURE_TOKENS` | `512` | 每步为检索捕获的 query token 数（对齐 KVMem `query_max_tokens` 默认 512）。**代价**：每 rank 约 `64 层 × N × 12 heads × 256 dim × dtype`，512 ≈ 200 MiB（bf16）/ 100 MiB（fp8）|
 | `KVMEM_ENTRY_MODE` | `middleware` | 入口策略实现：`middleware`（标准 Starlette body 改写，默认）/ `hook`（解析后请求上的兜底钩子）|
 | `KVMEM_ENTRY_SELECT` | `retrieval` | 选片打分方式：`retrieval`（按问题检索）/ `recency`（只留 sink+最近，不检索）|
-| `KVMEM_ENTRY_INREQUEST_COMPACTION` | `0` | 入口侧上限开关：`1` 把生成上限从 `R` 抬到 `CTX-B`。**通常不用手设**：`worker.py` 会根据 `--kvmem-inrequest-compaction` 自动导出这个变量（一个开关即可）；只有脱离 worker 单独跑入口策略（网关）时才需要显式设置 |
+| `KVMEM_ENTRY_INREQUEST_COMPACTION` | `0` | 入口侧上限开关：`1` 把生成上限从 `R` 抬到 `CTX`。**通常不用手设**：`worker.py` 会根据 `--kvmem-inrequest-compaction` 自动导出这个变量（一个开关即可）；只有脱离 worker 单独跑入口策略（网关）时才需要显式设置 |
 | `DISABLE_PREFIX_CACHING` | `0` | `1` 关闭 vLLM 前缀缓存。Route A 分析认为内容寻址的前缀缓存与压缩不冲突（待活引擎 TTFT 验证），如遇异常再关 |
 | `KVMEM_UI_DIR` | 空 | 同端口挂载的静态 UI；空字符串 = 不挂 |
 
@@ -64,7 +64,7 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 | `MAX_BATCHED_TOKENS` | `4096` | 单步 prefill 的 token 上限（chunk 大小）| 调大可减少 chunk 数、提升 prefill 并行度，但吃显存；调大后必须重跑启动 smoke |
 | `SPECULATIVE_TOKENS` | `4` | MTP 投机 token 数 | `0` = 关闭投机：省显存/更稳，但 decode 变慢 |
 | `NO_ASYNC_SCHEDULING` | `0` | `0` = 异步调度（默认），`1` = 强制同步 | 入口选片下引擎无块表改写，异步调度安全；两种模式实测**同速**。开 `inrequest-compaction` 时 worker **强制写回 `1`**（显式 `0` 会被覆盖并打印原因：异步预排下一步会与块表改写冲突） |
-| `--kvmem-inrequest-compaction` | 关 | **超 R 生成的唯一开关**：入口上限 `R`→`CTX-B`（自动导出给入口进程）+ 引擎内压缩 + block 通道 + 强制同步调度。默认关闭 = 完全走 vLLM 原始路径 | 需要超 R 生成时加这一个参数即可；显式把 `KVMEM_ENTRY_INREQUEST_COMPACTION` 设成相反值会被它纠正并打印原因 |
+| `--kvmem-inrequest-compaction` | 关 | **超 R 生成的唯一开关**：入口上限 `R`→`CTX`（自动导出给入口进程）+ 引擎内压缩 + block 通道 + 强制同步调度。默认关闭 = 完全走 vLLM 原始路径 | 需要超 R 生成时加这一个参数即可；显式把 `KVMEM_ENTRY_INREQUEST_COMPACTION` 设成相反值会被它纠正并打印原因 |
 | `MESSAGE_TYPE` | `text+image` | 是否加载视觉塔 | 纯文本模型/只跑文本时设 `text`（省 ~0.9 GiB 权重）|
 | `MM_IMAGE_LIMIT` | `64` | 每 prompt 允许图片数 | 与 `MESSAGE_TYPE` 配套 |
 | `SERVICE_SCOPE` | `lan` | 监听范围 | `lan` = `0.0.0.0`；`local` = 只监听 `127.0.0.1` |

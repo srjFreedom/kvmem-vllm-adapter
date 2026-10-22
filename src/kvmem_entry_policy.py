@@ -11,8 +11,9 @@ Two rules live here, and both are kvmem's, not the client's:
   blocks + recent tail.
 * ``R`` (generation reserve) - the output ceiling. ``max_tokens`` is capped at R (and stamped when
   the caller omits it); the residency bound ``B + R`` only holds if a request never generates past
-  R. With in-request compaction on, the engine recycles the pool while generating, so the ceiling
-  becomes the logical budget ``CTX - B`` and R is only the reselect cadence (see ``generation_ceil``).
+  R. With in-request compaction on, the engine recycles the resident pool while generating (B is
+  only the resident window; everything else lives on the host tier), so the ceiling becomes the
+  logical context ``CTX`` and R is only the reselect cadence (see ``generation_ceil``).
 
 ``CTX`` is kvmem's logical context ceiling, unrelated to the engine window: histories above it are
 a configuration error and are rejected rather than silently trimmed.
@@ -50,9 +51,10 @@ class EntryPolicy:
     history_kib: int = 0  # H tier for parsed history blocks
     history_disk_mib: int = 0  # D tier
     history_disk_path: str = "/tmp/kvmem_history_tier"
-    # Route A: in-request compaction. When on, the generation ceiling is the LOGICAL budget
-    # (CTX - B), not R: the request must be allowed to generate past R so the engine can reselect
-    # (spill/restore) and keep going. R stays the reselect cadence on the engine side.
+    # Route A: in-request compaction. When on, the generation ceiling is the LOGICAL context
+    # (CTX), not R: B is only the resident window, the rest of the history lives on the host tier,
+    # so the request must be allowed to generate past R while the engine reselects. R stays the
+    # reselect cadence on the engine side.
     inrequest_compaction: bool = False
 
     @classmethod
@@ -82,12 +84,11 @@ class EntryPolicy:
         return asdict(self)
 
     def generation_ceil(self) -> int:
-        """Output ceiling in tokens. Normally R; in compaction mode the engine recycles the pool
-        while generating, so the ceiling is the logical budget CTX - B (0 disables the cap, which
-        leaves the engine default in place)."""
+        """Output ceiling in tokens. Normally R. With in-request compaction the resident pool is
+        recycled during generation (B is only the window; the rest of the history sits on the host
+        tier), so the ceiling is the logical context CTX (0 disables the cap)."""
         if self.inrequest_compaction:
-            ctx = int(self.ctx or 0)
-            return ctx - int(self.budget) if ctx > 0 else 0
+            return int(self.ctx or 0)
         return int(self.gen_reserve)
 
     def warnings(self) -> list[str]:
