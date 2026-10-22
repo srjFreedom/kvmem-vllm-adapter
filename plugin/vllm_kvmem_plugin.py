@@ -943,12 +943,19 @@ def register():
                 # `truncated` so the second rank installs its own view (each rank owns its KV).
                 return {"ok": True, "truncated": True, "visible": visible}
             req.num_computed_tokens = max(0, visible)
+            # The served count and the resident count differ by exactly this rewind, and nothing
+            # else: the scheduler re-derives `num_logical = num_computed + offset` after every
+            # schedule, so the offset MUST be updated together with the rewind. Without it the two
+            # books disagree after the first compaction and the scheduler over-schedules.
+            req.num_kvmem_offset = int(getattr(req, "num_logical_tokens", 0)) \
+                - int(req.num_computed_tokens)
             _compact_state[request_id] = visible
             entry = {"kind": "compact_applied", "pid": os.getpid(),
                      "req": request_id, "pages": len(pages),
                      "visible_tokens": visible,
                      "before_computed": before_computed,
                      "after_computed": int(req.num_computed_tokens),
+                     "offset": int(getattr(req, "num_kvmem_offset", 0)),
                      "logical_tokens": int(getattr(req, "num_logical_tokens", 0)),
                      "num_tokens": int(req.num_tokens)}
             # The logical book must stay >= the prompt: the sampler derives the output length from
@@ -1170,6 +1177,42 @@ def _install(cls, module_name, probe, smoke, state):
                             {"kind": "sparse_pre_install_error", "error": traceback.format_exc()})
                 out = _orig_prepare_inputs(self, scheduler_output, batch_req_state,
                                            batch_desc, *args, **kwargs)
+                if os.environ.get("KVMEM_DEBUG_POS", "").strip().lower() in (
+                        "1", "true", "yes", "on"):
+                    # Diagnostic: dump the per-request position window the engine built for this
+                    # step together with the two counters it was derived from. A decode step whose
+                    # `positions` do not advance by `n` means the served counter is not tracking the
+                    # resident one (symptom: the model re-reads its own recent tokens and loops).
+                    try:
+                        import numpy as _npd
+                        rs = getattr(self, "req_states", None)
+                        npc_d = getattr(rs, "num_computed_tokens_np", None)
+                        nlg_d = getattr(rs, "num_logical_tokens_np", None)
+                        ib = getattr(self, "input_buffers", None)
+                        pos = getattr(ib, "positions", None)
+                        sl = getattr(ib, "seq_lens", None)
+                        idx = getattr(batch_req_state, "idx_mapping_np", None)
+                        reqs_d = list(getattr(batch_req_state, "req_ids", None) or [])
+                        counts_d = getattr(batch_req_state, "num_scheduled_tokens", None)
+                        if idx is not None and pos is not None and reqs_d and counts_d is not None:
+                            csl = _npd.concatenate(([0], _npd.cumsum(
+                                _npd.asarray(counts_d, dtype=_npd.int64))))
+                            for _i, _req in enumerate(reqs_d):
+                                _r = int(idx[_i])
+                                _p0, _p1 = int(csl[_i]), int(csl[_i + 1])
+                                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl", {
+                                    "kind": "debug_pos", "pid": os.getpid(), "req": _req,
+                                    "row": _r, "n": _p1 - _p0,
+                                    "positions": [int(v) for v in
+                                                  pos[_p0:_p1][:8].tolist()],
+                                    "seq_len_buf": (int(sl[_r]) if sl is not None else None),
+                                    "npc": (int(npc_d[_r]) if npc_d is not None and _r < len(npc_d)
+                                            else None),
+                                    "nlg": (int(nlg_d[_r]) if nlg_d is not None and _r < len(nlg_d)
+                                            else None),
+                                })
+                    except Exception:
+                        pass
                 try:
                     rt = state.get("sparse")
                     if rt is not None:

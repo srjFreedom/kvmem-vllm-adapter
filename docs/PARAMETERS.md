@@ -64,6 +64,7 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 | `MAX_BATCHED_TOKENS` | `4096` | 单步 prefill 的 token 上限（chunk 大小）| 调大可减少 chunk 数、提升 prefill 并行度，但吃显存；调大后必须重跑启动 smoke |
 | `KVMEM_ENTRY_RESIDENT_PREFILL` | `1`（随内压缩自动打开）| 常驻工作区：入口不裁剪、整条 prompt 常驻到**引擎窗口 = 物理 KV 池**（`MAX_MODEL_LEN` 自动适配，没有单独旋钮），压缩只在 decode 发生；与 `--kvmem-inrequest-compaction` 成对使用 | 只有调试 prefill 期压缩时才设 `0`（那条路径会答错） |
 | `--kvmem-block-tokens` | `32` | 选片块大小（必须是最小 KV 页 16 的整数倍）| 32 是修复值：检索按块取 pre-RoPE key 的**均值**打分，128 会让一条关键行（key/id/罕见词）被同块另外 ~127 个 token 稀释 —— 实测 200K prompt 在 50%~73% 换出时，128 答非所问、32 两把 needle 全中。调回 128 只在上下文很短（<32K）且不需要精确召回时才有意义 |
+| `KVMEM_DEBUG_POS` | 空（关）| 诊断：每一步在 `/tmp/kvmem_sparse.jsonl` 落一条 `debug_pos`，记录引擎为该请求算出的 `positions` 前 8 个、`npc`（常驻计数镜像）、`nlg`（服务计数镜像）、`seq_len` | 只在查「解码位置不前进 / 输出重复」时打开；`n` 应恒为 1+drafts（MTP=4 时 5），位置窗口应逐 step 前进 |
 | `SPECULATIVE_TOKENS` | `4` | MTP 投机 token 数 | `0` = 关闭投机：省显存/更稳，但 decode 变慢 |
 | `NO_ASYNC_SCHEDULING` | `0` | `0` = 异步调度（默认），`1` = 强制同步 | 入口选片下引擎无块表改写，异步调度安全；两种模式实测**同速**。开 `inrequest-compaction` 时 worker **强制写回 `1`**（显式 `0` 会被覆盖并打印原因：异步预排下一步会与块表改写冲突） |
 | `--kvmem-inrequest-compaction` | **开** | **常驻工作区的唯一开关**：入口上限 `R`→`CTX`（自动导出给入口进程）+ 入口不再裁剪历史 + 引擎内压缩（prefill 与 decode 都做）+ block 通道 + 强制同步调度 + 关闭前缀缓存。默认开启时**同时**打开常驻工作区（`KVMEM_ENTRY_RESIDENT_PREFILL=1`）——两者是一个功能；只开压缩会退回「入口裁到 B + prefill 期压缩」那条会答错的路径。设 0 = 完全走 vLLM 原始路径（入口裁到 B、上限 R） | 加这一个参数，显存就是每请求 `B+R`（与上下文长度无关）；显式把 `KVMEM_ENTRY_INREQUEST_COMPACTION` 设成相反值会被它纠正并打印原因 |
@@ -71,6 +72,8 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 | `MM_IMAGE_LIMIT` | `64` | 每 prompt 允许图片数 | 与 `MESSAGE_TYPE` 配套 |
 | `SERVICE_SCOPE` | `lan` | 监听范围 | `lan` = `0.0.0.0`；`local` = 只监听 `127.0.0.1` |
 | `THINKING_BUDGET` | 空 | 思考 token 上限（`REASONING_BUDGET`）| **默认空 = 无上限**；填数字才限制推理长度 |
+
+**decode 期压缩与投机解码**：R 节奏到点时，如果这一步带 spec draft（MTP 默认每步都带），压缩会延后到下一个无 draft 的步（日志 `reselect_deferred`）。原因：vLLM 把 logits 行放在 `query_end-(drafts+bonus)`，而调度器把 draft 也计进 `num_computed_tokens`，在轮次中间回退常驻计数会让两个账本差出 draft 数，引擎会以 `FULL CUDA graph metadata topology mismatch … num_prefills: runtime=1, captured=0` 直接退出。
 
 这些参数在启动脚本里都有 `${VAR:-默认}` 兜底，所以既可以写进 `~/.config/kvmem-vllm.env`，
 也可以临时 `GPU_UTIL=0.9 ./deploy/run-kvmem-vllm.sh` 试。

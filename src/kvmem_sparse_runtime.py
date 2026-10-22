@@ -709,7 +709,28 @@ class VllmSparseRuntime:
         # (visible == the whole book) and installing a compacted row anyway desynchronised the two
         # books - measured as an 8K prompt stalling right after prefill while the same prompt
         # completed with compaction off.
+        # A step that carries speculative drafts must NOT be compacted underneath the verifier:
+        # vLLM places the logits rows at [query_end - (drafts + bonus), query_end) and the scheduler
+        # counts the drafts in `num_computed_tokens`, so rewinding the resident book in the middle of
+        # a spec round leaves the two books disagreeing by the draft count. Measured with R=2048
+        # (compaction fires early): the next step was classified as a PREFILL chunk
+        # (`num_computed < num_tokens`) and the engine died on
+        #   FULL CUDA graph metadata topology mismatch ... num_prefills: runtime=1, captured=0,
+        # after writing KV at positions that overlapped the previous step. The reselect drains on
+        # the next draft-free step instead.
+        has_drafts = req in (getattr(self, "spec_reqs", None) or ())
         if bool(getattr(self, "inrequest_compaction", False)) and not prefill and due:
+            if has_drafts:
+                if req not in getattr(self, "_deferred_drafts", set()):
+                    self._deferred_drafts = getattr(self, "_deferred_drafts", set())
+                    self._deferred_drafts.add(req)
+                    if self.log is not None:
+                        self.log({"kind": "reselect_deferred", "req": req,
+                                  "tokens": int(st.tokens), "seq_len": int(st.seq_len),
+                                  "reason": "spec drafts in flight"})
+                return st
+            self._deferred_drafts = getattr(self, "_deferred_drafts", set())
+            self._deferred_drafts.discard(req)
             try:
                 result = self._reselect(req)
             except Exception:

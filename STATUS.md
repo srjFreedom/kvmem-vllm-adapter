@@ -1469,3 +1469,49 @@ needle 校验开始失败（`ok:false`），输出变成噪声。三个独立缺
   - 自动窗口 **202,000**（池 203,442），比原来硬编码 180,000 多 22K
   - 200K prompt：✅ 199,467 tokens、两把 key、301 秒（**不再需要 0.98**）
   - 4K ✅ 3.2 秒 / 80K ✅ 83 秒；离线 43/43
+
+### 常驻模型（第 9 轮）：服务计数钳制把解码位置钉住 → 输出重复（用户实测）
+
+**现象**：本地模型（本机 18200）在 DSH 里答出一长串重复片段；用 18 token 的 prompt、贪心采样
+即可 100% 复现——前 2 个 decode step 正常，之后开始重复模板句。之前的验收矩阵看不出来：
+needle 题只要前几步 logits 就能答对（4K 针检一直 ✅）。
+
+**判别实验**（同一 prompt「用一句话介绍长江」，贪心）：
+
+| 配置 | 输出 |
+|---|---|
+| `INREQUEST_COMPACTION=1`（当时的默认） | ❌ `长江是中国第一大河之一，流经多个省份，最终"用一句话…` 然后循环 |
+| `INREQUEST_COMPACTION=0` | ✅ `长江是中国第一长河、世界第三长河，发源于青藏高原唐古拉山脉…` |
+
+**根因 1（本次修复）**：`scheduler.py::_update_after_schedule` 里的服务计数钳制
+`min(num_logical, num_tokens-1)` 作用在**自增后**的值上，于是每个 decode step 都把刚排进去的
+draft 砍掉；下一步 `num_new_tokens = num_tokens_with_spec - num_logical` 反而变大，调度器排了
+**10 个**候选 token（正确应为 5 = 1 + 4 drafts），位置窗口互相重叠，模型读不到自己刚写的 token。
+
+- 位置实测（`KVMEM_DEBUG_POS=1`）：修复前 `n=10`，窗口 `[116..123]→[123..130]→[129..136]`（重叠）；
+  修复后 `n=5`，窗口 `[98..102]→[100..104]→[103..107]`（连续，差值 = 被拒 draft 数）
+- 修复：钳制改成不变量 `num_logical = num_computed + num_kvmem_offset`（offset 由压缩器在回退
+  `num_computed` 时写入；抢占/拒绝时同步复位），服务计数与常驻计数恒同步，负数 `num_new_tokens`
+  的自愈也由这条不变量兜住
+- 文件：`vLLM-2080Ti-Definitive/vllm/v1/{request.py,core/sched/scheduler.py}`（进补丁）
+
+**根因 2（顺带修掉一条会崩引擎的路径）**：decode 期压缩可能在 spec draft 在途时触发，压缩把
+`num_computed` 拉回后这步被判成 prefill，引擎直接死：
+`FULL CUDA graph metadata topology mismatch … num_prefills: runtime=1, captured=0`（R=2048 可稳定复现）。
+
+- runtime：`after_step` 里 R 节奏的压缩遇到本步带 draft 的请求就延后（`reselect_deferred`），
+  下一个无 draft 的步再压
+- scheduler：`is_prefill_chunk` 在常驻模式下改用**服务计数**（压缩后的 `num_computed` 变小，
+  旧公式会把已进入解码的请求判成 prefill chunk）
+- 结果：R=512 长生成 684 token、R=2048 5000 token、默认 R=32768 1856 token 均无崩溃、无重复
+
+**验证（默认参数，不改任何环境变量）**：
+
+| 用例 | 结果 |
+|---|---|
+| 解码质量闸门（新增 `routeA-tests/decode_quality.py`，贪心 + 12-gram 重复检测） | 4/4 ✅ |
+| 4K / 8K / 60K needle | ✅ 3.1s / 5.5s / 58.1s，两把 key |
+| 8K × N=2 并发 | ✅ 11s，两条都两把 key |
+| 自由生成 1856 token | ✅ 无重复、正常收尾 |
+| 离线套件 | 43/43 ✅ |
+| 补丁 / 树哈希 | `prepare-backends --check-tree` ✅ |
