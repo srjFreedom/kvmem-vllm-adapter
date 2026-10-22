@@ -52,6 +52,11 @@ void VllmSparseSelector::set_block_scores(const std::vector<double> &scores) {
     if (scores.size() != store_.block_count()) {
         throw std::invalid_argument("one score per selection block is required");
     }
+    // The LRFU policy scores blocks per ROUND: a score set outside a round is a logic error in
+    // the core (`LRFU probe outside a round`), which the Python side recorded as "no retrieval
+    // scores" and silently fell back to sink+recent. Measured: 224 selections, 0 with real
+    // scores, so relevance ranking never ran. Open the round here; select_* commits it.
+    store_.begin_retrieval_round();
     store_.set_retrieval_scores(scores);
 }
 
@@ -68,6 +73,7 @@ std::vector<uint32_t> VllmSparseSelector::select_pages(
         }
     }
     const std::vector<uint32_t> blocks = store_.pick_topk_blocks(mandatory_blocks);
+    store_.commit_retrieval_round();
 
     std::vector<uint32_t> pages;
     pages.reserve(blocks.size() * ppb);
@@ -92,6 +98,7 @@ std::vector<uint32_t> VllmSparseSelector::select_prefill_pressure_pages(
         }
     }
     const std::vector<uint32_t> blocks = store_.pick_prefill_pressure_blocks(mandatory_blocks);
+    store_.commit_retrieval_round();
     std::vector<uint32_t> pages;
     pages.reserve(blocks.size() * ppb);
     for (uint32_t block : blocks) {

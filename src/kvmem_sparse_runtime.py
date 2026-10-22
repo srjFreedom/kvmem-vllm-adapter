@@ -39,7 +39,7 @@ class _ReqState:
     # logical:  logical page id (true token page) occupying each row position, so a written
     #           token can be attributed to the history block it belongs to.
     __slots__ = ("row", "logical", "seq_len", "tokens", "next_page", "steps", "spare",
-                 "row_index", "prefill_done")
+                 "row_index", "prefill_done", "query_reselected")
 
     def __init__(self):
         self.row = ()
@@ -51,6 +51,10 @@ class _ReqState:
         self.spare = None
         self.row_index = 0
         self.prefill_done = False
+        # One retrieval-driven reselect right when the prompt is complete (the query is then in
+        # the captured window); without it a prompt compacted during prefill never re-reads its
+        # middle on a short generation.
+        self.query_reselected = False
 
 
 class VllmSparseRuntime:
@@ -624,7 +628,19 @@ class VllmSparseRuntime:
         if (prefill and st.tokens and orch.selector is not None
                 and bool(getattr(self, "inrequest_compaction", False))):
             high = self.prefill_high_watermark
-            if len(orch.resident) > high:
+            finishing = bool(prompt_len) and (st.tokens + int(n_new_tokens or 0)) >= prompt_len
+            if (finishing and not getattr(st, "query_reselected", False)
+                    and getattr(orch, "retrieval_index", None) is not None):
+                # The prompt is about to be complete, so the question is inside the captured
+                # query window: reselect ONCE with retrieval now. Without this a prompt that was
+                # compacted during prefill keeps only sink + recent (no query existed yet), the
+                # middle never comes back on a short generation, and the answer is invented from
+                # the tail (measured: KEY-MID recited with the END key's value).
+                st.query_reselected = True
+                self.log({"kind": "query_reselect", "req": req, "tokens": int(st.tokens),
+                          "prompt": prompt_len, "n_new": int(n_new_tokens or 0)})
+                self._reselect(req)
+            elif len(orch.resident) > high:
                 self._reselect(req, prefill_pressure=True)
                 if int(getattr(self, "needle_trace", 0)) > 0:
                     resident = sorted(orch.resident)
