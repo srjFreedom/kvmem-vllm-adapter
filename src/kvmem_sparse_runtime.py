@@ -781,6 +781,28 @@ class VllmSparseRuntime:
         self.log({"kind": "needle", "req": req, "pages": len(checks),
                   "ok": all(v is True for v in checks.values()),
                   "detail": {str(k): bool(v) for k, v in checks.items()}})
+        # Rotation reconciliation: the query tokens live at compacted positions
+        # [st.seq_len, st.seq_len+n) and a page placed at rank r must be baked for
+        # (r - logical_page) * page_tokens. Log a few RETRIEVED pages (outside the sink/recent
+        # windows) with every number the rotation depends on.
+        try:
+            rank_of = {int(pg): r for r, pg in enumerate(selected)}
+            window = max(0, (int(st.tokens) - int(self.recent_tokens or 0)) // self.page_tokens)
+            _ = int(getattr(orch, "prompt_tokens", 0) or 0)
+            sample = [pg for pg in selected if int(pg) >= window][:3] or selected[:3]
+            rot = {"kind": "rot_check", "req": req,
+                   "seq_len": int(st.seq_len), "tokens": int(st.tokens),
+                   "engine_computed": self._engine_computed.get(req),
+                   "engine_logical": self._engine_logical.get(req),
+                   "rows": [{"page": int(pg), "rank": rank_of[int(pg)],
+                             "slot": int(orch.slot_of.get(int(pg), -1)),
+                             "want": (rank_of[int(pg)] - int(pg)) * self.page_tokens,
+                             "baked": int(orch.baked_delta.get(int(pg), 0)),
+                             "store_delta": int(orch.store_delta.get(int(pg), 0)),
+                             "needle": orch.needle(int(pg))} for pg in sample]}
+            self.log(rot)
+        except Exception:
+            pass
         record = {"kind": "reselect", "req": req, "selected": stats["selected"],
                   "evicted": stats["evicted"], "resident": stats["resident"],
                   "seq_len": st.seq_len, "tokens": st.tokens,
