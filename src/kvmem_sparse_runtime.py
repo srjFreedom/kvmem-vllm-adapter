@@ -784,10 +784,21 @@ class VllmSparseRuntime:
 
         def _take(needed):
             need = int(needed)
-            if len(own) > need:
-                slots = list(own[: need + 1])
+            if len(own) >= need:
+                # Destinations are ALWAYS the request's own pages; when there is no spare page left
+                # in them, borrow exactly ONE slot from the pool instead of switching the whole
+                # destination set to pool slots. The old `> need` test made the FIRST compaction
+                # (row holding exactly `need` pages) fall back to the pool, so the row stopped
+                # pointing at the request's own pages, later growth reused stale entries, and the
+                # sink pages were overwritten (measured: `needle: false` on pages 0/1 after five
+                # 200K compactions).
+                slots = list(own[:need])
+                if len(own) > need:
+                    slots = slots + list(own[need: need + 1])
+                else:
+                    slots = slots + self._take_slots(req, 1, keep=keep)
                 taken["slots"] = slots
-                taken["own_packed"] = True
+                taken["own_packed"] = len(own) > need
                 return slots[:need]
             slots = self._take_slots(req, need + 1, keep=keep)
             taken["slots"] = slots
