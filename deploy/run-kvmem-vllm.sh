@@ -43,11 +43,6 @@ if [ "${DRYRUN:-0}" = "1" ]; then
   echo "DRYRUN: engine window = $(( N * (B + R) )), port=$PORT, served=$SERVED_NAME"
   printf '  %s\n' "model=$MODEL" "B=$B R=$R N=$N sink=$SINK recent=$RECENT CTX=$CTX" \
     "capture=$CAPTURE_TOKENS gpu_util=${GPU_UTIL:-default} entry=${KVMEM_ENTRY_MODE:-middleware}"
-  if [ "${INREQUEST_COMPACTION:-0}" = "1" ]; then
-    echo "  in-request compaction: ON  -> generation ceiling CTX-B = $(( CTX - B ))"
-  else
-    echo "  in-request compaction: OFF -> generation ceiling R = $R"
-  fi
   echo "  worker: $ADAPTER/backends/vllm/worker.py --model $MODEL --port $PORT"
   exit 0
 fi
@@ -74,27 +69,18 @@ export KVMEM_CAPTURE_TOKENS="$CAPTURE_TOKENS"
 export KVMEM_ENTRY_HISTORY_KIB=${KVMEM_ENTRY_HISTORY_KIB:-64}
 export KVMEM_ENTRY_HISTORY_DISK_MIB=${KVMEM_ENTRY_HISTORY_DISK_MIB:-256}
 export KVMEM_ENTRY_HISTORY_DISK_PATH=${KVMEM_ENTRY_HISTORY_DISK_PATH:-/tmp/kvmem_history_tier}
-# Super-R generation (in-request compaction): INREQUEST_COMPACTION=1 adds the worker flag. The entry
-# ceiling is derived from it by worker.py, so KVMEM_ENTRY_INREQUEST_COMPACTION must not be set here.
-INREQUEST_COMPACTION=${INREQUEST_COMPACTION:-0}
 
 {
   echo "==================== $(date '+%F %T') KVMem+vLLM start ===================="
   echo "CTX(logical)=$CTX  B=$B  R=$R  sink=$SINK  recent=$RECENT  sessions=$SESSIONS  H=${HOST_MIB}MiB  N=$N"
   echo "engine window = N x (B+R) = $(( N * (B + R) ))   port=$PORT   served=$SERVED_NAME"
   echo "entry policy = in-process, mode=$KVMEM_ENTRY_MODE (vllm.endpoint_plugins: kvmem_entry)  select=$KVMEM_ENTRY_SELECT"
-  if [ "$INREQUEST_COMPACTION" = "1" ]; then
-    echo "generation ceiling = CTX-B = $(( CTX - B ))  (in-request compaction on; pool stays B+R)"
-  else
-    echo "generation ceiling = R = $R  (in-request compaction off)"
-  fi
   echo "query capture = last $CAPTURE_TOKENS tokens per step (KVMEM_CAPTURE_TOKENS)"
 } >> "$LOG"
 
 # 把本次生效的 kvmem 参数落盘（诊断用；可选网关读同一份）
 printf 'CTX=%s\nB=%s\nR=%s\nSINK=%s\nRECENT=%s\nSESSIONS=%s\nHOST_MIB=%s\nN=%s\nPORT=%s\nCAPTURE_TOKENS=%s\n' \
   "$CTX" "$B" "$R" "$SINK" "$RECENT" "$SESSIONS" "$HOST_MIB" "$N" "$PORT" "$CAPTURE_TOKENS" > "$PARAMS_FILE"
-echo "INREQUEST_COMPACTION=$INREQUEST_COMPACTION" >> "$PARAMS_FILE"
 
 RUN=(env MAX_NUM_SEQS="$N" \
   ${VLLM_PY:-${VLLM_ROOT:-$HOME/vLLM-2080Ti-Definitive}/.venv/bin/python} \
@@ -108,7 +94,6 @@ RUN=(env MAX_NUM_SEQS="$N" \
     --kvmem-block-tokens 128 \
     --kvmem-lrfu-lambda 0.5 --kvmem-lrfu-top-frac 0.9 \
     --kvmem-score-aggregation max --kvmem-retrieval)
-if [ "$INREQUEST_COMPACTION" = "1" ]; then RUN+=(--kvmem-inrequest-compaction); fi
 
 if [ "${FOREGROUND:-0}" = "1" ]; then
   echo "foreground mode (systemd); log: $LOG"
