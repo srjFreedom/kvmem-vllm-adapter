@@ -1219,7 +1219,7 @@ index 481da2016b..f12cc9426b 100644
          LOOKAHEAD_BLOCK=triton.next_power_of_2(num_lookahead),
      )
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 0422c9e885..682354c244 100644
+index 0422c9e885..9ab0b53d5d 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -1157,6 +1157,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1265,6 +1265,25 @@ index 0422c9e885..682354c244 100644
              )
  
          # Prepare positions and seq_lens.
+@@ -1746,11 +1758,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # boundaries before the forward. Runs only on real batches, and
+             # before model_state.prepare_attn gathers num_accepted_tokens so the
+             # boundary reset is visible to the attention metadata.
++            # KVMem: the mamba/GDN recurrent state is NOT paged and cannot be compacted - it
++            # advances with EVERY token, so its state block must follow the SERVED position. With
++            # the resident book `num_computed_tokens` is the compacted length, and feeding it here
++            # migrated the state to the wrong block after every compaction (measured: an 80K
++            # prompt answered with noise on a hybrid model whose 8 paged attention layers were
++            # all verified byte-exact).
+             self.model_state.preprocess_state(
+                 input_batch,
+                 block_tables,
+                 self.kv_cache_config,
+-                self.req_states.num_computed_tokens.gpu,
++                self.req_states.num_logical_tokens,
+             )
+ 
+             if self.lora_config:
 diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
 index b069604c29..3fa6e6baf3 100644
 --- a/vllm/v1/worker/gpu/sample/sampler.py

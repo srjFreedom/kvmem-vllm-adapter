@@ -1098,8 +1098,14 @@ def _install(cls, module_name, probe, smoke, state):
             @functools.wraps(_orig_prepare_inputs)
             def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc,
                                *args, **kwargs):
-                out = _orig_prepare_inputs(self, scheduler_output, batch_req_state,
-                                           batch_desc, *args, **kwargs)
+                # KVMem: the sparse view must be installed BEFORE `_orig_prepare_inputs` runs.
+                # That method gathers the block table rows into the input buffers the attention
+                # kernel reads, so a row written afterwards would only take effect one step later -
+                # and that step would run the model with the NEW positions against the OLD row.
+                # With one compaction per R output tokens that was a single bad step; with a
+                # resident prefill (a compaction every ~8K prompt tokens) it accumulates into
+                # corrupted KV (measured: an 80K prompt answered with noise while every needle
+                # check inside the runtime still passed).
                 try:
                     rt = state.get("sparse")
                     if rt is not None:
@@ -1115,6 +1121,25 @@ def _install(cls, module_name, probe, smoke, state):
                                 rt.release(gone)
                                 _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                                         {"kind": "released", "req": gone, "pid": os.getpid()})
+                            for req in reqs:
+                                row = rt.view.row_index(req)
+                                if row is None:
+                                    continue
+                                # Installs the compacted row (and the attention seq_lens) so the
+                                # gather below copies THIS step's layout.
+                                rt.before_step(req, row_index=row,
+                                               position_slots=rt.view.query_position_slots(req))
+                except Exception:
+                    _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                            {"kind": "sparse_pre_install_error", "error": traceback.format_exc()})
+                out = _orig_prepare_inputs(self, scheduler_output, batch_req_state,
+                                           batch_desc, *args, **kwargs)
+                try:
+                    rt = state.get("sparse")
+                    if rt is not None:
+                        reqs = list(getattr(batch_req_state, "req_ids", None) or [])
+                        counts = getattr(batch_req_state, "num_scheduled_tokens", None)
+                        if reqs and counts is not None:
                             npc = getattr(getattr(self, "req_states", None),
                                           "num_computed_tokens_np", None)
                             _pl = getattr(getattr(self, "req_states", None), "prompt_len", None)
@@ -1134,12 +1159,8 @@ def _install(cls, module_name, probe, smoke, state):
                                     # count (`num_computed`) drives positions and seq_lens.
                                     rt.note_engine_logical(req, int(nlg[int(row)]))
                                 if plen is not None and int(row) < len(plen):
-                                    # The engine's post-tokenizer prompt length: the runtime refuses
-                                    # to compact a request whose prompt is above B (the engine would
-                                    # refuse every round and the slot churn corrupted the view).
+                                    # The engine's post-tokenizer prompt length (diagnostics).
                                     rt.note_prompt_len(req, int(plen[int(row)]))
-                                rt.before_step(req, row_index=row,
-                                               position_slots=rt.view.query_position_slots(req))
                 except Exception:
                     _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                             {"kind": "sparse_step_error", "error": traceback.format_exc()})
