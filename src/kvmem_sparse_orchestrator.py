@@ -428,6 +428,10 @@ class SparseOrchestrator:
                         if 0 <= index < total_blocks:
                             full[index] = float(value)
                     self.selector.set_block_scores(full)
+                    # Diagnostic: the highest-scoring selection blocks, so a caller can check
+                    # whether the block that carries the needed record was even ranked.
+                    ranked = sorted(range(len(full)), key=lambda i: full[i], reverse=True)[:8]
+                    self.last_top_blocks = [(int(b), round(float(full[b]), 4)) for b in ranked]
                     stats = {"blocks": len(blocks), "total_blocks": total_blocks,
                              "top": max(scores) if scores else None}
                     store = getattr(self, "store", None)

@@ -639,7 +639,7 @@ class VllmSparseRuntime:
                 st.query_reselected = True
                 self.log({"kind": "query_reselect", "req": req, "tokens": int(st.tokens),
                           "prompt": prompt_len, "n_new": int(n_new_tokens or 0)})
-                self._reselect(req)
+                self._reselect(req, probe=True)
             elif len(orch.resident) > high:
                 self._reselect(req, prefill_pressure=True)
                 if int(getattr(self, "needle_trace", 0)) > 0:
@@ -685,7 +685,7 @@ class VllmSparseRuntime:
                          "needle": orch.needle(page)})
         self.log({"kind": "needle_trace", "req": req, "tokens": st.tokens, "rows": rows})
 
-    def _reselect(self, req, prefill_pressure=False):
+    def _reselect(self, req, prefill_pressure=False, probe=False):
         st = self._state[req]
         cap = getattr(self, "capture", None)
         if cap is not None and getattr(self, "retrieval_enabled", False):
@@ -864,6 +864,23 @@ class VllmSparseRuntime:
         # Slots this request no longer references go back to the pool. On a refusal only the slots
         # taken in this round are dropped; the old sources stay because the orchestrator still
         # points at them (the engine's own row was not touched).
+        if probe:
+            # Where SHOULD the records be? The test prompt puts KEY-MID at 1/4 of the log and
+            # KEY-END twenty lines before the end; blocks are `select_block_tokens` long, so this
+            # is exact enough to tell "not ranked" from "ranked but misread".
+            blk = max(1, int(self.select_block_tokens))
+            prompt = int(getattr(orch, "prompt_tokens", 0) or prompt_tokens or 0)
+            mid_block = int((prompt // 4) // blk)
+            end_block = int((prompt - 20 * 17) // blk)
+            sel_blk = sorted({int(p) * self.page_tokens // blk for p in selected})
+            self.log({"kind": "retrieval_check", "req": req,
+                      "prompt": prompt, "block_tokens": blk,
+                      "mid_block": mid_block, "end_block": end_block,
+                      "top_blocks": list(getattr(orch, "last_top_blocks", []) or []),
+                      "selected_blocks": sel_blk[:12] + (["..."] if len(sel_blk) > 12 else []),
+                      "mid_selected": mid_block in sel_blk,
+                      "end_selected": end_block in sel_blk,
+                      "count": len(sel_blk)})
         st_keep = set(st.row) if st.row else old_owned
         self._release_slots(req, st_keep)
         self.log(record)
