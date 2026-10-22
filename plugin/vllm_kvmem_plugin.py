@@ -1151,15 +1151,18 @@ def _install(cls, module_name, probe, smoke, state):
                                 rt.release(gone)
                                 _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                                         {"kind": "released", "req": gone, "pid": os.getpid()})
-                            for req in reqs:
-                                row = rt.view.row_index(req)
-                                if row is None:
-                                    continue
-                                # Only the ROW goes in before the gather (that is what the kernel
-                                # copies); seq_lens/positions are written again after it.
-                                rt.before_step(req, row_index=row,
-                                               position_slots=rt.view.query_position_slots(req),
-                                               rows_only=True)
+                            if _env_flag("KVMEM_PREINSTALL_ROW"):
+                                # Opt-in: install the row before the gather. With compaction limited
+                                # to decode (the shipped default) the row is stable across a step,
+                                # and installing here changes when seq_lens/positions are written,
+                                # which breaks the CUDA-graph topology check with N>1.
+                                for req in reqs:
+                                    row = rt.view.row_index(req)
+                                    if row is None:
+                                        continue
+                                    rt.before_step(req, row_index=row,
+                                                   position_slots=rt.view.query_position_slots(req),
+                                                   rows_only=True)
                 except Exception:
                     _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                             {"kind": "sparse_pre_install_error", "error": traceback.format_exc()})
