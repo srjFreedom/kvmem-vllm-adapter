@@ -1700,3 +1700,32 @@ kvmem: no new tokens … logical=83445 computed=83445 tokens=83441
 **下一步修法（下一轮）**：在 `before_step`/install 之前用**本步**的 `npc` 对一次账：
 `st.seq_len = npc - inflight`（对齐后再 install），并让 `page_shift` 随 `(tokens-seq_len)` 动态更新
 （现在它停在压缩时的 256，已过期）。
+
+### 常驻模式重做（第 16 轮）：seq_len 对账修好单请求长 prompt；N=2 与页对齐分块各有新问题
+
+**修好的一处（保留）**：`before_step` 在 install 之前用**本步**引擎计数对账
+（`book = nlg - n`、`resident = npc - n`、`page_shift` 随之重算），消除了「运行时 seq_len 落后
+一个 chunk」。实测（常驻 + prefill 压缩，84K prompt，单请求）连续 3 次都答对两把 key：
+
+| 次 | 墙钟 | 结果 |
+|---|---|---|
+| 1 | 95.9s | `J J J J7ND4X, GDW2LN`（前缀有噪声，两 key 正确） |
+| 2 | 80.0s | `BF5FCE, GTTPXD` ✅ |
+| 3 | 79.6s | `M85FR3, QX5ZLS` ✅ |
+
+**试了但回退的两处**：
+
+1. **页对齐分块**（让 chunk 边界落在 16 的整数倍，好让 prefill 压缩总能对齐）：
+   N=2 时压缩能触发（4 次），但两个请求都 500：
+   `FULL CUDA graph metadata topology mismatch … num_prefills: runtime=1, captured=0`；
+   N=1 时答案退化成 `S`（错误）。→ 已回退。
+
+2. **N=2 无页对齐**：两个 84K 并发都答对（157s），但 `compact_deferred_align` 14 次、
+   `compact_applied` 0 次——模板前缀把边界推到 `14 mod 16`，对齐门把所有 prefill 压缩挡掉。
+
+**结论**：单请求的常驻长 prompt 已经能压缩且正确；并发下的压缩仍会撞 CUDA graph 批分类
+（压缩后的追赶批被当成 5-token 均匀解码），需要改图分发器对「追赶批」的判定，而不是继续在
+运行时的位置/相位上打补丁。解码期压缩仍被 MTP draft 挡住（本轮两次 `reselect_deferred`）。
+
+现状：站点经典模式运行中；常驻 prefill 压缩 `opt-in`；补丁固定回 `4207168f…`（含 seq_len 对账
+与宽口径 debug）。

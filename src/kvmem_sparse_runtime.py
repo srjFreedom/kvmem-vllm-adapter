@@ -342,6 +342,25 @@ class VllmSparseRuntime:
         # --kvmem-inrequest-compaction off). Retrieval statistics can still be collected.
         if not bool(getattr(self, "inrequest_compaction", False)):
             return None
+        # Reconcile the two views with the ENGINE's own counters for THIS step before installing.
+        # `after_step` can only derive them from the PREVIOUS step's counters (the engine publishes
+        # this step's numbers when prepare_inputs runs, which is now), so the incremental `+= n`
+        # bookkeeping drifts by one chunk exactly at a compaction boundary: measured 81,920 (ours)
+        # vs 83,440 (engine + prompt) on the first decode step after a mid-prefill compaction - the
+        # model attended 1,520 tokens too few, the sampler had no valid logits row and the request
+        # stalled forever. Both engine counters INCLUDE this step's scheduled tokens, so back them
+        # out; the difference between them is exactly the still-uncomputed compaction gap.
+        if st.row and position_slots is not None:
+            _engine_c = self._engine_computed.get(req)
+            _engine_l = self._engine_logical.get(req)
+            _n = len(position_slots)
+            if _engine_c is not None and _engine_l is not None and _n > 0:
+                _book = max(0, int(_engine_l) - _n)
+                _resident = max(0, int(_engine_c) - _n)
+                if _book >= st.tokens or _resident != st.seq_len:
+                    st.tokens = max(int(st.tokens), _book)
+                    st.seq_len = min(_resident, st.tokens)
+                    st.page_shift = (st.tokens - st.seq_len) // max(1, self.page_tokens)
         if not st.row:
             return None
         row_index = req if row_index is None else int(row_index)
