@@ -222,11 +222,13 @@ def _attach_adapter(runner, log_path):
         pages_per_block=pages_per_block,
         ctx_tokens=int(cfg.get("ctx") or 0),
         sink_tokens=int(cfg.get("sink_tokens", 0) or 0),
-        # Lossless long prompts default to "no compaction while prefilling": that path is verified
-        # (80K/170K/N=2 answers exact) while compacting mid-prefill is not (measured: noise from
-        # the first token). The prompt then stays resident up to the engine window, which the
-        # worker sizes to the physical pool. Opt in to the old behaviour with
-        # KVMEM_RESIDENT_PREFILL_COMPACT=1 when working on that path.
+        # Lossless long prompts default to "no compaction while prefilling". The invariant rework
+        # (page-aligned visible, packed rows, RANK-based rotation) is in place and unit-tested, but
+        # a mid-prefill rewind still hands the scheduler a "recompute" batch that the CUDA-graph
+        # dispatcher classifies as a 5-token uniform decode while the attention metadata says
+        # `num_prefills=1` (measured: engine death right after the first prefill compaction). Until
+        # the scheduler-side handshake lands, opt in with KVMEM_RESIDENT_PREFILL_COMPACT=1 only
+        # when working on that path.
         no_prefill_compact=(
             _resident_prefill_on()
             and not _env_flag("KVMEM_RESIDENT_PREFILL_COMPACT")),
@@ -397,11 +399,7 @@ def _attach_sparse(runner, log_path):
         pages_per_block=pages_per_block,
         ctx_tokens=int(cfg.get("ctx") or 0),
         sink_tokens=int(cfg.get("sink_tokens", 0) or 0),
-        # Lossless long prompts default to "no compaction while prefilling": that path is verified
-        # (80K/170K/N=2 answers exact) while compacting mid-prefill is not (measured: noise from
-        # the first token). The prompt then stays resident up to the engine window, which the
-        # worker sizes to the physical pool. Opt in to the old behaviour with
-        # KVMEM_RESIDENT_PREFILL_COMPACT=1 when working on that path.
+        # See the V1 path: prefill compaction stays opt-in until the scheduler handshake lands.
         no_prefill_compact=(
             _resident_prefill_on()
             and not _env_flag("KVMEM_RESIDENT_PREFILL_COMPACT")),

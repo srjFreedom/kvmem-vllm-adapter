@@ -366,13 +366,21 @@ class SparseOrchestrator:
             index.add(int(page), layer, k)
         return block
 
-    def commit_written_page(self, page, slot):
-        """Record a page the ENGINE just wrote at compacted `slot` (live path).
+    def commit_written_page(self, page, slot, rank=None):
+        """Record a page the ENGINE just wrote into physical `slot` at compacted `rank`.
 
-        The engine wrote it at the compacted position (the caller overrode `positions`), so the
-        bytes are baked at `(slot - page)*tokens`; we store them verbatim with that delta.
+        The rotation baked into those bytes is the POSITION shift, not the physical page id: the
+        engine writes at the compacted positions the runtime installs, so a page placed at rank r
+        carries `(r - page) * page_tokens` of RoPE. Using `(slot - page)` instead (the old form) was
+        only correct while `slot == rank`; with the runtime's slot pool (ids allocated from the top
+        of the pool) it recorded an arbitrary delta, `needle()` compared against that same arbitrary
+        value so it always passed, and a later restore rotated the page to the wrong phase - the
+        measured "checker green, answers rot". `rank=None` means identity (the engine wrote at true
+        positions before any compaction), which is the pre-compaction path.
         """
-        delta = (int(slot) - int(page)) * self.page_tokens
+        if rank is None:
+            rank = int(page)
+        delta = (int(rank) - int(page)) * self.page_tokens
         page_bytes = [kv[int(slot)].clone() for kv in self.kvs]
         self.store.put(page, page_bytes)
         self.store_delta[int(page)] = delta
@@ -381,7 +389,7 @@ class SparseOrchestrator:
         self.slot_of[int(page)] = int(slot)
         self.baked_delta[int(page)] = delta
 
-    def restore_page(self, page, slot=None, channel=None, request_id=None):
+    def restore_page(self, page, slot=None, channel=None, request_id=None, rank=None):
         """Bring an evicted page back; without a slot, ask EngineCore for a free block."""
         if slot is None:
             if channel is None:
@@ -392,11 +400,16 @@ class SparseOrchestrator:
         The store keeps the canonical bytes forever, so a restore is exactly ONE rotation hop by
         `needed - store_delta` (never a rotation of a rotation). The control plane - asking the
         scheduler for a free block - is the caller's job; this is the data plane.
+
+        `rank` is the compacted RANK the page is being restored for - that is what decides the RoPE
+        phase; the physical slot id does not. Callers that pass a slot equal to the rank (the unit
+        tests) can omit it.
         """
         page, slot = int(page), int(slot)
         if not self.store.has(page):
             raise RuntimeError(f"cannot restore page {page}: no canonical bytes")
-        needed = (slot - page) * self.page_tokens
+        needed = (int(rank) - page) * self.page_tokens if rank is not None \
+            else (slot - page) * self.page_tokens
         step = needed - self.store_delta.get(page, 0)
         for layer, kv in enumerate(self.kvs):
             dev = self.store.get(page)[layer].to(kv.device, non_blocking=True)

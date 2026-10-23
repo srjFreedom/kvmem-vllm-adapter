@@ -1584,3 +1584,33 @@ draft 砍掉；下一步 `num_new_tokens = num_tokens_with_spec - num_logical` �
 | 补丁 / 树哈希 | `--check-tree` ✅（`patch_sha256 58a987c0…`，`tree a59c7ce2…`） |
 
 常驻模式（压缩开）仍保持强制关闭前缀缓存：块哈希按逻辑 token、KV 布局是压缩后的，两者不兼容。
+
+### 常驻模式重做（第 12 轮）：不变量落地，prefill 压缩仍被调度器握手挡住
+
+**本轮修掉的真问题（P1，已进补丁 `89cdaf01`→`95047358`）**：
+
+| 缺陷 | 位置 | 修法 |
+|---|---|---|
+| 压缩后「可见长度」不是整页，尾页被拆到两个 rank，任何单值 RoPE 相位都描述不了 | `_reselect` 的 `seq_len` | 压缩只允许发生在逻辑前沿按页对齐时（`compact_deferred_align`），`seq_len = n*page`，并新增 `page_shift` |
+| 行增长用 `logical = len(grown)`，只在 shift 为 0 时成立 | `after_step` | 按 `rank + page_shift` 取页 |
+| 写入页的旋转记为 `(物理 slot - page)`，而真实烘焙的是 `(rank - page)`；`needle()` 用同一个错值自校验，所以「检查全绿、答案腐烂」 | `commit_written_page` / `restore_page` | delta 改为按 RANK；`needle` 增加 `rot_ok`：逐页核对 `baked_delta == (rank-page)*page` 且 `slot_of == row[rank]` |
+| `_own_pages` 把行按 101 页量化截断，压缩后的 packed 行会丢掉尾页 | `_own_pages` | 只有引擎原始行才按量子截断，packed 行原样返回 |
+
+**新增测试**：`tests/resident_invariants_test.py`（I1 对齐、I2 尾页/下一 rank、I3 shift、I4 写入 delta、未对齐压缩被延后），离线套件 **43/43 ✅**。
+
+**实机验证**（常驻模式，`KVMEM_RESIDENT_PREFILL_COMPACT=0`）：
+83,448-token prompt，两把 key 都答对（80.8s）——说明 P1 没有退化 0.2.2 的能力。
+
+**被挡住的部分（P3 prefill 期压缩）**：打开后第一次压缩就崩：
+`FULL CUDA graph metadata topology mismatch … num_prefills: runtime=1, captured=0`。
+定位：压缩把 `num_computed` 回退后，调度器排出的下一步是一个「无 draft 的 5-token 批」
+（`num_scheduled_tokens=5`、`scheduled_spec_decode_tokens={}`），
+attention 元数据按「computed < prompt」判成 prefill，而图分发器按「5 == 1+4 draft」的均匀解码
+选了 FULL 图 → 拓扑不匹配。根因是两个「prefill 进度」口径在回退后不再一致
+（`num_computed_prefill_tokens` / `prefill_len` 与 `num_computed`），
+不是 P1 的相位/映射问题。
+
+**下一阶段要做的事**：把压缩决策从 worker 的 `after_step` 移到 EngineCore 的步边界——
+调度器在「本轮 drafts 已结算、下一步未排」时下发压缩指令，worker 在下一步的 `prepare_inputs`
+执行块表改写并回执；这样既不会被 draft 撞上，也不会产生那 5-token 的畸形批。
+在此之前 `KVMEM_RESIDENT_PREFILL_COMPACT` 保持 opt-in（默认关）。
