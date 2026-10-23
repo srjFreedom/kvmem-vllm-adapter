@@ -1729,3 +1729,27 @@ kvmem: no new tokens … logical=83445 computed=83445 tokens=83441
 
 现状：站点经典模式运行中；常驻 prefill 压缩 `opt-in`；补丁固定回 `4207168f…`（含 seq_len 对账
 与宽口径 debug）。
+
+### 仓库默认改回经典模式（第 17 轮）：别人拉下去就能命中前缀缓存
+
+**背景**：仓库默认脚本 `deploy/run-kvmem-vllm.sh` 之前默认
+`INREQUEST_COMPACTION=1` + `KVMEM_ENTRY_RESIDENT_PREFILL=1`（常驻压缩开），worker 据此
+**强制关闭前缀缓存**（`backends/vllm/worker.py`：压缩布局与逻辑 token 哈希不兼容）。
+也就是说别人拉仓库跑默认脚本，前缀缓存**命中不了**；只有站点脚本显式设 0 才走经典。
+而本周实测：常驻压缩在并发下压缩被对齐门挡住（`compact_applied` 0 次）、MTP 解码期
+压缩不触发（draft 槽位未回滚）——省显存的收益只在单请求长 prompt 上兑现，前缀缓存却
+整条丢了。
+
+**改动**（用户拍板选 A）：
+
+| 文件 | 改动 |
+|---|---|
+| `deploy/run-kvmem-vllm.sh` | `INREQUEST_COMPACTION` / `KVMEM_ENTRY_RESIDENT_PREFILL` 默认 `1` → `0`（经典），注释说明常驻为 opt-in |
+| `docs/PARAMETERS.md` | `--kvmem-inrequest-compaction` 默认 **开** → **关**；`KVMEM_ENTRY_RESIDENT_PREFILL` 默认 `1` → `0`（随内压缩自动打开） |
+
+**验证**：`bash -n` 通过；`DRYRUN=1` 输出确认默认不带 `--kvmem-inrequest-compaction`
+（第 110 行仅 `=1` 时追加）；worker 仅在该 flag 存在时强制关前缀缓存 → 默认启动 =
+经典模式 + 前缀缓存开，与站点生产同款（8.6K 热启动 2.3s、cached 6464 已验证）。
+
+**现状**：仓库默认 = 经典（有缓存、稳定）；常驻压缩仍是 opt-in（`INREQUEST_COMPACTION=1`），
+并发/解码期压缩的修复（图分发器对追赶批的判定 + MTP draft 回滚）仍未完成。
