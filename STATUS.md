@@ -1675,3 +1675,28 @@ kvmem: no new tokens … logical=83445 computed=83445 tokens=83441
 对齐 sampler 期望的 logits 行区间；修好后再看是否需要调度器回滚在途 draft。
 
 现状：站点经典模式运行中（压缩关、前缀缓存开），`KVMEM_RESIDENT_PREFILL_COMPACT` 仍 opt-in。
+
+### 常驻模式重做（第 15 轮）：宽口径 debug 对比出「运行时 seq_len 落后引擎 computed 一个 chunk」
+
+`KVMEM_DEBUG_POS` 现在每步同时打印：`positions`、`seq_len_buf`、`npc`（引擎 computed）、
+`nlg`（服务计数）、`plen`、`st_tokens/st_seq/st_shift`、`row_len/row_pages/spare`、`inflight`、`spec`。
+这样相邻两步可以直接对照。压缩前后的关键对比：
+
+| 步 | n | positions[0] | seq_len_buf | npc | nlg | plen | st_tokens | st_seq | row_len |
+|---|---|---|---|---|---|---|---|---|---|
+| prefill | 4096 | 69632 | 73728 | 73728 | 73728 | 83440 | 69632 | 69632 | 4352 |
+| prefill | 1520 | 77824 | 79344 | 81920 | 81920 | 83440 | 77824 | 77824 | 4864 |
+| **首个 decode** | 5 | 81920 | **81925** | **83440** | 83440 | 83440 | 81920 | **81920** | 5120 |
+
+结论：首个 decode 步里运行时认为「可见 81,920 token」，而引擎与 prompt 都是 **83,440**
+（差 1,520 = 最后一个 prefill chunk）。运行时用 `81925` 覆盖了 `seq_lens`、把 query 放在
+`81920..81924`，模型只看到 81,920 token，采样器按 `query_end` 取不到有效的 logits 行 →
+`prompt served but no sampled token` → 调度器 `num_new_tokens` 变负 → 永久卡住。
+
+**根因**：`after_step` 用 `_engine_computed`（上一步的值）回推 `seq_len`，而 `note_engine_computed`
+是在本步的 `prepare_inputs` 里才更新的 → `seq_len` 永远落后一个 chunk；平时被 `+= n_new_tokens`
+掩盖，但压缩后那一步的 `n` 与 chunk 长度不一致时就暴露成 1,520 的缺口。
+
+**下一步修法（下一轮）**：在 `before_step`/install 之前用**本步**的 `npc` 对一次账：
+`st.seq_len = npc - inflight`（对齐后再 install），并让 `page_shift` 随 `(tokens-seq_len)` 动态更新
+（现在它停在压缩时的 256，已过期）。

@@ -1195,9 +1195,15 @@ def _install(cls, module_name, probe, smoke, state):
                         if idx is not None and pos is not None and reqs_d and counts_d is not None:
                             csl = _npd.concatenate(([0], _npd.cumsum(
                                 _npd.asarray(counts_d, dtype=_npd.int64))))
+                            _rt_d = state.get("sparse")
+                            _plen = getattr(getattr(self, "req_states", None), "prompt_len", None)
+                            _plnp = getattr(_plen, "np", None)
                             for _i, _req in enumerate(reqs_d):
                                 _r = int(idx[_i])
                                 _p0, _p1 = int(csl[_i]), int(csl[_i + 1])
+                                _st = _rt_d.state(_req) if _rt_d is not None else None
+                                _row = (list(_st.row[:4]) + ["..."] + list(_st.row[-2:])
+                                        if _st is not None and _st.row else [])
                                 _append(smoke or probe or "/tmp/kvmem_sparse.jsonl", {
                                     "kind": "debug_pos", "pid": os.getpid(), "req": _req,
                                     "row": _r, "n": _p1 - _p0,
@@ -1208,6 +1214,24 @@ def _install(cls, module_name, probe, smoke, state):
                                             else None),
                                     "nlg": (int(nlg_d[_r]) if nlg_d is not None and _r < len(nlg_d)
                                             else None),
+                                    # Wider context so two adjacent steps can be compared directly:
+                                    # the runtime's own counters, the installed row and the engine's
+                                    # prompt length. A step whose seq_len_buf disagrees with `st_seq`
+                                    # is one where the engine's install won.
+                                    "plen": (int(_plnp[_r]) if _plnp is not None
+                                             and _r < len(_plnp) else None),
+                                    "st_tokens": (int(_st.tokens) if _st is not None else None),
+                                    "st_seq": (int(_st.seq_len) if _st is not None else None),
+                                    "st_shift": (int(getattr(_st, "page_shift", 0))
+                                                 if _st is not None else None),
+                                    "row_len": (len(_st.row) if _st is not None and _st.row
+                                                else 0),
+                                    "row_pages": [int(v) for v in _row if v != "..."],
+                                    "spare": (int(_st.spare) if _st is not None
+                                              and _st.spare is not None else None),
+                                    "inflight": int((getattr(_rt_d, "_inflight", {}) or {})
+                                                    .get(_req, 0) or 0),
+                                    "spec": bool(_req in (getattr(_rt_d, "spec_reqs", None) or ())),
                                 })
                     except Exception:
                         pass
