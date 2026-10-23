@@ -710,7 +710,7 @@ index 87fdbfb164..374c481070 100644
      # Version of dataclass repr with token IDs obfuscated.
      def anon_repr(self) -> str:
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 253ea9d3ea..66997f53fa 100644
+index 253ea9d3ea..8d0b8ad35c 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -129,6 +129,21 @@ class Scheduler(SchedulerInterface):
@@ -892,23 +892,27 @@ index 253ea9d3ea..66997f53fa 100644
          if request.spec_token_ids:
              request.spec_token_ids = []
          # Async scheduling: mark all in-flight output as stale. Its tokens are
-@@ -1736,11 +1797,33 @@ class Scheduler(SchedulerInterface):
+@@ -1736,11 +1797,37 @@ class Scheduler(SchedulerInterface):
          for req_id, num_scheduled_token in num_scheduled_tokens.items():
              request = self.requests[req_id]
              request.num_computed_tokens += num_scheduled_token
-+            request.num_logical_tokens += num_scheduled_token
-+            # KVMem invariant: the served count tracks the RESIDENT count exactly, and the only
-+            # legitimate difference is the compaction offset (set when a compaction rewinds
-+            # `num_computed_tokens`). The previous clamp (`num_logical <= num_tokens - 1`) was
-+            # applied to the POST-increment value, so on every decode step it dropped the drafts
-+            # that were just scheduled: `num_new_tokens = tokens - served` then grew by that
-+            # deficit, the scheduler passed MORE candidate tokens than the request holds, and the
-+            # model was fed undefined ids at overlapping positions (measured: 18-token prompt,
-+            # greedy, coherent for ~2 steps then a repetition loop; the same prompt is clean with
-+            # compaction off).
++            # KVMem invariant: `num_computed_tokens` is the RESIDENT KV book and
++            # `num_logical_tokens` the SERVED count. A compaction rewinds the resident book and
++            # leaves a gap that the engine RE-COMPUTES; those tokens were already served, so the
++            # gap shrinks by exactly the recomputed amount while the served count stays put:
++            #   offset <- offset - min(offset, scheduled);  logical <- computed + offset
++            # (offset == 0 outside a catch-up, which makes the second line a no-op identity).
++            # Deriving `logical` every step also heals any drift the spec bookkeeping introduces -
++            # without it a 4-token drift made `num_new_tokens` negative and the request stalled
++            # forever after the first compaction.
 +            if self.kvmem_resident:
 +                _offset = int(getattr(request, "num_kvmem_offset", 0) or 0)
-+                request.num_logical_tokens = request.num_computed_tokens + _offset
++                if _offset > 0:
++                    request.num_kvmem_offset = max(0, _offset - num_scheduled_token)
++                request.num_logical_tokens = request.num_computed_tokens + \
++                    int(request.num_kvmem_offset)
++            else:
++                request.num_logical_tokens += num_scheduled_token
              request.num_in_flight_tokens += num_scheduled_token
              if self.defer_block_free:
                  # Record the in-flight step, to fence deferred block freeing.
@@ -927,7 +931,7 @@ index 253ea9d3ea..66997f53fa 100644
                  request.num_tokens + request.num_output_placeholders
              )
              scheduler_output.has_structured_output_requests |= (
-@@ -1828,6 +1911,7 @@ class Scheduler(SchedulerInterface):
+@@ -1828,6 +1915,7 @@ class Scheduler(SchedulerInterface):
          new_block_ids: list[tuple[list[int], ...] | None] = []
          all_token_ids: dict[str, list[int]] = {}
          num_computed_tokens: list[int] = []
@@ -935,7 +939,7 @@ index 253ea9d3ea..66997f53fa 100644
          num_output_tokens: list[int] = []
          resumed_req_ids = set()
  
-@@ -1860,6 +1944,7 @@ class Scheduler(SchedulerInterface):
+@@ -1860,6 +1948,7 @@ class Scheduler(SchedulerInterface):
                  req_to_new_blocks[req_id].get_block_ids(allow_none=True)
              )
              num_computed_tokens.append(req.num_computed_tokens)
@@ -943,7 +947,7 @@ index 253ea9d3ea..66997f53fa 100644
              num_output_tokens.append(
                  req.num_output_tokens + req.num_output_placeholders
              )
-@@ -1871,6 +1956,7 @@ class Scheduler(SchedulerInterface):
+@@ -1871,6 +1960,7 @@ class Scheduler(SchedulerInterface):
              all_token_ids=all_token_ids,
              new_block_ids=new_block_ids,
              num_computed_tokens=num_computed_tokens,
@@ -951,7 +955,7 @@ index 253ea9d3ea..66997f53fa 100644
              num_output_tokens=num_output_tokens,
          )
  
-@@ -2179,6 +2265,22 @@ class Scheduler(SchedulerInterface):
+@@ -2179,6 +2269,22 @@ class Scheduler(SchedulerInterface):
                  sampled_token_ids[req_index] if sampled_token_ids else []
              )
  
@@ -974,7 +978,7 @@ index 253ea9d3ea..66997f53fa 100644
              scheduled_spec_token_ids = (
                  scheduler_output.scheduled_spec_decode_tokens.get(req_id)
              )
-@@ -2196,6 +2298,11 @@ class Scheduler(SchedulerInterface):
+@@ -2196,6 +2302,11 @@ class Scheduler(SchedulerInterface):
                  if not output_is_stale:
                      if request.num_computed_tokens > 0:
                          request.num_computed_tokens -= num_rejected
@@ -986,7 +990,7 @@ index 253ea9d3ea..66997f53fa 100644
                      if request.num_output_placeholders > 0:
                          request.num_output_placeholders -= num_rejected
                  spec_decoding_stats = self.make_spec_decoding_stats(
-@@ -2246,7 +2353,7 @@ class Scheduler(SchedulerInterface):
+@@ -2246,7 +2357,7 @@ class Scheduler(SchedulerInterface):
                  stopped = True
              elif (
                  self.is_mm_encoder_only
@@ -995,7 +999,7 @@ index 253ea9d3ea..66997f53fa 100644
              ):
                  # An encoder instance runs the encoder and publishes the
                  # embeddings instead of sampling, so it stops as soon as the
-@@ -2577,7 +2684,13 @@ class Scheduler(SchedulerInterface):
+@@ -2577,7 +2688,13 @@ class Scheduler(SchedulerInterface):
  
              # Check for stop and update request state.
              # This must be called before we make the EngineCoreOutput.
@@ -1010,7 +1014,7 @@ index 253ea9d3ea..66997f53fa 100644
              if stopped:
                  del new_token_ids[num_new:]  # Trim new tokens if needed.
                  break
-@@ -3005,6 +3118,16 @@ class Scheduler(SchedulerInterface):
+@@ -3005,6 +3122,16 @@ class Scheduler(SchedulerInterface):
          connector_stats_payload = (
              kv_connector_stats.to_dict() if kv_connector_stats else None
          )
@@ -1027,7 +1031,7 @@ index 253ea9d3ea..66997f53fa 100644
          return SchedulerStats(
              num_running_reqs=len(self.running),
              num_waiting_reqs=len(self.waiting),
-@@ -3017,6 +3140,8 @@ class Scheduler(SchedulerInterface):
+@@ -3017,6 +3144,8 @@ class Scheduler(SchedulerInterface):
              kv_connector_stats=connector_stats_payload,
              cudagraph_stats=cudagraph_stats,
              perf_stats=perf_stats,
@@ -1036,7 +1040,7 @@ index 253ea9d3ea..66997f53fa 100644
          )
  
      def make_spec_decoding_stats(
-@@ -3322,6 +3447,7 @@ class Scheduler(SchedulerInterface):
+@@ -3322,6 +3451,7 @@ class Scheduler(SchedulerInterface):
                      marked_invalid_block_ids |= request_invalid_block_ids
                      total_affected_tokens += req_num_computed_tokens
                      request.num_computed_tokens = 0

@@ -1614,3 +1614,37 @@ attention 元数据按「computed < prompt」判成 prefill，而图分发器按
 调度器在「本轮 drafts 已结算、下一步未排」时下发压缩指令，worker 在下一步的 `prepare_inputs`
 执行块表改写并回执；这样既不会被 draft 撞上，也不会产生那 5-token 的畸形批。
 在此之前 `KVMEM_RESIDENT_PREFILL_COMPACT` 保持 opt-in（默认关）。
+
+### 常驻模式重做（第 13 轮）：调度器侧「重算间隙」语义 —— 崩溃变卡住，还差自旋回滚
+
+**改了什么**（进补丁 `5be8bfbc`）：`_update_after_schedule` 里把 `num_logical` 的推进改成
+「间隙收缩」模型，而不是自由累加：
+
+```
+offset  <- offset - min(offset, scheduled)      # 压缩回退留下的重算量
+logical <- computed + offset                    # 每步重新推导，顺带自愈漂移
+```
+
+理由：压缩回退 `num_computed` 之后，引擎要把这段 token **重算**；它们早就服务过了，
+所以重算只能推进常驻计数，不能推进服务计数。之前的写法（`logical = computed + offset` 但 offset 不变）
+会在追赶阶段把服务计数抬高整整一个回退量。
+
+**实测（常驻 + `KVMEM_RESIDENT_PREFILL_COMPACT=1`，83K prompt）**：
+
+| 版本 | 结果 |
+|---|---|
+| 自由累加（0.2.2 原式） | 崩溃：`FULL CUDA graph ... num_prefills: runtime=1, captured=0` |
+| 只加 debt（不回写 offset） | 不崩，但请求永久卡住：`logical=83454 > tokens=83450` → `num_new_tokens < 0` |
+| 间隙收缩（本轮） | 不崩，仍卡住：`computed=83451 > tokens=83447`（**超出 4 = MTP draft 数**），`num_new_tokens < 0` |
+
+**根因（已定位到数字）**：压缩回退时，本步已经排进去的 draft 槽位（`1+4`）仍记在
+`num_computed` 里；回退/重算之后这些槽位没有对应的真实 token，于是 `computed` 最终比
+`num_tokens` 多 4，`num_new_tokens = tokens + placeholders - logical` 变负，请求再也排不上。
+
+**下一步（下一轮做）**：压缩必须由 EngineCore 在**步边界**发起，并在同一处把在途 draft 一起回滚：
+调度器先 cancels `spec_token_ids` + `num_output_placeholders`、清 `in_flight`，再下发
+`compact(visible)`；worker 在下一步 `prepare_inputs` 执行块表改写并回执。这样
+`computed`、`tokens`、`logical` 三者不会出现「重算超出书」的窗口。
+
+现状：`KVMEM_RESIDENT_PREFILL_COMPACT` 保持 opt-in，站点跑经典模式（压缩关、前缀缓存开），
+8.6K 第二次命中 6464（5.94s → 2.06s）✅。
