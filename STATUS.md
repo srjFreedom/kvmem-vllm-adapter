@@ -1648,3 +1648,30 @@ logical <- computed + offset                    # 每步重新推导，顺带自
 
 现状：`KVMEM_RESIDENT_PREFILL_COMPACT` 保持 opt-in，站点跑经典模式（压缩关、前缀缓存开），
 8.6K 第二次命中 6464（5.94s → 2.06s）✅。
+
+### 常驻模式重做（第 14 轮）：调试日志把卡死点定位到「压缩后的第一个 decode 步没有采样 token」
+
+打开 `KVMEM_DEBUG_SCHED=1` 后，调度器每步打印六个计数。83K prompt、压缩开，最后的序列是：
+
+```
+computed=81920 logical=81920 tokens=83440 sched=4096   # 倒数第二个 prefill chunk
+computed=83440 logical=83440 tokens=83440 sched=1520   # 最后一个 chunk，prompt=83440
+computed=83445 logical=83445 tokens=83441 sched=5      # 第一个 decode 步：1 + 4 draft 槽
+kvmem: prompt served but no sampled token … scheduled=5 placeholders=0
+kvmem: no new tokens … logical=83445 computed=83445 tokens=83441
+```
+
+结论：
+1. **间隙收缩是对的**：压缩发生在 65536（下一步 `computed=57344 logical=65536`），随后
+   `57344→61440→65536` 追赶期间 `logical` 纹丝不动，追平后恢复正常 —— 之前“服务计数被抬高”的问题消失了。
+2. 卡死的真正位置是**压缩之后第一个 decode 步**：调度器排了 5 个 KV 槽，模型跑完后
+   **没有产出采样 token**（`prompt served but no sampled token`），于是书只从 83440 长到 83441，
+   而 `computed` 按 5 个槽记到 83445 → `num_new_tokens = tokens + ph - logical = -4`，请求永久排不上。
+3. 没有采样 token 说明压缩后的**注意力元数据/位置窗口**在 prefill→decode 交界处不满足采样器要求
+   （sampler 按 `[query_end-(drafts+bonus), query_end)` 取 logits 行），也就是 P1 的
+   `_install`/`seq_len` 在“追赶完成后的第一步”仍有偏差——不是调度器计数问题。
+
+**下一步**：抓这一笔的 `prepare_inputs` 侧的 `seq_len/positions/row`（`KVMEM_DEBUG_POS=1` 已有），
+对齐 sampler 期望的 logits 行区间；修好后再看是否需要调度器回滚在途 draft。
+
+现状：站点经典模式运行中（压缩关、前缀缓存开），`KVMEM_RESIDENT_PREFILL_COMPACT` 仍 opt-in。
