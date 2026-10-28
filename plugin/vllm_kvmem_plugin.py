@@ -1567,9 +1567,20 @@ def _install(cls, module_name, probe, smoke, state):
                                 # chunk folds into bucket sums instead. Without this guard the
                                 # prefill deltas were folded as "decode rows" and written at
                                 # positions past the prompt (measured: take=3232 at first=53580).
-                                if _prev is not None and _now > _prev and int(_n) <= 8:
-                                    _rt.harvest_decode_rows(_req, _now - _prev)
+                                _was_decode = bool((state.get("was_decode") or {}).get(_req))
+                                # Fold only when the PREVIOUS step was a decode step: the step that
+                                # follows the last prefill chunk carries that chunk's delta, which
+                                # the prefill path already wrote - folding it too overshot the
+                                # frontier by exactly one chunk (measured: 32823 vs 27730).
+                                # A decode step can accept at most 1 + num_spec tokens, so a delta
+                                # larger than that is a prefill chunk that the prefill path already
+                                # wrote; folding it made the frontier overshoot by exactly one chunk
+                                # (measured: +1868 and +5100 before this bound).
+                                _delta = (_now - _prev) if _prev is not None else 0
+                                if (0 < _delta <= 8 and int(_n) <= 8 and _was_decode):
+                                    _rt.harvest_decode_rows(_req, _delta)
                                 state.setdefault("computed_before", {})[_req] = _now
+                                state.setdefault("was_decode", {})[_req] = int(_n) <= 8
                     except Exception:
                         pass
                     _rt.advance_tokens(_req, int(_n))
