@@ -1784,6 +1784,11 @@ class VllmSparseRuntime:
                         _rebuild = False
                 res = ch.compact(req, selected, self.page_tokens,
                                  visible_tokens=int(st.seq_len), rebuild=_rebuild)
+                if _rebuild and isinstance(res, dict) and res.get("rebuild"):
+                    # One reconstruction per request: repeating it re-prefills the compacted
+                    # sequence again and again (measured: compact_rebuilt fired twice with
+                    # 36864 then 32768 tokens before the engine tripped an assert).
+                    _st_r.rebuilt = True
                 if isinstance(res, dict):
                     record["compact_applied"] = bool(res.get("ok"))
                     record["compact_truncated"] = bool(res.get("truncated"))

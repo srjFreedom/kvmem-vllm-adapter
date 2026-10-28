@@ -1336,6 +1336,8 @@ def register():
             # books disagree after the first compaction and the scheduler over-schedules.
             req.num_kvmem_offset = int(getattr(req, "num_logical_tokens", 0)) \
                 - int(req.num_computed_tokens)
+            if rebuild and request_id in _rebuilt_requests:
+                return {"ok": True, "truncated": True, "rebuild": True, "skipped": "already rebuilt"}
             if rebuild:
                 # RECONSTRUCTION (upstream's CheckpointPurpose::Reconstruction): rewrite the
                 # request's token book to the COMPACTED sequence and rewind both counters to zero,
@@ -1355,10 +1357,11 @@ def register():
                         req.num_computed_tokens = 0
                         req.num_logical_tokens = 0
                         req.num_kvmem_offset = 0
-                        _compact_state[request_id] = 0
+                        _compact_state[request_id] = visible      # peer message sees "already applied"
                         _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
                                 {"kind": "compact_rebuilt", "req": request_id,
                                  "pages": len(pages), "tokens": len(new_ids)})
+                        _rebuilt_requests.add(request_id)
                         return {"ok": True, "truncated": True, "rebuild": True,
                                 "tokens": len(new_ids)}
                 except Exception:
@@ -1385,6 +1388,7 @@ def register():
         # request_id -> visible length of the last applied compaction (TP-rank idempotency).
         _compact_state = {}
         _replay_state = {}       # request_id -> visible length of the last applied replay
+        _rebuilt_requests = set()  # requests whose token book was rewritten (reconstruction)
         # request ids already examined for a resume (a waiting request is looked at once).
         _resume_decided = set()
 
