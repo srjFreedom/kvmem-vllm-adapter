@@ -1489,6 +1489,36 @@ def _install(cls, module_name, probe, smoke, state):
                     # buckets this step correctly (device tensor -> CUDA graph replays it live).
                     if getattr(_rt, "stats_core", False):
                         _rt.publish_position_offset(_req)
+                    # Book-consistency probe for the beyond-pool prefill path: after a compaction the
+                    # engine schedules the next chunk from its LOGICAL pointer while its RESIDENT
+                    # length is the compacted one, and the row must cover both. Log the three numbers
+                    # for the first steps so a divergence is visible instead of showing up as a
+                    # FlashInfer fault deep in the kernel.
+                    try:
+                        _cs = getattr(runtime, "_cmp_logged", None)
+                        if _cs is None:
+                            runtime._cmp_logged = _cs = [0]
+                        if _cs[0] < 24:
+                            _st2 = _rt.state(_req)
+                            _rs = getattr(self, "req_states", None)
+                            _comp = _logi = -1
+                            if _rs is not None:
+                                try:
+                                    _idx = int(_rs.req_id_to_index.get(_req, 0)) \
+                                        if hasattr(_rs, "req_id_to_index") else 0
+                                    _comp = int(_rs.num_computed_tokens_np[_idx])
+                                    _logi = int(_rs.num_logical_tokens_np[_idx])
+                                except Exception:
+                                    pass
+                            _cs[0] += 1
+                            _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                    {"kind": "book", "req": str(_req)[:8], "n": int(_n),
+                                     "computed": _comp, "logical": _logi,
+                                     "rt_tokens": int(getattr(_st2, "tokens", 0)),
+                                     "rt_seq_len": int(getattr(_st2, "seq_len", 0)),
+                                     "row": len(getattr(_st2, "row", ()))})
+                    except Exception:
+                        pass
                     # Adapter half of the position split: RoPE keeps the TRUE position (the engine's
                     # own `positions`), the WRITE address uses the compacted one. `kvmem_slot_offset`
                     # is a 0-dim device tensor so a CUDA graph replays the live value; 0 (no
