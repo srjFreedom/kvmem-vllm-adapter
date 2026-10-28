@@ -104,7 +104,7 @@ RUN=(env MAX_NUM_SEQS="$N" \
     --kvmem-sink-tokens "$SINK" --kvmem-recent-tokens "$RECENT" \
     --kvmem-sessions "$SESSIONS" --kvmem-host-mib "$HOST_MIB" \
     --kvmem-capture-tokens "$CAPTURE_TOKENS" \
-    --kvmem-block-tokens 32 \
+    --kvmem-block-tokens "${SELECT_BLOCK_TOKENS:-32}" \
     --no-kvmem-lrfu \
     --kvmem-score-aggregation mean --kvmem-retrieval)
 if [ "$INREQUEST_COMPACTION" = "1" ]; then RUN+=(--kvmem-inrequest-compaction); fi
