@@ -1,6 +1,6 @@
 # kvmem-vllm 适配器交付说明（v0.19 对齐）
 
-更新：2026-10-29
+更新：2026-10-29（第 25 轮）
 
 ## 一、这一版是什么
 
@@ -62,3 +62,39 @@ PORT=18200 ./deploy/run-kvmem-vllm.sh
 | 实时执行 | 写 `/tmp/kvmem_console.py`，引擎下一步在 worker 内执行；可读 `runtime/orch/stats/bridge/runner` |
 | 热重载 | `touch /tmp/kvmem_reload.request` → 下一个 prompt 边界 reload 并 rebind（纯 Python 改动免重启） |
 | 探针 | `/tmp/kvmem_sparse.jsonl`（`book`/`reselect`/`compact_applied`/`statistics_final`/`core_scores`/`scores_unavailable` …） |
+
+
+## 六、超池路径的当前边界（2026-10-29 第 25 轮实测，最权威的一条）
+
+**能服务的最大常驻长度**（任何压缩都不发生）受"池 − R − 一个 chunk"约束：
+
+```
+num_gpu_blocks = 126 × block 1616 = 203,616 token   （池）
+max_model_len  = auto（KVMEM_ENTRY_RESIDENT_PREFILL=1 时 = 池）
+```
+
+实测：
+
+| prompt | B | 结果 |
+|---|---|---|
+| 88,256 | 131,072 | ✅ 答案 `ZX-4417` |
+| 95,356 | 36,864（prefill 期压缩） | ✅ HTTP 200、引擎存活（曾崩） |
+| 190,204 | 196,000（不压缩） | ❌ 4 次 preempt → `illegal memory access` |
+| 201,360 | 36,864 / 172,000 / 199,000 | ❌ 同上前提 |
+
+也就是说：**只要调度器在 prefill 期间发生抢占，就会崩**；而 190K+ 的 prompt 在本机
+（池 203.6K、R 16K、chunk 4K）必然挤到抢占。压缩路径（prefill 期）另有非法访问，两件事都
+还没解决。
+
+### 已经排除/已修的（都不构成当前故障）
+
+- 行的长度、写地址、page id 范围、重复页（全部检查通过）
+- 引擎块列表未接管 → **已修**（池空闲块 74 → 100~116）
+- 块表写入游标未重置 → **已修**（`exceeds row capacity (11514 > 11312)` 消失）
+- 统计路径、投机解码、位置偏移（均已单独隔离，不是原因）
+
+### 结论
+
+超池要真正打通，需要解决 **prefill 期的抢占路径**（本 fork 下抢占 = 重算，重算面对压缩过的行
+会越界），这与"prompt 不受显存限制"是同一件事的两面。压缩本身（prefill 末）是可用的：58K 实测
+`mid_selected=True` 且答案含 `ZX-4417`。
