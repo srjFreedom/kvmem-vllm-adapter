@@ -1504,6 +1504,10 @@ def _install(cls, module_name, probe, smoke, state):
                             _buf = _t.zeros((), dtype=_t.int64, device="cuda")
                             self._kvmem_slot_offset = _buf
                         _buf.fill_(_off)
+                        # One offset, two consumers: RoPE adds it (true position) and the slot
+                        # mapping subtracts it (compacted write address). Both are device scalars so
+                        # CUDA graphs replay the live value.
+                        self.kvmem_rope_offset = _buf
                         self.kvmem_slot_offset = _buf
                     except Exception:
                         self.kvmem_slot_offset = None

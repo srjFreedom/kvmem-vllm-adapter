@@ -544,7 +544,10 @@ class SparseOrchestrator:
         # arrive here; this one is already known to survive it.
         if os.environ.get("KVMEM_STATS", "").strip().lower() not in ("core", "1", "on"):
             return
-        if os.environ.get("KVMEM_SCORER_COMPARE", "1") != "1":
+        # OFF by default now: it was the gate that proved the core scorer matches the shipped index
+        # (rank_corr 0.69-0.77), and each attempt copies the whole query window of every layer
+        # (~50 MiB) to host - which is exactly what exhausted the pinned allocator at 128K.
+        if os.environ.get("KVMEM_SCORER_COMPARE", "0") != "1":
             return
         # The counter is per ORCHESTRATOR and an orchestrator can serve several requests (parked
         # sessions are reused), so a low cap silently ended the audit while everything else looked
