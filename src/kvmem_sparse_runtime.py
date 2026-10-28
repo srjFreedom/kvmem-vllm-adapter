@@ -35,6 +35,10 @@ class RunnerView:
         raise NotImplementedError
 
 
+class _SkipSeqFromRow(Exception):
+    """Internal: this experiment is switched off."""
+
+
 class _ReqState:
     # row:      PHYSICAL slot ids written into the block table (what the kernel reads).
     # logical:  logical page id (true token page) occupying each row position, so a written
@@ -1047,6 +1051,11 @@ class VllmSparseRuntime:
             # seq_len=90112 while the engine was at 42114) - the kernel then masked/indexed against
             # a length the row does not have, which is the repetition seen on >B prompts.
             try:
+                # OFF by default: re-deriving the attention length from the row every step changed
+                # behaviour on the known-good 58K path (mid_selected=False, then repetition), so it
+                # stays an experiment until the books are unified properly.
+                if not bool(getattr(self, "seq_from_row", False)):
+                    raise _SkipSeqFromRow
                 covered = len(st.row) * max(1, self.page_tokens)
                 target = min(int(getattr(st, "tokens", 0)) + n, covered)
                 if target > 0 and int(getattr(st, "seq_len", 0)) != target:
@@ -1055,6 +1064,8 @@ class VllmSparseRuntime:
                         self.log({"kind": "seq_len_from_row", "req": req,
                                   "seq_len": int(target), "row": len(st.row),
                                   "tokens": int(getattr(st, "tokens", 0)), "n": n})
+            except _SkipSeqFromRow:
+                pass
             except Exception:
                 pass
             if added and self.log is not None:
