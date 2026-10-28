@@ -1209,6 +1209,54 @@ def register():
             blocks = mgr.block_pool.get_new_blocks(int(count))
             return [int(getattr(b, "block_id", b)) for b in blocks]
 
+        def _replay(request_id, visible_tokens, replay_tokens):
+            """KVMem QueryReplay: rewind BOTH books so the engine re-schedules the tail.
+
+            Prefill-time compaction keeps sink+newest only (no query exists yet), so the tokens
+            prefilled while the middle was evicted saw an approximate history. Once the query-driven
+            reselect has installed the real working set, rewinding `num_computed_tokens` (resident)
+            and `num_logical_tokens` (served) by N makes the scheduler prefill those N tokens again -
+            against the full B - refreshing their KV and the recurrent state just before sampling.
+            """
+            scheduler = _channel_state.get("scheduler")
+            if scheduler is None or not request_id:
+                return {"ok": False, "error": "no scheduler"}
+            req = None
+            for r in list(getattr(scheduler, "running", []) or []):
+                if getattr(r, "request_id", None) == request_id:
+                    req = r
+                    break
+            if req is None:
+                req = (getattr(scheduler, "requests", None) or {}).get(request_id)
+            if req is None:
+                return {"ok": False, "error": "unknown request"}
+            visible = int(visible_tokens or 0) or int(getattr(req, "num_computed_tokens", 0))
+            # BOTH TP ranks send the same request (each owns its own KV), but rewinding the two books
+            # is a single EngineCore operation: applying it twice rewound `num_logical_tokens` again
+            # while `num_computed_tokens` had already reached its floor, which changed the offset by
+            # N and shifted every position (measured: "ZX" followed by garbage).
+            _seen = _replay_state.get(request_id)
+            if _seen == visible:
+                return {"ok": True, "skipped": "duplicate", "computed": int(req.num_computed_tokens)}
+            n = min(int(replay_tokens or 0), visible,
+                    int(getattr(req, "num_logical_tokens", 0) or 0))
+            if n <= 0:
+                return {"ok": False, "error": "nothing to replay"}
+            before = (int(req.num_computed_tokens), int(getattr(req, "num_logical_tokens", 0)))
+            req.num_computed_tokens = max(0, visible - n)
+            req.num_logical_tokens = max(0, int(getattr(req, "num_logical_tokens", 0)) - n)
+            # Keep the two books related exactly as the scheduler expects.
+            req.num_kvmem_offset = int(req.num_logical_tokens) - int(req.num_computed_tokens)
+            entry = {"kind": "replay_applied", "pid": os.getpid(), "req": request_id,
+                     "n": int(n), "visible": visible,
+                     "before_computed": before[0], "before_logical": before[1],
+                     "computed": int(req.num_computed_tokens),
+                     "logical": int(req.num_logical_tokens),
+                     "offset": int(req.num_kvmem_offset)}
+            _replay_state[request_id] = visible
+            _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl", entry)
+            return {"ok": True, "replay": int(n), "computed": int(req.num_computed_tokens)}
+
         def _compact(request_id, pages, page_tokens, visible_tokens=0):
             """Resident-book reconciliation (Route A / resident model).
 
@@ -1271,6 +1319,7 @@ def register():
         _channel_state = {"scheduler": None, "server": None}
         # request_id -> visible length of the last applied compaction (TP-rank idempotency).
         _compact_state = {}
+        _replay_state = {}       # request_id -> visible length of the last applied replay
         # request ids already examined for a resume (a waiting request is looked at once).
         _resume_decided = set()
 
@@ -1394,13 +1443,15 @@ def register():
         if not getattr(original, "_kvmem_channel_patched", False):
             def schedule(self, *args, **kwargs):
                 _channel_state["scheduler"] = self
+                _channel_state["probe_log"] = _sched_cfg(self).get("probe_log")
                 if _channel_state["server"] is None:
                     scfg = _sched_cfg(self)
                     if scfg.get("block_channel") and scfg.get("inrequest_compaction"):
                         _channel_state["server"] = BlockChannelScheduler(
                             _alloc, path=scfg.get("block_channel_path",
                                                   "/tmp/kvmem_block_channel.sock"),
-                            compactor=_compact, session_sink=_session_park_payload).start()
+                            compactor=_compact, session_sink=_session_park_payload,
+                            replayer=_replay).start()
                         _append(scfg.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
                                 {"kind": "block_channel_attached", "pid": os.getpid()})
                 _maybe_resume(self)

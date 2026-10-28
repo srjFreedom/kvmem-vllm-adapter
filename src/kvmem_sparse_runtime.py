@@ -1164,6 +1164,9 @@ class VllmSparseRuntime:
                 self.log({"kind": "query_reselect", "req": req, "tokens": int(st.tokens),
                           "prompt": int(self._prompt_len.get(req, 0) or 0)})
                 self._reselect(req, probe=True)
+                # QueryReplay: the tail was prefilled while the middle was evicted, so re-schedule
+                # it now that the working set holds the real middle.
+                self.send_replay(req, int(getattr(self, "replay_tokens", 2048) or 2048))
             # The prompt is IMMUTABLE for this backend: vLLM derives the output length from
             # `num_tokens - prompt_len` and requires `_all_token_ids` to cover the prompt, so a
             # compaction may only ever drop GENERATED tokens. Remember the prefill length here so
@@ -1211,6 +1214,7 @@ class VllmSparseRuntime:
                                   "resident_pages": int(_rp), "budget_pages": int(_bp)})
                         try:
                             self._reselect(req, probe=True)
+                            self.send_replay(req, int(getattr(self, "replay_tokens", 2048) or 2048))
                         except Exception:
                             if self.log is not None:
                                 import traceback as _tb
@@ -1314,6 +1318,34 @@ class VllmSparseRuntime:
                          "baked_delta": int(orch.baked_delta.get(page, 0)),
                          "needle": orch.needle(page)})
         self.log({"kind": "needle_trace", "req": req, "tokens": st.tokens, "rows": rows})
+
+    def send_replay(self, req, n_tokens=2048):
+        """QueryReplay: ask EngineCore to re-schedule the last N tokens against the new view.
+
+        Only meaningful right after a query-driven reselect: the working set now holds the real
+        middle, and those N tokens were computed while it did not. Returns the engine's reply or
+        None (disabled / nothing to do / error), never raises.
+        """
+        ch = getattr(self, "compact_channel", None)
+        if ch is None or not hasattr(ch, "replay"):
+            return None
+        try:
+            st = self.state(req)
+            visible = int(getattr(st, "seq_len", 0) or 0)
+            n = min(int(n_tokens or 0), visible)
+            if n <= 0:
+                return None
+            res = ch.replay(req, visible, n)
+            if self.log is not None:
+                self.log({"kind": "query_replay", "req": req, "n": int(n),
+                          "visible": visible, "reply": res})
+            return res
+        except Exception:
+            if self.log is not None:
+                import traceback as _tb
+                self.log({"kind": "query_replay_error", "req": req,
+                          "error": _tb.format_exc()[-400:]})
+            return None
 
     def _reselect(self, req, prefill_pressure=False, probe=False):
         st = self._state[req]

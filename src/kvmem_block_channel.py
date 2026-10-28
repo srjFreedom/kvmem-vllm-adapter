@@ -26,18 +26,20 @@ class BlockChannelScheduler:
     """
 
     def __init__(self, allocator, path=DEFAULT_PATH, backlog=8, compactor=None,
-                 session_sink=None):
+                 session_sink=None, replayer=None):
         self._allocator = allocator      # callable(request_id, count) -> list[int]
         self._compactor = compactor      # callable(request_id, pages, page_tokens) -> bool
         # callable(payload) -- a finished session was parked in the worker; EngineCore keeps the
         # routing metadata so it can decide a later resume without touching any KV.
         self._session_sink = session_sink
+        self._replayer = replayer        # callable(request_id, visible, n) -> dict
         self._path = path
         self._server = None
         self._thread = None
         self._stop = threading.Event()
         self.requests_served = 0
         self.compacts_applied = 0
+        self.replays_applied = 0
         self.sessions_parked = 0
 
     def start(self):
@@ -71,6 +73,18 @@ class BlockChannelScheduler:
                         continue
                     req = json.loads(payload.decode())
                     kind = req.get("kind", "alloc")
+                    if kind == "replay":
+                        # KVMem QueryReplay: rewind BOTH books by N so the scheduler re-schedules
+                        # the last N tokens against the freshly installed working set.
+                        if self._replayer is None:
+                            raise RuntimeError("no replayer installed")
+                        reply = self._replayer(req.get("request"),
+                                               int(req.get("visible_tokens", 0) or 0),
+                                               int(req.get("replay_tokens", 0) or 0))
+                        self.replays_applied += 1
+                        conn.sendall(json.dumps(reply if isinstance(reply, dict)
+                                                else {"ok": bool(reply)}).encode())
+                        continue
                     if kind == "compact":
                         # In-request compaction: the worker selected a working set; the engine
                         # truncates _all_token_ids to those pages and rewinds num_computed_tokens.
@@ -143,6 +157,30 @@ class BlockChannel:
         if "error" in reply:
             raise RuntimeError(f"session park failed: {reply['error']}")
         return bool(reply.get("ok", False))
+
+    def replay(self, request_id, visible_tokens, replay_tokens):
+        """Ask EngineCore to re-schedule the last `replay_tokens` tokens (KVMem QueryReplay).
+
+        Prefill-time compaction keeps only sink+newest (no query exists yet), so the tokens that were
+        prefilled while the middle was evicted saw an approximate history. After the query-driven
+        reselect installs the real working set, rewinding BOTH books by N makes the scheduler
+        prefilled those N tokens again - this time against the full B - which refreshes their KV and
+        the recurrent state right before sampling.
+        """
+        n = int(replay_tokens or 0)
+        if n <= 0:
+            return None
+        body = {"kind": "replay", "request": request_id,
+                "visible_tokens": int(visible_tokens), "replay_tokens": n}
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(self._timeout)
+            sock.connect(self._path)
+            sock.sendall(json.dumps(body).encode())
+            data = sock.recv(4096)
+        reply = json.loads(data.decode())
+        if "error" in reply:
+            raise RuntimeError(f"replay request failed: {reply['error']}")
+        return reply
 
     def compact(self, request_id, pages, page_tokens, visible_tokens=0):
         """Tell EngineCore that `request_id` compacted to `pages` (in compacted order).
