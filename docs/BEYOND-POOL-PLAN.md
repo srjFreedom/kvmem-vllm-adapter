@@ -280,3 +280,35 @@ len=256, uniq=102, dups=154   ← 同一物理页被多个位置引用
 
 201K prompt（7 次压缩）在去掉重复页后仍以 `BatchPrefillWithPagedKVCache` 崩溃，引擎退出 →
 下一轮继续追"行内 page id 是否指向已归还的页"。
+
+## 第 22 轮：粒度问题测清楚了 —— 页(16) vs 引擎块(1616)
+
+从运行中的 worker 直接读出（console）：
+
+```
+page_tokens            = 16          ← KVMem 页 / 内核块表的一列
+view.num_blocks()      = 12726       ← 内核块表的列数（12,726 × 16 = 203,616 token）
+cache_config.block_size= 1616        ← 引擎分配器的块
+max_model_len          = 177,760
+FullAttentionManager 里本请求的块数 = 31   （31 × 1616 ≈ 50K token）
+```
+
+也就是说**存在两套完全不同的空间**：
+
+| 空间 | 单位 | 谁在用 |
+|---|---|---|
+| 内核块表（`runner.block_tables.gpu`） | **16 token/列** | FlashInfer 的 `slot_mapping` / KV 索引 |
+| 引擎分配器（`FullAttentionManager.req_to_blocks`） | **1616 token/块** | 调度器的分配/释放/抢占 |
+
+由此得到两条结论：
+
+1. 我上一轮"按页 id 去回收引擎块"的做法**在两个不可比的空间里做减法**——所以 `freed=0`
+   （运气好，没有误释放）。这个方向要撤回，不能这样回收。
+2. **超池崩溃的根因是这个粒度不匹配**：我们按 16-token 页做压缩选择，而引擎按 1616-token 块
+   记账与释放。只要调度器释放/抢占一个 1616-token 块，我们行里保留的 16-token 页就会有一批被
+   抽走 → 内核读到已释放显存 → `BatchPrefillWithPagedKVCache: illegal memory access`。
+   这也解释了为什么"行长度对、写地址对、id 在池内、无重复"却仍然崩。
+
+修法（下一轮）：**压缩选择必须在引擎块粒度（1616 token）上做**，即选择/淘汰以引擎块为单位
+（页只是块内偏移），这样释放一个块绝不会带走仍被行引用的页。这需要把 selector 的块网格从 16
+页改成 1616 引擎块（或在两者之间做严格的对齐映射）。
