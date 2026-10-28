@@ -230,6 +230,24 @@ class KvmemHostStore:
         return int(self._storage.capacity())
 
 
+def _probe_write(record) -> None:
+    """Append one diagnostic record to the KVMem probe file (best effort, never raises).
+
+    The orchestrator has no log handle of its own; the runtime/plugin own the probe path, and this
+    file is the one every other layer writes to.
+    """
+    try:
+        import json
+        import os
+        path = os.environ.get("KVMEM_PROBE_LOG") or "/tmp/kvmem_sparse.jsonl"
+        record = dict(record)
+        record.setdefault("pid", os.getpid())
+        with open(path, "a") as handle:
+            handle.write(json.dumps(record, default=str) + "\n")
+    except Exception:
+        pass
+
+
 class SparseOrchestrator:
     """Per-request sparse working-set manager for one TP rank.
 
@@ -435,6 +453,74 @@ class SparseOrchestrator:
         self.baked_delta[page] = needed
         return needed
 
+    # --- P1 audit: core mean-K scorer vs the legacy Python index ------------------------
+    def _compare_core_scores(self, blocks, legacy):
+        """Log one comparison record (env: KVMEM_SCORER_COMPARE=1). Never raises."""
+        import os
+        # OFF unless the v0.19 statistics are on: the audit exists to gate the P1 switch, and it must
+        # never perturb the shipped 0.2.5 ranking. Gated on KVMEM_STATS (not on its own flag) because
+        # vLLM forks the workers with a filtered environment, so a new variable may simply not
+        # arrive here; this one is already known to survive it.
+        if os.environ.get("KVMEM_STATS", "").strip().lower() not in ("core", "1", "on"):
+            return
+        if os.environ.get("KVMEM_SCORER_COMPARE", "1") != "1":
+            return
+        if getattr(self, "_compare_done", 0) >= 12:
+            return
+        stats = getattr(self, "statistics", None)
+        if stats is None:
+            return
+        try:
+            from vllm import kvmem_bridge as bridge
+            from kvmem_recall import KvmemRecall, compare_scores
+            if not getattr(bridge, "ARMED", False):
+                return
+            layer_rows = {}
+            rows = 0
+            for layer, (q, _pos) in bridge.read_all().items():
+                if q is None or q.numel() == 0:
+                    continue
+                q = q.detach().to("cpu", non_blocking=False).float()
+                layer_rows[int(layer)] = q
+                rows = max(rows, int(q.shape[0]))
+            if rows <= 0:
+                return
+            kv_heads = int(getattr(stats, "kv_heads", 0) or 0)
+            head_dim = int(getattr(stats, "head_dim", 0) or 0)
+            query_heads = int(layer_rows[next(iter(layer_rows))].shape[1]) if layer_rows else 0
+            recall = getattr(self, "_recall", None)
+            if recall is None:
+                cfg = getattr(self.selector, "config_", None)
+                recall = KvmemRecall(
+                    stats,
+                    block_tokens=int(getattr(stats, "block_tokens", 64) or 64),
+                    sink_blocks=int(getattr(cfg, "sink_tokens", 0) or 0) // 64,
+                    recent_blocks=int(getattr(cfg, "recent_tokens", 0) or 0) // 64,
+                    budget_blocks=int(getattr(cfg, "budget_tokens", 0) or 0) // 64,
+                    aggregation="max")
+                self._recall = recall
+            count = int(getattr(stats, "frontier", 0)) // int(recall.block_tokens)
+            core = recall.scores(layer_rows, rows, query_heads, kv_heads, head_dim, count)
+            if core is None:
+                rec = {"kind": "scorer_compare_error", "error": recall.last_error,
+                       "rows": rows, "layers": len(layer_rows)}
+            else:
+                rec = {"kind": "scorer_compare", "rows": rows, "layers": len(layer_rows),
+                       "query_heads": query_heads, "kv_heads": kv_heads,
+                       "core_blocks": len(core), "legacy_blocks": len(legacy)}
+                rec.update(compare_scores(core, legacy,
+                                          blocks=range(len(core)), top=10))
+            self._compare_done = getattr(self, "_compare_done", 0) + 1
+            _probe_write(rec)
+        except Exception:
+            try:
+                import traceback as _tb
+                if getattr(self, "log", None) is not None:
+                    self.log({"kind": "scorer_compare_crash",
+                              "error": _tb.format_exc()[-500:]})
+            except Exception:
+                pass
+
     # --- reselect ---------------------------------------------------------------------
     def reselect(self, mandatory_pages=(), slots=None, page_to_slot=None,
                  prefill_pressure=False, forced_pages=()):
@@ -446,6 +532,10 @@ class SparseOrchestrator:
                 try:
                     scores = self.retrieval_index.scores(blocks)
                     raw = [float(s) for s in scores]
+                    # P1 audit: score the SAME blocks with kvmem's own mean-K scorer over the
+                    # RawKvStore statistics, and record how the two agree. A rewrite is not allowed
+                    # to switch the shipped ranking on faith.
+                    self._compare_core_scores(blocks, raw)
                     # The selector requires exactly one score per selection block
                     # (`store_.block_count()`), while the index only covers blocks that actually
                     # carry statistics. Pad the rest BELOW every real score so unscored blocks are

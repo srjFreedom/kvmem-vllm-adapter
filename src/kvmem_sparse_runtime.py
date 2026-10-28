@@ -193,6 +193,7 @@ class VllmSparseRuntime:
         self._stats_next = {}       # req -> first TRUE position not yet written
         self._stats_written = {}    # req -> bucket writes
         self._stats_skipped = {}    # req -> {reason: count} so a refusal cannot hide behind another
+        self._compare_done = {}     # req -> the core-vs-legacy score audit already ran
         # Set by the plugin from the attention module: per-rank KV heads and the number of
         # full-attention layers (= the statistics store's n_layer).
         self.kv_heads = 0
@@ -658,11 +659,12 @@ class VllmSparseRuntime:
                 self._skip(req, "no capture")
                 return 0
             written = stats.write_step(first, n, sums)
+            if written == 0:
+                self._skip(req, f"wrote 0 (frontier {stats.frontier} first {first} n {n})")
             self._stats_next[req] = first + n
             try:
                 import json as _json, os as _os
-                if (_os.environ.get("KVMEM_STATS_DEBUG", "") == "1"
-                        and int(self._stats_written.get("_dbg", 0)) < 40):
+                if int(self._stats_written.get("_dbg", 0)) < 40:
                     self._stats_written["_dbg"] = int(self._stats_written.get("_dbg", 0)) + 1
                     with open("/tmp/kvmem_stats_debug.jsonl", "a") as _fh:
                         _fh.write(_json.dumps({"pid": _os.getpid(), "req": str(req)[:12],
@@ -674,6 +676,22 @@ class VllmSparseRuntime:
             except Exception:
                 pass
             self._stats_written[req] = int(self._stats_written.get(req, 0)) + int(written)
+            # P1 audit hook: once the whole prompt has statistics, score the SAME blocks with
+            # kvmem's mean-K scorer and with the legacy Python index. This fires exactly when the
+            # query window holds the question, not at release time after generation.
+            if written and not self._compare_done.get(req):
+                plen = int(self._prompt_len.get(req, 0) or 0)
+                if int(stats.frontier) >= min(plen or 4096, 4096):
+                    self._compare_done[req] = True
+                    orch = self._orch.get(req)
+                    index = self._retrieval.get(req)
+                    if orch is not None and index is not None:
+                        try:
+                            blocks = list(index.covered_blocks())
+                            legacy = [float(v) for v in index.scores(blocks)] if blocks else []
+                            orch._compare_core_scores(blocks, legacy)
+                        except Exception:
+                            pass
             return written
         except Exception:
             try:

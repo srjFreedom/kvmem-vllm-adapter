@@ -15,6 +15,11 @@
 // (backends/ninfer .../storage/memory_statistics.cpp) and scores it with the mean-K/page-softmax
 // scorers, so the adapter binds it instead of keeping a second mean-key store in Python.
 #include "kvmem/raw_kv_store.hpp"
+// v0.19 recall surface: the Query frame (which pages are candidates, which are required) and the
+// two scorers over the mean-K statistics. `mean_query_cosine_scores` is the P1 scorer; the page
+// softmax reference is available without the CUDA object.
+#include "kvmem/graph_recall.hpp"
+#include "kvmem/query_policy.hpp"
 // nvme_kv_tier.hpp was removed in upstream v0.19 (shared SSD tier retired). The two Python
 // call sites (kvmem_sparse_orchestrator / kvmem_history_cache) are guarded by try/except and a
 // disk-config condition, so the RAM-only path degrades to self._disk = None without this binding.
@@ -380,6 +385,78 @@ PYBIND11_MODULE(vllm_kvmem_ext, m) {
             return self.config().n_embd_k; })
         .def_property_readonly("block_tokens", [](const kvmem::RawKvStore & self) {
             return self.config().block_tokens; });
+
+    // --- Query frame and scorers (v0.19 recall) ----------------------------------------------
+    py::class_<kvmem::QueryScoreFrame>(m, "QueryScoreFrame")
+        .def_readonly("starts", &kvmem::QueryScoreFrame::starts)
+        .def_readonly("counts", &kvmem::QueryScoreFrame::counts)
+        .def_readonly("score_mask", &kvmem::QueryScoreFrame::score_mask)
+        .def_readonly("transport_mask", &kvmem::QueryScoreFrame::transport_mask)
+        .def_readonly("accepted_through", &kvmem::QueryScoreFrame::accepted_through);
+
+    m.def("query_score_frame", &kvmem::query_score_frame,
+          py::arg("accepted_through"), py::arg("block_tokens"), py::arg("budget_blocks"),
+          py::arg("sink_blocks"), py::arg("recent_blocks"), py::arg("fixed_blocks"));
+
+    m.def("query_prefix_required", &kvmem::query_prefix_required,
+          py::arg("prefix"), py::arg("block"), py::arg("sink"), py::arg("recent"),
+          py::arg("media"));
+
+    // One scorer entry point for both aggregation modes; the per-layer arrays are borrowed for the
+    // duration of the call (PageQueryView carries their pointers, it does not own them). A layer
+    // passed as None is ABSENT (recurrent layers, the MTP layer), never a zero sample.
+    auto score_with_view = [](const kvmem::RawKvStore & keys, py::object layers, uint32_t rows,
+                              uint32_t query_heads, uint32_t kv_heads, uint32_t head_dim,
+                              uint32_t blocks, bool max_agg, py::object frame) {
+        using Array = py::array_t<float, py::array::c_style | py::array::forcecast>;
+        std::vector<Array> held;                     // owns the data for the call's duration
+        std::vector<const float *> ptrs;
+        std::vector<uint32_t> counts;
+        std::vector<std::pair<size_t, size_t>> slots;   // (layer index, held index)
+        const auto layer_count = static_cast<size_t>(py::len(layers));
+        ptrs.reserve(layer_count);
+        counts.reserve(layer_count);
+        size_t layer = 0;
+        for (py::handle item : layers) {
+            if (item.is_none()) {
+                // ABSENT layer (recurrent, MTP): no rows, never a zero-valued sample.
+                ptrs.push_back(nullptr);
+                counts.push_back(0);
+            } else {
+                auto array = py::cast<Array>(item);
+                const auto info = array.request();
+                if (info.ndim != 3 || uint32_t(info.shape[1]) != query_heads ||
+                    uint32_t(info.shape[2]) != head_dim || uint32_t(info.shape[0]) != rows)
+                    throw std::invalid_argument("query rows must be [rows, query_heads, head_dim]");
+                held.push_back(std::move(array));
+                ptrs.push_back(nullptr);             // filled once `held` stops moving
+                counts.push_back(rows);
+                slots.emplace_back(layer, held.size() - 1);
+            }
+            ++layer;
+        }
+        for (const auto & [at, index] : slots)
+            ptrs[at] = static_cast<const float *>(held[index].request().ptr);
+        kvmem::PageQueryView view{};
+        view.data = nullptr;
+        view.layer_rows = counts.data();
+        view.layers = static_cast<uint32_t>(layer_count);
+        view.rows = rows;
+        view.query_heads = query_heads;
+        view.kv_heads = kv_heads;
+        view.head_dim = head_dim;
+        view.layer_data = ptrs.data();
+        const auto aggregation = max_agg ? kvmem::GqaScoreAggregation::Max
+                                         : kvmem::GqaScoreAggregation::Mean;
+        if (frame.is_none())
+            return kvmem::mean_query_cosine_scores(keys, view, blocks, aggregation);
+        const auto & score_frame = frame.cast<const kvmem::QueryScoreFrame &>();
+        return kvmem::page_softmax_scores(keys, view, score_frame, aggregation);
+    };
+    m.def("query_scores", score_with_view,
+          py::arg("keys"), py::arg("layer_rows"), py::arg("rows"), py::arg("query_heads"),
+          py::arg("kv_heads"), py::arg("head_dim"), py::arg("blocks"), py::arg("max_aggregation"),
+          py::arg("frame") = py::none());
 
     // --- NVMe KV tier (disk layer, D budget) -------------------------------------------------
     // Removed with upstream v0.19: the shared SSD tier (nvme_kv_tier.hpp) was retired and the

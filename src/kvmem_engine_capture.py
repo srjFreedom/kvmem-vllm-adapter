@@ -294,14 +294,20 @@ def harvest_from_bridge(capture):
             key = (rotary_dim, base, str(q.device))
             if key not in capture._inv_freq:
                 capture._inv_freq[key] = rotary_inv_freq(rotary_dim, base, device=q.device)
-            try:
-                q_pre = unrotate(q, pos[:q.shape[0]], capture._inv_freq[key], rotary_dim)
-            except Exception:
+            # The bridge inverts RoPE inside its capture op, so its rows are already the pre-RoPE
+            # frame PageQueryView means. Rotating them again would score against a turned query
+            # (the exact failure this migration removes), so it is skipped when the bridge says so.
+            if bool(getattr(bridge, "PRE_ROPE", False)):
+                q_pre = q
+            else:
+                try:
+                    q_pre = unrotate(q, pos[:q.shape[0]], capture._inv_freq[key], rotary_dim)
+                except Exception:
                 # Fall back to the captured query unchanged: the rotation frame is then approximate,
                 # but a slightly-wrong direction still ranks far better than no ranking at all.
-                q_pre = q
-                if getattr(capture, "_log", None) is not None:
-                    capture._log({"kind": "bridge_harvest_unrotate_fallback", "layer": layer})
+                    q_pre = q
+                    if getattr(capture, "_log", None) is not None:
+                        capture._log({"kind": "bridge_harvest_unrotate_fallback", "layer": layer})
             if dbg is None:
                 # Recorded BEFORE the non-finite check: a broken payload is exactly the evidence we
                 # need, and it must not be swallowed by the filter.
