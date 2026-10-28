@@ -1007,102 +1007,46 @@ class VllmSparseRuntime:
         self._pending_new[req] = int(n_new)
 
     def ensure_row_for_chunk(self, req, n_tokens):
-        # OFF by default: synthesising the row from the page map introduced DUPLICATE page ids even
-        # on the first prefills (measured: len=256, uniq=102, dups=154), because the map is keyed by
-        # LOGICAL page and the row by RESIDENT rank. A row with duplicates points several positions
-        # at one physical page, which corrupts attention and can fault. The engine appends blocks
-        # for new tokens itself; the after-step growth then mirrors them.
-        """Make the block table row cover the tokens this step is about to write.
+        """Mirror the engine's appended blocks so the row covers the attention length THIS step.
 
-        The row used to be extended in `after_step`, i.e. AFTER the model ran - so a prefill chunk
-        that crossed a page boundary made the kernel read row entries that did not exist yet
-        (measured: row=4864 pages for seq_len=77824 while the step wrote up to 81920 -> FlashInfer
-        illegal memory access). Growing it at step entry, from the engine's own page map, keeps the
-        row at least as long as `seq_len` for every step.
+        The row used to be extended only in `after_step`, so every prefill chunk ran with a row one
+        chunk short of the `seq_len` the kernel was told to attend to (measured: seq_len=49152 needs
+        3072 entries, row had 2828 -> deficit 244). This mirrors entries the ENGINE really appended
+        (never synthesises from the page map, which mixed logical pages with resident ranks and
+        produced duplicate ids).
         """
-        if not bool(getattr(self, "row_grow_pre_step", False)):
+        if not bool(getattr(self, "row_grow_pre_step", True)):
             return 0
         st = self._state.get(req)
         n = int(n_tokens or 0)
         if st is None or n <= 0:
             return 0
         try:
-            # RESIDENT coordinate: the row covers the compacted sequence, so the pages this step
-            # needs are ranks 0..(seq_len + n)/page. Using the LOGICAL count asked for ranks the
-            # compacted row cannot have (measured: wanted 11521 entries, had 4141) and the appended
-            # stale ids made FlashInfer fault.
-            last_rank = (int(getattr(st, "seq_len", 0)) + n - 1) // max(1, self.page_tokens)
-            if len(st.row) > last_rank:
+            need = (int(getattr(st, "seq_len", 0)) + n + self.page_tokens - 1) // max(1, self.page_tokens)
+            if len(st.row) >= need:
                 return 0
-            self._absorb_engine_row(req)
+            table = self.view.block_table_rows()[0]
+            values = table[st.row_index].tolist()
             grown = list(st.row)
-            page_map = self._page_map.get(req) or {}
-            while len(grown) <= last_rank:
-                logical = len(grown)
-                page = page_map.get(logical)
-                if page is None:
-                    self._grow_from_engine(req, grown, logical)
-                    page = page_map.get(logical)
-                if page is None:
+            for i in range(len(grown), min(need, len(values))):
+                page = int(values[i])
+                if page <= 0:
                     break
-                grown.append(int(page))
+                grown.append(page)
             added = len(grown) - len(st.row)
-            if len(grown) <= last_rank and self.log is not None:
-                # Could not reserve the whole chunk: the engine's page map has no entry for the
-                # logical pages this step will write. Logged loudly because the kernel would then
-                # read row entries that do not exist (illegal memory access).
-                self.log({"kind": "row_short_pre_step", "req": req,
-                          "row": len(grown), "need": int(last_rank) + 1,
-                          "tokens": int(getattr(st, "tokens", 0)), "n": n,
-                          "page_map": len(page_map), "next_page": getattr(st, "next_page", None)})
-            st.row = tuple(grown)
-            # Validity of the row's page ids: FlashInfer faults on an id past the pool or on a page
-            # that was handed back to the allocator, and neither shows up as "row too short".
-            try:
-                nb = int(self.view.num_blocks()) if hasattr(self.view, "num_blocks") else 0
-                if nb and st.row:
-                    mx = max(st.row)
-                    mn = min(st.row)
-                    uniq = len(set(st.row))
-                    if mx >= nb or mn < 0 or uniq != len(st.row):
-                        self.log({"kind": "row_invalid", "req": req,
-                                  "max": int(mx), "min": int(mn), "pool": nb,
-                                  "len": len(st.row), "uniq": int(uniq),
-                                  "dups": int(len(st.row) - uniq)})
-            except Exception:
-                pass
-            # The attention length must equal what the ROW actually holds, including this chunk. The
-            # runtime used to keep its own `seq_len`, and after an in-prefill compaction it drifted
-            # away from the engine's num_computed by tens of thousands of tokens (measured:
-            # seq_len=90112 while the engine was at 42114) - the kernel then masked/indexed against
-            # a length the row does not have, which is the repetition seen on >B prompts.
-            try:
-                # OFF by default: re-deriving the attention length from the row every step changed
-                # behaviour on the known-good 58K path (mid_selected=False, then repetition), so it
-                # stays an experiment until the books are unified properly.
-                if not bool(getattr(self, "seq_from_row", False)):
-                    raise _SkipSeqFromRow
-                covered = len(st.row) * max(1, self.page_tokens)
-                target = min(int(getattr(st, "tokens", 0)) + n, covered)
-                if target > 0 and int(getattr(st, "seq_len", 0)) != target:
-                    st.seq_len = target
-                    if self.log is not None and added:
-                        self.log({"kind": "seq_len_from_row", "req": req,
-                                  "seq_len": int(target), "row": len(st.row),
-                                  "tokens": int(getattr(st, "tokens", 0)), "n": n})
-            except _SkipSeqFromRow:
-                pass
-            except Exception:
-                pass
-            if added and self.log is not None:
-                self.log({"kind": "row_grown_pre_step", "req": req, "added": int(added),
-                          "row": len(st.row), "need": int(last_rank) + 1,
-                          "tokens": int(getattr(st, "tokens", 0)), "n": n})
+            if added:
+                st.row = tuple(grown)
+                if self.log is not None:
+                    self.log({"kind": "row_mirrored_pre_step", "req": req, "added": int(added),
+                              "row": len(st.row), "need": int(need)})
+            if len(st.row) < need and self.log is not None:
+                self.log({"kind": "row_short_pre_step", "req": req, "row": len(st.row),
+                          "need": int(need), "seq_len": int(getattr(st, "seq_len", 0)), "n": n})
             return added
         except Exception:
             if self.log is not None:
                 import traceback as _tb
-                self.log({"kind": "row_grow_error", "req": req, "error": _tb.format_exc()[-400:]})
+                self.log({"kind": "row_grow_error", "req": req, "error": _tb.format_exc()[-300:]})
             return 0
 
     def advance_tokens(self, req, n_new):
@@ -1888,7 +1832,37 @@ class VllmSparseRuntime:
         out = base.clone()
         for row, value in self._seq_override.items():
             if row < out.numel():
+                # Clamp to what the row actually holds: the kernel reads ceil(seq_len/page) row
+                # entries, and a row that is one chunk short made FlashInfer fault (measured:
+                # seq_len=49152 needs 3072 entries, row had 2828). Losing the tail of the CURRENT
+                # chunk's attention is strictly better than an illegal access.
+                try:
+                    for _req, _st in self._state.items():
+                        if getattr(_st, "row_index", None) == row and _st.row:
+                            _cap = len(_st.row) * max(1, int(self.page_tokens))
+                            if int(value) > _cap:
+                                self.log({"kind": "seq_len_clamped", "req": _req,
+                                          "seq_len": int(value), "cap": int(_cap),
+                                          "lost": int(value) - int(_cap)})
+                                value = _cap
+                            break
+                except Exception:
+                    pass
                 out[row] = value
+                # Read-side diagnostic: the kernel attends to `value` positions, i.e. it reads
+                # ceil(value / page) entries of the row. More than the row has = illegal access that
+                # neither the write-address probe nor the row-length probe can see.
+                try:
+                    need = (int(value) + int(self.page_tokens) - 1) // max(1, int(self.page_tokens))
+                    for _req, _st in self._state.items():
+                        if getattr(_st, "row_index", None) == row and _st.row:
+                            if need > len(_st.row):
+                                self.log({"kind": "kv_len_past_row", "req": _req,
+                                          "seq_len": int(value), "need": int(need),
+                                          "row": len(_st.row),
+                                          "deficit": int(need - len(_st.row))})
+                except Exception:
+                    pass
         return out
 
     # --- page allocation ----------------------------------------------------------------
