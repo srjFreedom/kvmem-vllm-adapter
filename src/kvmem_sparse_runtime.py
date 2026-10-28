@@ -41,7 +41,7 @@ class _ReqState:
     #           token can be attributed to the history block it belongs to.
     __slots__ = ("row", "logical", "seq_len", "tokens", "next_page", "steps", "spare",
                  "row_index", "prefill_done", "query_reselected", "resume", "resumed",
-                 "replay_snap", "replay_n", "replay_at")
+                 "replay_snap", "replay_n", "replay_at", "replay_at_resident")
 
     def __init__(self):
         self.row = ()
@@ -67,6 +67,7 @@ class _ReqState:
         self.replay_snap = None
         self.replay_n = 0
         self.replay_at = 0
+        self.replay_at_resident = 0
 
 
 class VllmSparseRuntime:
@@ -1037,6 +1038,22 @@ class VllmSparseRuntime:
                           "tokens": int(getattr(st, "tokens", 0)), "n": n,
                           "page_map": len(page_map), "next_page": getattr(st, "next_page", None)})
             st.row = tuple(grown)
+            # The attention length must equal what the ROW actually holds, including this chunk. The
+            # runtime used to keep its own `seq_len`, and after an in-prefill compaction it drifted
+            # away from the engine's num_computed by tens of thousands of tokens (measured:
+            # seq_len=90112 while the engine was at 42114) - the kernel then masked/indexed against
+            # a length the row does not have, which is the repetition seen on >B prompts.
+            try:
+                covered = len(st.row) * max(1, self.page_tokens)
+                target = min(int(getattr(st, "tokens", 0)) + n, covered)
+                if target > 0 and int(getattr(st, "seq_len", 0)) != target:
+                    st.seq_len = target
+                    if self.log is not None and added:
+                        self.log({"kind": "seq_len_from_row", "req": req,
+                                  "seq_len": int(target), "row": len(st.row),
+                                  "tokens": int(getattr(st, "tokens", 0)), "n": n})
+            except Exception:
+                pass
             if added and self.log is not None:
                 self.log({"kind": "row_grown_pre_step", "req": req, "added": int(added),
                           "row": len(st.row), "need": int(last_rank) + 1,
@@ -1072,6 +1089,10 @@ class VllmSparseRuntime:
                     # was left" instead let the two ranks disagree (2042 vs 2048) and the first
                     # message won, which rewound to the wrong position.
                     _st0.replay_at = int(getattr(_st0, "tokens", 0))
+                    # The rewind happens in RESIDENT coordinates (num_computed_tokens), so the
+                    # boundary must be recorded in the same units. Mixing logical and resident made
+                    # n negative and the replay a no-op that still cost a message.
+                    _st0.replay_at_resident = int(getattr(_st0, "seq_len", 0))
                     if self.log is not None:
                         self.log({"kind": "replay_snapshot", "req": req, "left": int(_left),
                                   "at": int(_st0.replay_at)})
@@ -1470,9 +1491,17 @@ class VllmSparseRuntime:
             st = self.state(req)
             visible = int(getattr(st, "seq_len", 0) or 0)
             snap = getattr(st, "replay_snap", None)
-            at = int(getattr(st, "replay_at", 0) or 0)
-            n = (visible - at) if (snap and at > 0) else int(n_tokens or 0)
-            n = min(max(int(n), 0), visible)
+            at = int(getattr(st, "replay_at_resident", 0) or 0)
+            # Resident coordinates, and only within one bounded window: a snapshot taken many
+            # compactions ago cannot be restored into the current view.
+            n = (visible - at) if (snap and at > 0) else 0
+            if n <= 0 or n > int(getattr(self, "replay_max_tokens", 4096) or 4096):
+                if self.log is not None:
+                    self.log({"kind": "query_replay_skipped", "req": req,
+                              "visible": visible, "at_resident": at, "n": int(n),
+                              "reason": "no valid resident boundary"})
+                return None
+            n = min(int(n), visible)
             if n <= 0:
                 return None
             if snap is not None and self.restore_state is not None:
