@@ -1414,6 +1414,63 @@ def register():
             except Exception:
                 pass
             _compact_state[request_id] = visible
+            # Hand the engine's OWN bookkeeping the compacted row. Until now only the worker's block
+            # table was rewritten, so the engine kept the pre-compaction block list (and kept
+            # allocating new blocks for every chunk on top of it): the pool drained to a handful of
+            # free blocks and the scheduler preempted, whose recompute then faced a compacted row.
+            _gt = set(int(p) for p in pages)
+            try:
+                if os.environ.get("KVMEM_COMPACT_FREE", "1") == "1":
+                    _pool = scheduler.kv_cache_manager.block_pool
+                    # The engine keeps its OWN per-request block list (per KV cache group) inside the
+                    # coordinators; `req.block_ids` is not populated in this fork. Rewriting only the
+                    # worker's block table left it holding the pre-compaction blocks forever, so
+                    # every chunk allocated new ones and the pool drained.
+                    _groups = []
+                    try:
+                        _coord = scheduler.kv_cache_manager.coordinator
+                        _groups = list(getattr(_coord, "single_type_managers", ()) or ())
+                    except Exception:
+                        _groups = []
+                    _blocks = getattr(req, "block_ids", None)
+                    if not _groups:
+                        _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "compact_free_nogroups", "req": request_id})
+                    for _mgr in _groups:
+                        _map = getattr(_mgr, "req_to_blocks", None)
+                        if not _map:
+                            continue
+                        _cur = _map.get(request_id)
+                        if not _cur:
+                            continue
+                        _keep = [b for b in _cur if int(getattr(b, "block_id", -1)) in _gt]
+                        _gone = [b for b in _cur if int(getattr(b, "block_id", -1)) not in _gt]
+                        if _gone:
+                            _pool.free_blocks(_gone)
+                            _map[request_id] = _keep
+                        _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "compact_freed", "req": request_id,
+                                 "group": type(_mgr).__name__, "kept": len(_keep),
+                                 "freed": len(_gone),
+                                 "free_blocks": int(_pool.get_num_free_blocks())})
+                    if _blocks:
+                        _kept = [int(p) for p in pages]
+                        _kept_set = set(_kept)
+                        _old = list(_blocks[0])
+                        _drop = [int(b) for b in _old if int(b) not in _kept_set]
+                        if _drop:
+                            _objs = [_pool.blocks[b] for b in _drop
+                                     if 0 <= b < len(getattr(_pool, "blocks", []))]
+                            _pool.free_blocks(_objs)
+                        _blocks[0] = _kept
+                        _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "compact_freed", "req": request_id,
+                                 "kept": len(_kept), "freed": len(_drop),
+                                 "free_blocks": int(_pool.get_num_free_blocks())})
+            except Exception:
+                _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "compact_free_error", "req": request_id,
+                         "error": traceback.format_exc()[-300:]})
             entry = {"kind": "compact_applied", "pid": os.getpid(),
                      "req": request_id, "pages": len(pages),
                      "visible_tokens": visible,
