@@ -182,6 +182,21 @@ class VllmSparseRuntime:
         self.first_page = int(first_page)
         # Spill before the pool fills: resident pages per request during prefill.
         self.prefill_high_watermark = self.selector.budget_pages() + 64
+        # --- mean-K statistics owned by kvmem's RawKvStore (v0.19 recall design) --------------
+        # KVMEM_STATS=core fills one kvmem statistics store per request from the engine's
+        # device-side 64-token bucket sums (kvmem_bridge.capture_k). The Python mean-key index
+        # keeps running alongside it until the scoring path moves over (P1), so the two can be
+        # compared block by block instead of trusting a rewrite.
+        self.stats_core = os.environ.get("KVMEM_STATS", "").strip().lower() in ("core", "1", "on")
+        self.stats_decode = os.environ.get("KVMEM_STATS_DECODE", "0").strip() == "1"
+        self._statistics = {}       # req -> KvmemStatistics
+        self._stats_next = {}       # req -> first TRUE position not yet written
+        self._stats_written = {}    # req -> bucket writes
+        self._stats_skipped = {}    # req -> {reason: count} so a refusal cannot hide behind another
+        # Set by the plugin from the attention module: per-rank KV heads and the number of
+        # full-attention layers (= the statistics store's n_layer).
+        self.kv_heads = 0
+        self.statistics_layers = 0
 
     # --- state -------------------------------------------------------------------------
     def _absorb_engine_row(self, req):
@@ -246,6 +261,10 @@ class VllmSparseRuntime:
                             orch.planner.pre_rope_statistics = True
                     except Exception:
                         pass
+                try:
+                    self.attach_statistics(req)
+                except Exception:
+                    pass
                 return
             kv_tensors = self.view.paged_kv()
             session = max(1, len(self._orch) + 1)
@@ -325,6 +344,10 @@ class VllmSparseRuntime:
                 orch.retrieval_index = index
                 if orch.planner is not None:
                     orch.planner.pre_rope_statistics = True
+            try:
+                self.attach_statistics(req)
+            except Exception:
+                pass
             orch.session_id = session      # identity used by the shared H pool on release
             self._orch[req] = orch
             self._owned_slots[req] = set()
@@ -539,6 +562,138 @@ class VllmSparseRuntime:
     def retrieval_index(self, req):
         return self._retrieval.get(req)
 
+    # --- mean-K statistics (kvmem RawKvStore, v0.19 design) --------------------------------
+    def attach_statistics(self, req):
+        """Give this request the kvmem statistics store the recall design owns.
+
+        Upstream keeps one `RawKvStore` per sequence holding only mean-K sums
+        (`n_layer = full-attention layers`, `n_embd_k = kv_heads*head_dim`, `block_tokens = 64`)
+        and fills it from device-side bucket sums. The store is per REQUEST because a request is
+        the unit the engine rewinds/truncates.
+        """
+        if not self.stats_core:
+            return None
+        layers = int(self.statistics_layers or 0)
+        heads = int(self.kv_heads or 0)
+        if layers <= 0 or heads <= 0:
+            self._skip("(global)", "no geometry")
+            return None
+        try:
+            from kvmem_statistics import KvmemStatistics
+            stats = KvmemStatistics(layers, heads, self.head_dim)
+        except Exception as exc:                       # binding missing / build stale
+            self._skip("(global)", f"store init: {exc}")
+            return None
+        self._statistics[req] = stats
+        self._stats_next.setdefault(req, 0)
+        orch = self._orch.get(req)
+        if orch is not None:
+            orch.statistics = stats
+        return stats
+
+    def _skip(self, req, reason):
+        """Count a statistics refusal by reason (a single `setdefault` slot hid the real cause)."""
+        bucket = self._stats_skipped.setdefault(req, {})
+        bucket[reason] = int(bucket.get(reason, 0)) + 1
+
+    def publish_position_offset(self, req):
+        """Tell the capture op this step's compacted->true offset (before the model runs)."""
+        if not self.stats_core or req not in self._statistics:
+            return
+        try:
+            st = self.state(req)
+            offset = max(0, int(getattr(st, "tokens", 0)) - int(getattr(st, "seq_len", 0)))
+            from vllm import kvmem_bridge as bridge
+            bridge.set_position_offset(offset)
+        except Exception:
+            pass
+
+    def harvest_key_statistics(self, req, n_tokens):
+        """Drain this step's device bucket sums into the request's kvmem RawKvStore.
+
+        Called right AFTER the model ran for the step, so the bucket rows describe exactly the
+        tokens the model pushed through. Prompt steps are exact; a step that carries speculative
+        drafts is refused, because the model writes 1+draft rows while acceptance is decided
+        later, and committing them would inject rejected KV into the statistics.
+        """
+        if not self.stats_core:
+            return 0
+        stats = self._statistics.get(req)
+        if stats is None:
+            # `attach_statistics` runs when the request is created, which can be BEFORE the plugin
+            # has published the model geometry (the bridge is installed on the first step of the
+            # first request), so retry here rather than leaving that request without a store.
+            stats = self.attach_statistics(req)
+            if stats is None:
+                self._skip(req, "no store")
+                return 0
+        n = int(n_tokens or 0)
+        if n <= 0:
+            return 0
+        if req in (getattr(self, "spec_reqs", None) or ()):
+            self._skip(req, "drafts")
+            return 0
+        if not self.stats_decode:
+            # Prompt steps are exact; a decode step's acceptance is decided later, and any skipped
+            # step would leave a hole in `_stats_next` (the true frontier), so P0 writes the prompt
+            # only. `st.prefill_done` is the runtime's own record that decode has started.
+            try:
+                if bool(getattr(self.state(req), "prefill_done", False)):
+                    self._skip(req, "prefill_done")
+                    return 0
+            except Exception:
+                self._skip(req, "no state")
+                return 0
+        if int(getattr(self, "batch_size", 1) or 1) > 1:
+            # One position offset is published per step; a batched step would attribute every
+            # request's buckets to the same offset.
+            self._skip(req, "batch")
+            return 0
+        try:
+            from vllm import kvmem_bridge as bridge
+            from kvmem_statistics import stats_from_bridge
+            first = int(self._stats_next.get(req, 0))
+            sums = stats_from_bridge(bridge, range(stats.layers), first, n)
+            if not sums:
+                self._skip(req, "no capture")
+                return 0
+            written = stats.write_step(first, n, sums)
+            self._stats_next[req] = first + n
+            try:
+                import json as _json, os as _os
+                if (_os.environ.get("KVMEM_STATS_DEBUG", "") == "1"
+                        and int(self._stats_written.get("_dbg", 0)) < 40):
+                    self._stats_written["_dbg"] = int(self._stats_written.get("_dbg", 0)) + 1
+                    with open("/tmp/kvmem_stats_debug.jsonl", "a") as _fh:
+                        _fh.write(_json.dumps({"pid": _os.getpid(), "req": str(req)[:12],
+                                               "pid_f": "harvest", "first": first, "n": n,
+                                               "layers": len(sums), "written": written,
+                                               "frontier": stats.frontier,
+                                               "sums_shape": [int(x) for x in
+                                                              list(sums.values())[0].shape]}) + "\n")
+            except Exception:
+                pass
+            self._stats_written[req] = int(self._stats_written.get(req, 0)) + int(written)
+            return written
+        except Exception:
+            try:
+                import traceback as _tb
+                self.log({"kind": "stats_error", "req": req, "error": _tb.format_exc()[-800:]})
+            except Exception:
+                pass
+            return 0
+
+    def statistics_stats(self, req):
+        stats = self._statistics.get(req)
+        if stats is None:
+            return {"enabled": bool(self.stats_core), "present": False,
+                    "skipped": self._stats_skipped.get(req)}
+        out = stats.stats()
+        out["written"] = int(self._stats_written.get(req, 0))
+        out["next"] = int(self._stats_next.get(req, 0))
+        out["skipped"] = self._stats_skipped.get(req)
+        return out
+
     def live_requests(self):
         """Requests the runtime still holds state for (for the worker-side sweep)."""
         return list(self._orch.keys())
@@ -552,6 +707,15 @@ class VllmSparseRuntime:
         """
         st = self._state.get(req)
         row = getattr(st, "row_index", None) if st is not None else None
+        # One unconditional record per request: whether the kvmem statistics store actually
+        # received this prompt. Without it the only evidence was a sampled step log, and a silent
+        # harvest refusal looked identical to "statistics are off".
+        if self.stats_core and self.log is not None:
+            try:
+                self.log({"kind": "statistics_final", "req": str(req)[:12],
+                          **self.statistics_stats(req)})
+            except Exception:
+                pass
         parked = False
         if self.session_reuse and st is not None:
             try:

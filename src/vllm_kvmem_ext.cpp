@@ -5,9 +5,16 @@
 // fills/drains them in place (no copy).
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <pybind11/numpy.h>
 #include <cstdio>
 
 #include "kvmem/memory_contract.hpp"
+// v0.19's recall design keeps one statistics store per sequence: a RawKvStore holding only the
+// mean-K sums (`n_layer = full-attention layers`, `n_embd_k = kv_heads*head_dim`,
+// `block_tokens = 64`). The reference product program fills it from device-side bucket sums
+// (backends/ninfer .../storage/memory_statistics.cpp) and scores it with the mean-K/page-softmax
+// scorers, so the adapter binds it instead of keeping a second mean-key store in Python.
+#include "kvmem/raw_kv_store.hpp"
 // nvme_kv_tier.hpp was removed in upstream v0.19 (shared SSD tier retired). The two Python
 // call sites (kvmem_sparse_orchestrator / kvmem_history_cache) are guarded by try/except and a
 // disk-config condition, so the RAM-only path degrades to self._disk = None without this binding.
@@ -335,6 +342,45 @@ PYBIND11_MODULE(vllm_kvmem_ext, m) {
         .def("abort", &MemorySession::abort)
         .def("phase", &MemorySession::phase)
         .def("disconnect", &MemorySession::disconnect);
+    // --- mean-K statistics store (v0.19 recall design) ---------------------------------------
+    py::class_<kvmem::RawKvStore, std::unique_ptr<kvmem::RawKvStore>>(m, "RawKvStore")
+        .def(py::init([](uint32_t n_layer, uint32_t n_embd_k, uint32_t block_tokens) {
+            kvmem::RawKvStoreConfig cfg;
+            cfg.n_layer = n_layer;
+            cfg.n_embd_k = n_embd_k;   // kv_heads * head_dim (the key width, not the query width)
+            cfg.block_tokens = block_tokens ? block_tokens : 64;
+            return std::make_unique<kvmem::RawKvStore>(cfg);
+        }), py::arg("n_layer"), py::arg("n_embd_k"), py::arg("block_tokens") = 64)
+        .def("write_layer_mean_sum",
+            [](kvmem::RawKvStore & self, uint32_t pos0, uint32_t n, uint32_t layer,
+               py::array_t<float, py::array::c_style | py::array::forcecast> sum) {
+                const auto info = sum.request();
+                if (info.ndim != 1 || uint64_t(info.shape[0]) != self.config().n_embd_k)
+                    throw std::invalid_argument("mean-sum width must equal n_embd_k");
+                self.write_layer_mean_sum(pos0, n, layer,
+                                          static_cast<const float *>(info.ptr));
+            }, py::arg("pos0"), py::arg("n"), py::arg("layer"), py::arg("sum"))
+        .def("mean_k", [](const kvmem::RawKvStore & self, uint32_t block_id, uint32_t layer) {
+            const auto width = self.config().n_embd_k;
+            py::array_t<float> out(width);
+            self.mean_k(block_id, layer, out.mutable_data());
+            return out;
+        }, py::arg("block_id"), py::arg("layer"))
+        .def("n_tokens", &kvmem::RawKvStore::n_tokens, py::arg("block_id"))
+        .def("has_block", &kvmem::RawKvStore::has_block, py::arg("block_id"))
+        .def("truncate_to", &kvmem::RawKvStore::truncate_to, py::arg("token_pos"))
+        .def("clear", &kvmem::RawKvStore::clear)
+        .def("allocated_bytes", &kvmem::RawKvStore::allocated_bytes)
+        .def("mean_checkpoint", &kvmem::RawKvStore::mean_checkpoint, py::arg("token_pos"))
+        .def("restore_mean_checkpoint", &kvmem::RawKvStore::restore_mean_checkpoint,
+             py::arg("token_pos"), py::arg("state"))
+        .def_property_readonly("n_layer", [](const kvmem::RawKvStore & self) {
+            return self.config().n_layer; })
+        .def_property_readonly("n_embd_k", [](const kvmem::RawKvStore & self) {
+            return self.config().n_embd_k; })
+        .def_property_readonly("block_tokens", [](const kvmem::RawKvStore & self) {
+            return self.config().block_tokens; });
+
     // --- NVMe KV tier (disk layer, D budget) -------------------------------------------------
     // Removed with upstream v0.19: the shared SSD tier (nvme_kv_tier.hpp) was retired and the
     // RAM-only PinnedKvTier does not expose this binding. The Python call sites are guarded, so

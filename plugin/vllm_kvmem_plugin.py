@@ -597,12 +597,32 @@ def _attach_sparse(runner, log_path):
         ok = bool(per_rank) and _bridge.ensure(layers=layers, heads=per_rank,
                                               head_dim=head_dim,
                                               device=getattr(view, "device", "cuda"),
-                                              dtype=_act_dtype)
+                                              dtype=_act_dtype,
+                                              kv_heads=kv_heads)
+        # The mean-K statistics store needs the model's own geometry: `n_layer` is the number of
+        # FULL-attention layers (the ones the capture op numbers), and `n_embd_k` is
+        # kv_heads*head_dim. The MTP layer reports slot -1 and is not part of it.
+        try:
+            _types = None
+            for _holder in (hf, getattr(hf, "text_config", None)):
+                if _holder is None:
+                    continue
+                _types = getattr(_holder, "layer_types", None)
+                if _types is None and isinstance(_holder, dict):
+                    _types = _holder.get("layer_types")
+                if _types:
+                    break
+            _full = sum(1 for _t in list(_types or []) if "full" in str(_t))
+            runtime.statistics_layers = int(_full or 0)
+            runtime.kv_heads = int(kv_heads or 0)
+        except Exception:
+            pass
         _append(log_path, {"kind": "bridge_ensure", "ok": bool(ok), "pid": os.getpid(),
                            "tokens": int(os.environ.get("KVMEM_CAPTURE_TOKENS", 0) or 0),
                            "layers": layers, "heads_per_rank": per_rank,
                            "kv_heads": kv_heads, "head_dim": head_dim, "tp": tp,
-                           "buf_dtype": str(_act_dtype)})
+                           "buf_dtype": str(_act_dtype),
+                           "statistics_layers": getattr(runtime, "statistics_layers", 0)})
     except Exception:
         _append(log_path, {"kind": "bridge_ensure_error", "error": traceback.format_exc()})
     global _ACTIVE_RUNTIME
@@ -1290,6 +1310,11 @@ def _install(cls, module_name, probe, smoke, state):
                                  "drafts": len(_d)})
                 for _req, _n in list(_counts.items()):
                     _rt.advance_tokens(_req, int(_n))
+                    # The mean-K statistics are keyed by TRUE positions while the model may run at
+                    # compacted ones; publish the offset before the model executes so the capture op
+                    # buckets this step correctly (device tensor -> CUDA graph replays it live).
+                    if getattr(_rt, "stats_core", False):
+                        _rt.publish_position_offset(_req)
         except Exception:
             _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                     {"kind": "advance_error", "error": traceback.format_exc()})
@@ -1329,6 +1354,30 @@ def _install(cls, module_name, probe, smoke, state):
                 for req, n_new in scheduled.items():
                     if cap is not None:
                         cap.note_tokens(int(n_new))
+                    # KVMem mean-K statistics (v0.19 design): the model has just written this
+                    # step's K, so the bridge's 64-token bucket sums are complete. Draining them
+                    # here (a step boundary) is what keeps the device buffer per step; the
+                    # context-sized sum lives in the request's kvmem RawKvStore.
+                    if getattr(runtime, "stats_core", False):
+                        if state.get("stats_probe", 0) < 6:
+                            state["stats_probe"] = state.get("stats_probe", 0) + 1
+                            try:
+                                _st = runtime.state(req)
+                                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                        {"kind": "harvest_attempt", "pid": os.getpid(),
+                                         "step": state["steps"], "n_new": int(n_new),
+                                         "tokens": _st.tokens, "seq_len": _st.seq_len,
+                                         "prefill_done": bool(getattr(_st, "prefill_done", False)),
+                                         "drafts": req in (getattr(runtime, "spec_reqs", None) or ()),
+                                         "batch": int(getattr(runtime, "batch_size", 1) or 1)})
+                            except Exception:
+                                pass
+                        try:
+                            runtime.harvest_key_statistics(req, int(n_new))
+                        except Exception:
+                            _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                    {"kind": "stats_harvest_error", "req": req,
+                                     "error": traceback.format_exc()[-600:]})
                     # Token accounting now lives in runtime.advance_tokens (driven from this
                     # wrapper's entry). Calling after_step here as well double-counted the
                     # frontier: a 37K request reached tokens=98327.
@@ -1342,6 +1391,11 @@ def _install(cls, module_name, probe, smoke, state):
                                  "step": state["steps"], "n_new": int(n_new),
                                  "tokens": st_now.tokens, "seq_len": st_now.seq_len,
                                  "row": len(st_now.row)})
+                        if getattr(runtime, "stats_core", False):
+                            _append(probe or smoke or "/tmp/kvmem_sparse.jsonl",
+                                    {"kind": "statistics", "pid": os.getpid(),
+                                     "req": str(req)[:8], "n_new": int(n_new),
+                                     **runtime.statistics_stats(req)})
                     if trace:
                         # Logging must never break the step.
                         try:
