@@ -1020,7 +1020,11 @@ class VllmSparseRuntime:
         if st is None or n <= 0:
             return 0
         try:
-            last_rank = (int(getattr(st, "tokens", 0)) + n - 1) // max(1, self.page_tokens)
+            # RESIDENT coordinate: the row covers the compacted sequence, so the pages this step
+            # needs are ranks 0..(seq_len + n)/page. Using the LOGICAL count asked for ranks the
+            # compacted row cannot have (measured: wanted 11521 entries, had 4141) and the appended
+            # stale ids made FlashInfer fault.
+            last_rank = (int(getattr(st, "seq_len", 0)) + n - 1) // max(1, self.page_tokens)
             if len(st.row) > last_rank:
                 return 0
             self._absorb_engine_row(req)
