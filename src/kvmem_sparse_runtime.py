@@ -162,6 +162,7 @@ class VllmSparseRuntime:
         self.restore_state = None
         self.reset_state = None          # zero the recurrent state (reconstruction)
         self.set_block_cursor = None     # reset the worker's block-table append cursor
+        self.reselect_at_prompt_end = False   # re-rank at prompt end (needs a state rebuild)
         self.compact_rebuild = False     # rewrite the token book on compaction (reconstruction)
         # True when the model has non-attention (GDN/Mamba) KV groups. Their recurrent state is NOT
         # in the paged store, so a resume is only safe when a state snapshot travelled with the
@@ -1093,6 +1094,46 @@ class VllmSparseRuntime:
 
     def advance_tokens(self, req, n_new):
         self._inflight[req] = int(n_new or 0)
+        # Prompt-complete reselect: once the WHOLE prompt is in, the question is inside the captured
+        # query window, so rank the working set with the real query. This used to hang off the first
+        # DECODE step, which a long prompt never reaches in that state (the compaction paths set
+        # `prefill_done` earlier), so a 147K prompt finished prefill, never re-ranked, and answered
+        # with the tail instead of the middle ("7").
+        try:
+            _stq = self.state(req)
+            _plq = int(self._prompt_len.get(req, 0) or 0)
+            _orchq = self._orch.get(req)
+            # Detect "the prompt just finished" without trusting `_prompt_len`: the step AFTER a
+            # prefill chunk is the first decode step. (The prompt-length check never fired for a
+            # long prompt - 147K prefilled, no re-rank, tail answer.)
+            _prev_n = int(getattr(self, "_prev_chunk", {}).get(req, 0) or 0)
+            try:
+                self._prev_chunk = getattr(self, "_prev_chunk", {})
+                self._prev_chunk[req] = int(n_new or 0)
+            except Exception:
+                pass
+            # Re-ranking the working set right at the end of prefill REPLACES the row the recurrent
+            # state was built against. Measured on a 147K prompt: the ranking found the needle block
+            # at the top (score 5.32 vs 1.77) but the answer went from correct to "7", because the
+            # state no longer matches the installed view. Off unless explicitly enabled; the
+            # state-consistent re-rank needs a reconstruction pass.
+            _finished = (self.reselect_at_prompt_end
+                         and _prev_n > 1 and int(n_new or 0) <= 1)
+            if (((_plq and int(getattr(_stq, "tokens", 0)) >= _plq) or _finished)
+                    and not getattr(_stq, "query_reselected", False)
+                    and getattr(_stq, "row", ())
+                    and _orchq is not None
+                    and getattr(_orchq, "retrieval_index", None) is not None):
+                _stq.query_reselected = True
+                if self.log is not None:
+                    self.log({"kind": "query_reselect", "req": req, "tokens": int(_stq.tokens),
+                              "prompt": _plq, "n_new": int(n_new or 0), "why": "prompt_complete"})
+                self._reselect(req, probe=True)
+        except Exception:
+            if self.log is not None:
+                import traceback as _tb
+                self.log({"kind": "query_reselect_error", "req": req,
+                          "error": _tb.format_exc()[-400:]})
         # QueryReplay boundary: this step prefills the FINAL chunk of the prompt, so snapshot the
         # recurrent state BEFORE it runs. Replaying that chunk afterwards must start from this state
         # or the tokens are applied to the GDN state twice.
