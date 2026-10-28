@@ -138,6 +138,87 @@ def _console_step(context):
         pass
 
 
+HOT_REQUEST = "/tmp/kvmem_reload.request"
+
+
+def _hot_apply(runner, runtime, log_path):
+    """Apply pending Python changes at a REQUEST BOUNDARY (no capture in flight). Never raises.
+
+    Python code does not need an engine restart: modules are reloaded and their methods rebound on
+    the live runtime class, and the bridge geometry is rebuilt in place. Only compiled extensions
+    (the pybind .so) would need a restart - nothing here touches those.
+    """
+    import importlib
+    import os
+    import traceback
+    out = []
+    try:
+        reloaded = {}
+        for name in ("kvmem_statistics", "kvmem_recall", "kvmem_sparse_orchestrator",
+                     "kvmem_sparse_runtime"):
+            try:
+                module = importlib.import_module(name)
+                reloaded[name] = importlib.reload(module)
+            except Exception as exc:
+                out.append(f"reload {name}: {exc}")
+        mod = reloaded.get("kvmem_sparse_runtime")
+        if mod is not None:
+            cls = type(runtime)
+            rebound = []
+            for attr in ("harvest_key_statistics", "attach_statistics", "statistics_stats",
+                         "publish_position_offset", "_skip"):
+                if hasattr(mod.VllmSparseRuntime, attr):
+                    setattr(cls, attr, getattr(mod.VllmSparseRuntime, attr))
+                    rebound.append(attr)
+            out.append(f"rebound {rebound}")
+        # Re-derive the PER-RANK key geometry from the config (the hf count is global under TP) and
+        # rebuild the bridge buffers at that width.
+        from vllm import kvmem_bridge as _bridge
+        cfg = getattr(getattr(runner, "vllm_config", None), "model_config", None)
+        hf = getattr(cfg, "hf_config", None)
+        text = getattr(hf, "text_config", None)
+        def _int(obj, name):
+            value = getattr(obj, name, None)
+            return int(value) if isinstance(value, int) and value > 0 else 0
+        heads = _int(hf, "num_attention_heads") or _int(text, "num_attention_heads")
+        kv_global = _int(hf, "num_key_value_heads") or _int(text, "num_key_value_heads") or heads
+        head_dim = _int(hf, "head_dim") or _int(text, "head_dim") or 256
+        try:
+            tp = int(getattr(getattr(runner, "vllm_config", None), "parallel_config",
+                             None).tensor_parallel_size)
+        except Exception:
+            tp = 1
+        per_rank_heads = max(1, heads // max(1, tp)) if heads else 0
+        per_rank_kv = max(1, kv_global // max(1, tp)) if kv_global else 0
+        layers = _int(hf, "num_hidden_layers") or _int(text, "num_hidden_layers") or 64
+        ok = _bridge.ensure(layers=layers, heads=per_rank_heads, head_dim=head_dim,
+                            device="cuda", dtype=torch_dtype(runner),
+                            kv_heads=per_rank_kv, force=True)
+        runtime.kv_heads = per_rank_kv
+        for table in ("_statistics", "_stats_next", "_stats_written", "_stats_skipped",
+                      "_compare_done"):
+            getattr(runtime, table).clear()
+        out.append(f"bridge force-ensure ok={ok} heads/rank={per_rank_heads} "
+                   f"kv/rank={per_rank_kv} width={getattr(_bridge, '_KEY_WIDTH', None)}")
+    except Exception:
+        out.append("EXC:\n" + traceback.format_exc()[-800:])
+    try:
+        _append(log_path, {"kind": "hot_apply", "pid": os.getpid(), "lines": out})
+    except Exception:
+        pass
+    try:
+        os.remove(HOT_REQUEST)
+    except Exception:
+        pass
+
+
+def torch_dtype(runner):
+    import torch as _t
+    cfg = getattr(getattr(runner, "vllm_config", None), "model_config", None)
+    dtype = getattr(cfg, "dtype", None)
+    return dtype if getattr(dtype, "is_floating_point", False) else _t.bfloat16
+
+
 def _append(path, record):
     try:
         with open(path, "a") as handle:
@@ -1387,6 +1468,10 @@ def _install(cls, module_name, probe, smoke, state):
                         _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                                 {"kind": "spec_short", "req": str(_r)[:8], "scheduled": _n,
                                  "drafts": len(_d)})
+                if _rt is not None and not os.path.exists(HOT_REQUEST):
+                    pass
+                elif _rt is not None:
+                    _hot_apply(self, _rt, probe or smoke or "/tmp/kvmem_sparse.jsonl")
                 for _req, _n in list(_counts.items()):
                     _rt.advance_tokens(_req, int(_n))
                     # The mean-K statistics are keyed by TRUE positions while the model may run at
