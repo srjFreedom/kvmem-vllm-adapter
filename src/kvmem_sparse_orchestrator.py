@@ -508,8 +508,14 @@ class SparseOrchestrator:
                 rec = {"kind": "scorer_compare", "rows": rows, "layers": len(layer_rows),
                        "query_heads": query_heads, "kv_heads": kv_heads,
                        "core_blocks": len(core), "legacy_blocks": len(legacy)}
-                rec.update(compare_scores(core, legacy,
-                                          blocks=range(len(core)), top=10))
+                from kvmem_recall import align_scores
+                lb = int(getattr(index, "block_tokens", 0) or 0)
+                aligned = align_scores(core, int(getattr(stats, "block_tokens", 64)),
+                                       len(legacy), lb)
+                rec["core_block_tokens"] = int(getattr(stats, "block_tokens", 64))
+                rec["legacy_block_tokens"] = lb
+                rec.update(compare_scores(aligned, legacy,
+                                          blocks=range(len(aligned)), top=10))
             self._compare_done = getattr(self, "_compare_done", 0) + 1
             _probe_write(rec)
         except Exception:

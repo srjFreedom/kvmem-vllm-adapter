@@ -178,3 +178,38 @@ def compare_scores(core, legacy, blocks=None, top: int = 10) -> dict:
     except Exception as exc:
         return {"comparable": False, "error": f"{type(exc).__name__}: {exc}"}
     return out
+
+
+def align_scores(core, core_block_tokens: int, legacy_blocks: int,
+                 legacy_block_tokens: int):
+    """Resample core scores onto the LEGACY block grid before comparing them.
+
+    The two sides do not score the same token spans: kvmem's statistics bucket is 64 tokens while
+    the shipped selection block is 32 (`--kvmem-block-tokens 32`), so comparing element i to element
+    i compared different halves of the context - which is what produced rank_corr ~ -0.02 and a
+    meaningless top_overlap of 0.
+    """
+    core = list(core)
+    if not core or legacy_blocks <= 0:
+        return []
+    core_block_tokens = int(core_block_tokens or 0)
+    legacy_block_tokens = int(legacy_block_tokens or 0)
+    if not core_block_tokens or not legacy_block_tokens or core_block_tokens == legacy_block_tokens:
+        return core[:legacy_blocks]
+    if core_block_tokens % legacy_block_tokens == 0:
+        ratio = core_block_tokens // legacy_block_tokens
+        return [core[min(len(core) - 1, j // ratio)] for j in range(legacy_blocks)]
+    if legacy_block_tokens % core_block_tokens == 0:
+        ratio = legacy_block_tokens // core_block_tokens
+        out = []
+        for j in range(legacy_blocks):
+            part = core[j * ratio:(j + 1) * ratio]
+            out.append(float(np.mean(part)) if part else 0.0)
+        return out
+    # Coarse grids only: map each legacy block's midpoint to the core block containing it.
+    out = []
+    for j in range(legacy_blocks):
+        mid = (j + 0.5) * legacy_block_tokens
+        index = int(mid // core_block_tokens)
+        out.append(core[min(len(core) - 1, max(0, index))])
+    return out
