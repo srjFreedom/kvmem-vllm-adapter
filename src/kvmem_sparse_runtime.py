@@ -1007,6 +1007,11 @@ class VllmSparseRuntime:
         self._pending_new[req] = int(n_new)
 
     def ensure_row_for_chunk(self, req, n_tokens):
+        # OFF by default: synthesising the row from the page map introduced DUPLICATE page ids even
+        # on the first prefills (measured: len=256, uniq=102, dups=154), because the map is keyed by
+        # LOGICAL page and the row by RESIDENT rank. A row with duplicates points several positions
+        # at one physical page, which corrupts attention and can fault. The engine appends blocks
+        # for new tokens itself; the after-step growth then mirrors them.
         """Make the block table row cover the tokens this step is about to write.
 
         The row used to be extended in `after_step`, i.e. AFTER the model ran - so a prefill chunk
@@ -1015,6 +1020,8 @@ class VllmSparseRuntime:
         illegal memory access). Growing it at step entry, from the engine's own page map, keeps the
         row at least as long as `seq_len` for every step.
         """
+        if not bool(getattr(self, "row_grow_pre_step", False)):
+            return 0
         st = self._state.get(req)
         n = int(n_tokens or 0)
         if st is None or n <= 0:
@@ -1049,6 +1056,21 @@ class VllmSparseRuntime:
                           "tokens": int(getattr(st, "tokens", 0)), "n": n,
                           "page_map": len(page_map), "next_page": getattr(st, "next_page", None)})
             st.row = tuple(grown)
+            # Validity of the row's page ids: FlashInfer faults on an id past the pool or on a page
+            # that was handed back to the allocator, and neither shows up as "row too short".
+            try:
+                nb = int(self.view.num_blocks()) if hasattr(self.view, "num_blocks") else 0
+                if nb and st.row:
+                    mx = max(st.row)
+                    mn = min(st.row)
+                    uniq = len(set(st.row))
+                    if mx >= nb or mn < 0 or uniq != len(st.row):
+                        self.log({"kind": "row_invalid", "req": req,
+                                  "max": int(mx), "min": int(mn), "pool": nb,
+                                  "len": len(st.row), "uniq": int(uniq),
+                                  "dups": int(len(st.row) - uniq)})
+            except Exception:
+                pass
             # The attention length must equal what the ROW actually holds, including this chunk. The
             # runtime used to keep its own `seq_len`, and after an in-prefill compaction it drifted
             # away from the engine's num_computed by tens of thousands of tokens (measured:
