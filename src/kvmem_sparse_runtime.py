@@ -1418,7 +1418,13 @@ class VllmSparseRuntime:
                 self.log({"kind": "query_reselect", "req": req, "tokens": int(st.tokens),
                           "prompt": prompt_len, "n_new": int(n_new_tokens or 0)})
                 self._reselect(req, probe=True)
-            elif len(orch.resident) > high:
+            elif max(len(orch.resident), len(st.row)) > high:
+                # The ROW is the true residency: pages the engine appended since the last
+                # compaction are in the row immediately (the cursor sync copies them), while
+                # `orch.resident` only knows the set the last compaction installed. Comparing
+                # against the stale set let residency climb unchecked until the physical pool ran
+                # out (measured: row 11,008 pages = 176,128 tokens on a 179,182-token pool, then
+                # the next allocation faulted).
                 try:
                     self._reselect(req, prefill_pressure=True)
                 except Exception:
@@ -1430,7 +1436,7 @@ class VllmSparseRuntime:
                 # so the next useful one is a reserve later (R tokens = 2K pages at B=53K). Without
                 # this every prefill chunk compacted - 24 reselects on a 200K prompt, each moving
                 # ~3.3K pages (measured: prefill fell to ~300 tok/s, 9x slower).
-                self.prefill_high_watermark = len(orch.resident) + max(
+                self.prefill_high_watermark = max(len(orch.resident), len(st.row)) + max(
                     64, int(self.gen_reserve) // max(1, self.page_tokens))
                 if int(getattr(self, "needle_trace", 0)) > 0:
                     resident = sorted(orch.resident)
