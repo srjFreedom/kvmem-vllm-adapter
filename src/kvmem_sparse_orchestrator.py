@@ -453,6 +453,86 @@ class SparseOrchestrator:
         self.baked_delta[page] = needed
         return needed
 
+    # --- v0.19 scoring path ------------------------------------------------------------
+    def core_selection_scores(self):
+        """Page-softmax scores from kvmem's own scorer, resampled to the selection-block grid.
+
+        This IS the ranking input now. Upstream's default configuration is page-softmax with LRFU
+        off (resolve_query_scoring: softmax implies mean aggregation and no LRFU), so the scores
+        here are attention-mass shares that are already comparable between rounds - the LRFU decay
+        exists for the uncalibrated cosine scorer we no longer use.
+
+        Returns None when there is nothing to score (no statistics / no query yet), which the caller
+        treats as "keep the current working set" rather than as a ranking of zeros.
+        """
+        stats = getattr(self, "statistics", None)
+        if stats is None:
+            return None
+        try:
+            from vllm import kvmem_bridge as bridge
+            from kvmem_recall import KvmemRecall, align_scores
+        except Exception:
+            return None
+        if not getattr(bridge, "ARMED", False):
+            return None
+        layer_rows, rows = {}, 0
+        try:
+            for layer, (q, _pos) in bridge.read_all().items():
+                if q is None or q.numel() == 0:
+                    continue
+                q = q.detach().to("cpu", non_blocking=False).float()
+                layer_rows[int(layer)] = q
+                rows = max(rows, int(q.shape[0]))
+        except Exception:
+            return None
+        if rows <= 0 or not layer_rows:
+            return None
+        recall = getattr(self, "_recall", None)
+        if recall is None:
+            cfg = getattr(self.selector, "config_", None)
+            recall = KvmemRecall(
+                stats,
+                block_tokens=int(getattr(stats, "block_tokens", 64) or 64),
+                sink_blocks=int(getattr(cfg, "sink_tokens", 0) or 0) // 64,
+                recent_blocks=int(getattr(cfg, "recent_tokens", 0) or 0) // 64,
+                budget_blocks=int(getattr(cfg, "budget_tokens", 0) or 0) // 64,
+                aggregation="mean")
+            self._recall = recall
+        frontier = int(getattr(stats, "frontier", 0))
+        if frontier <= 0:
+            return None
+        query_heads = int(layer_rows[next(iter(layer_rows))].shape[1])
+        core = recall.scores(layer_rows, rows, query_heads,
+                             int(getattr(stats, "kv_heads", 0) or 0),
+                             int(getattr(stats, "head_dim", 0) or 0),
+                             frontier // int(recall.block_tokens))
+        if core is None:
+            self._core_error = recall.last_error
+            return None
+        self._core_error = None
+        self._last_core = list(core)
+        if not getattr(self, "_core_logged", False):
+            self._core_logged = True
+            try:
+                finite = [float(v) for v in core if v == v]
+                order = sorted(range(len(core)), key=lambda i: -float(core[i]))[:5]
+                _probe_write({"kind": "core_scores", "scorer": recall.scorer,
+                              "aggregation": "max" if recall.max_aggregation else "mean",
+                              "blocks": len(core), "finite": len(finite),
+                              "min": min(finite) if finite else None,
+                              "max": max(finite) if finite else None,
+                              "sum": round(sum(finite), 6) if finite else None,
+                              "top": order, "device_bytes": getattr(recall, "device_bytes", 0),
+                              "frontier": frontier, "rows": rows})
+            except Exception:
+                pass
+        selection_blocks = int(getattr(self.selector, "selection_blocks", lambda: 0)() or 0)
+        if selection_blocks <= 0:
+            return None
+        aligned = align_scores(core, int(recall.block_tokens), selection_blocks,
+                              int(self.selector.tokens_per_selection_block()))
+        return aligned or None
+
     # --- P1 audit: core mean-K scorer vs the legacy Python index ------------------------
     def _compare_core_scores(self, blocks, legacy):
         """Log one comparison record (env: KVMEM_SCORER_COMPARE=1). Never raises."""
@@ -506,7 +586,7 @@ class SparseOrchestrator:
                     sink_blocks=int(getattr(cfg, "sink_tokens", 0) or 0) // 64,
                     recent_blocks=int(getattr(cfg, "recent_tokens", 0) or 0) // 64,
                     budget_blocks=int(getattr(cfg, "budget_tokens", 0) or 0) // 64,
-                    aggregation="max")
+                    aggregation="mean")
                 self._recall = recall
             count = int(getattr(stats, "frontier", 0)) // int(recall.block_tokens)
             core = recall.scores(layer_rows, rows, query_heads, kv_heads, head_dim, count)
@@ -542,16 +622,32 @@ class SparseOrchestrator:
                  prefill_pressure=False, forced_pages=()):
         # The selector works on the token frontier, which can include a partially-filled last
         # selection block; only pages that already hold written tokens may be selected.
-        if self.retrieval_index is not None:
+        core = None
+        try:
+            core = self.core_selection_scores()
+        except Exception as exc:
+            _probe_write({"kind": "core_scores_error", "error": f"{type(exc).__name__}: {exc}"})
+        if core is not None:
+            blocks = list(range(len(core)))
+            raw = [float(v) for v in core]
+            # Cross-check record only: the legacy index never feeds the selector any more.
+            if self.retrieval_index is not None:
+                try:
+                    legacy_blocks = self.retrieval_index.covered_blocks()
+                    legacy = [float(v) for v in self.retrieval_index.scores(legacy_blocks)] \
+                        if legacy_blocks else []
+                    if legacy:
+                        self._compare_core_scores(legacy_blocks, legacy)
+                except Exception:
+                    pass
+        elif self.retrieval_index is not None:
             blocks = self.retrieval_index.covered_blocks()
             if blocks:
                 try:
                     scores = self.retrieval_index.scores(blocks)
                     raw = [float(s) for s in scores]
-                    # P1 audit: score the SAME blocks with kvmem's own mean-K scorer over the
-                    # RawKvStore statistics, and record how the two agree. A rewrite is not allowed
-                    # to switch the shipped ranking on faith.
-                    self._compare_core_scores(blocks, raw)
+                    _probe_write({"kind": "scores_fallback_legacy",
+                                  "reason": getattr(self, "_core_error", None)})
                     # The selector requires exactly one score per selection block
                     # (`store_.block_count()`), while the index only covers blocks that actually
                     # carry statistics. Pad the rest BELOW every real score so unscored blocks are

@@ -39,6 +39,26 @@ import numpy as np
 
 SCORERS = ("meanq-cosine", "page-softmax")
 
+# Sink/recent/budget in TOKENS, published by the plugin from the kvmem config
+# (--additional-config {"kvmem": {...}}). The split into blocks happens per store, because the
+# statistics bucket (64) need not equal the selection block (32). Without it `query_score_frame`
+# rejects the call outright ("invalid Query score budget or block size") - the selector's C++ config
+# is not exposed to Python, so this is the channel.
+_DEFAULTS = {"sink_tokens": 0, "recent_tokens": 0, "budget_tokens": 0, "block_tokens": 64}
+
+
+def set_default_blocks(sink_tokens=0, recent_tokens=0, budget_tokens=0, block_tokens=64):
+    """Publish the budget bands (tokens). Called once per process by the plugin."""
+    _DEFAULTS.update({"sink_tokens": int(sink_tokens or 0),
+                      "recent_tokens": int(recent_tokens or 0),
+                      "budget_tokens": int(budget_tokens or 0),
+                      "block_tokens": int(block_tokens or 64)})
+    return dict(_DEFAULTS)
+
+
+def default_blocks():
+    return dict(_DEFAULTS)
+
 
 def _ext():
     import vllm_kvmem_ext as ext
@@ -50,17 +70,25 @@ class KvmemRecall:
 
     def __init__(self, statistics, block_tokens: int = 64, sink_blocks: int = 0,
                  recent_blocks: int = 0, budget_blocks: int = 0,
-                 aggregation: str = "max", scorer: str = "meanq-cosine"):
+                 aggregation: str = "mean", scorer: str = "page-softmax"):
         self.statistics = statistics
         self.block_tokens = int(block_tokens or 64)
+        if not (sink_blocks or recent_blocks or budget_blocks):
+            # Fall back to the published bands: the selector's C++ config is not visible here, so
+            # the plugin publishes them once per process.
+            sink_blocks = _DEFAULTS["sink_tokens"] // self.block_tokens
+            recent_blocks = _DEFAULTS["recent_tokens"] // self.block_tokens
+            budget_blocks = _DEFAULTS["budget_tokens"] // self.block_tokens
         self.sink_blocks = int(sink_blocks or 0)
         self.recent_blocks = int(recent_blocks or 0)
         self.budget_blocks = int(budget_blocks or 0)
         self.max_aggregation = str(aggregation).lower() != "mean"
-        self.scorer = scorer if scorer in SCORERS else "meanq-cosine"
+        self.scorer = scorer if scorer in SCORERS else "page-softmax"
         self.last_frame = None
         self.last_error = None
         self.calls = 0
+        self._softmax = None          # kvmem::PageSoftmaxCuda, created on first use
+        self.device_bytes = 0
 
     # -- frame -----------------------------------------------------------------------------
     def frame(self, accepted_through: int, fixed_blocks=()):
@@ -114,12 +142,28 @@ class KvmemRecall:
             return None
         try:
             if self.scorer == "page-softmax":
-                use = frame if frame is not None else self.last_frame
-                if use is None:
-                    use = self.frame(int(getattr(stats, "frontier", 0)))
-                out = _ext().query_scores(stats._store, ordered, int(rows), int(query_heads),
-                                          int(kv_heads), int(head_dim), count,
-                                          bool(self.max_aggregation), use)
+                # v0.19 default: softmax over the candidate frame's logits, per query row and head.
+                # It takes the FRAME, so the candidate set, the score mask and the accepted extent
+                # all come from query_score_frame instead of a bare block count.
+                if frame is None:
+                    frame = self.frame(int(getattr(stats, "frontier", 0)))
+                if frame is None or int(frame.accepted_through) <= 0:
+                    self.last_error = "no query frame"
+                    return None
+                if self._softmax is None:
+                    try:
+                        import torch
+                        device = int(torch.cuda.current_device())
+                    except Exception:
+                        device = 0
+                    self._softmax = _ext().PageSoftmaxCuda(device)
+                out = self._softmax.score(stats._store, ordered, int(rows), int(query_heads),
+                                          int(kv_heads), int(head_dim), frame,
+                                          bool(self.max_aggregation))
+                try:
+                    self.device_bytes = int(self._softmax.device_bytes())
+                except Exception:
+                    pass
             else:
                 out = _ext().query_scores(stats._store, ordered, int(rows), int(query_heads),
                                           int(kv_heads), int(head_dim), count,

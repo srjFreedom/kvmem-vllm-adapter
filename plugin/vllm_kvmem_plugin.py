@@ -679,6 +679,16 @@ def _attach_sparse(runner, log_path):
     runtime.disk_path = cfg.get("disk_path") or None
     runtime.retrieval_enabled = bool(cfg.get("retrieval", False))
     try:
+        # Upstream's budget bands, published for the core scorer (query_score_frame needs them in
+        # statistics blocks; the selector's C++ config is not exposed to Python).
+        from kvmem_recall import set_default_blocks
+        set_default_blocks(sink_tokens=int(cfg.get("sink_tokens", 0) or 0),
+                           recent_tokens=int(cfg.get("recent_tokens", 0) or 0),
+                           budget_tokens=int(cfg.get("budget_tokens", 0) or 0),
+                           block_tokens=64)
+    except Exception:
+        pass
+    try:
         # Allocate the query bridge OUTSIDE any compiled region (required: dynamo cannot trace
         # allocation, and graph capture cannot allocate at all).
         from vllm import kvmem_bridge as _bridge

@@ -17,7 +17,16 @@ if(DEFINED ENV{KVMA_SRC} AND NOT KVMEM_BASE)
 else()
   set(KVMEM_BASE "$ENV{HOME}/src/kvmem-v018rc1" CACHE PATH "kvmem worktree root")
 endif()
+# v0.19's DEFAULT Query scorer is page-softmax, whose CUDA object lives in the core's optional
+# recall target (`kvmem-recall-cuda`, source src/cuda/page_softmax.cu). Without it the core only has
+# the host reference `page_softmax_scores`, which costs ~3e9 MACs per selection at our geometry.
+# Enabling CUDA here is what makes the upstream default usable at all.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+  set(CMAKE_CUDA_ARCHITECTURES 75)     # the pair on this box is TU102 (sm_75)
+endif()
+enable_language(CUDA)
 add_subdirectory(${KVMEM_BASE}/kvmem ${CMAKE_BINARY_DIR}/kvmem)
+kvmem_enable_cuda_recall()
 
 # The async page pipeline (KVMEM_ASYNC_TRANSFER arm) needs the CUDA runtime for its transfer
 # stream. The sync arm and the contract tests never touch the GPU, but the backend references

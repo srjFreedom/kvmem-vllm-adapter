@@ -105,8 +105,8 @@ RUN=(env MAX_NUM_SEQS="$N" \
     --kvmem-sessions "$SESSIONS" --kvmem-host-mib "$HOST_MIB" \
     --kvmem-capture-tokens "$CAPTURE_TOKENS" \
     --kvmem-block-tokens 32 \
-    --kvmem-lrfu-lambda 0.5 --kvmem-lrfu-top-frac 0.9 \
-    --kvmem-score-aggregation max --kvmem-retrieval)
+    --no-kvmem-lrfu \
+    --kvmem-score-aggregation mean --kvmem-retrieval)
 if [ "$INREQUEST_COMPACTION" = "1" ]; then RUN+=(--kvmem-inrequest-compaction); fi
 
 if [ "${FOREGROUND:-0}" = "1" ]; then

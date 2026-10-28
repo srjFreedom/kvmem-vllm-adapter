@@ -19,6 +19,7 @@
 // two scorers over the mean-K statistics. `mean_query_cosine_scores` is the P1 scorer; the page
 // softmax reference is available without the CUDA object.
 #include "kvmem/graph_recall.hpp"
+#include "kvmem/page_softmax_cuda.hpp"
 #include "kvmem/query_policy.hpp"
 // nvme_kv_tier.hpp was removed in upstream v0.19 (shared SSD tier retired). The two Python
 // call sites (kvmem_sparse_orchestrator / kvmem_history_cache) are guarded by try/except and a
@@ -453,6 +454,60 @@ PYBIND11_MODULE(vllm_kvmem_ext, m) {
         const auto & score_frame = frame.cast<const kvmem::QueryScoreFrame &>();
         return kvmem::page_softmax_scores(keys, view, score_frame, aggregation);
     };
+    // The upstream DEFAULT scorer (v0.19 resolve_query_scoring: page-softmax implies mean
+    // aggregation and LRFU off). Its device storage is bounded to one layer and <=64 MiB of logits
+    // instead of L*T*H*B, and score() takes a proper QueryScoreFrame (candidates, score_mask and the
+    // accepted extent), not a bare block count.
+    py::class_<kvmem::PageSoftmaxCuda, std::unique_ptr<kvmem::PageSoftmaxCuda>>(m, "PageSoftmaxCuda")
+        .def(py::init<int>(), py::arg("device"))
+        .def_static("workspace_bytes", &kvmem::PageSoftmaxCuda::workspace_bytes,
+                    py::arg("max_blocks"), py::arg("query_heads"), py::arg("kv_heads"),
+                    py::arg("head_dim"))
+        .def("device_bytes", &kvmem::PageSoftmaxCuda::device_bytes)
+        .def("score", [](kvmem::PageSoftmaxCuda & self, const kvmem::RawKvStore & keys,
+                         py::object layers, uint32_t rows, uint32_t query_heads, uint32_t kv_heads,
+                         uint32_t head_dim, const kvmem::QueryScoreFrame & frame, bool max_agg) {
+            using Array = py::array_t<float, py::array::c_style | py::array::forcecast>;
+            std::vector<Array> held;
+            std::vector<const float *> ptrs;
+            std::vector<uint32_t> counts;
+            std::vector<std::pair<size_t, size_t>> slots;
+            const auto layer_count = static_cast<size_t>(py::len(layers));
+            size_t layer = 0;
+            for (py::handle item : layers) {
+                if (item.is_none()) {
+                    ptrs.push_back(nullptr);
+                    counts.push_back(0);
+                } else {
+                    auto array = py::cast<Array>(item);
+                    const auto info = array.request();
+                    if (info.ndim != 3 || uint32_t(info.shape[1]) != query_heads ||
+                        uint32_t(info.shape[2]) != head_dim || uint32_t(info.shape[0]) != rows)
+                        throw std::invalid_argument("query rows must be [rows, query_heads, head_dim]");
+                    held.push_back(std::move(array));
+                    ptrs.push_back(nullptr);
+                    counts.push_back(rows);
+                    slots.emplace_back(layer, held.size() - 1);
+                }
+                ++layer;
+            }
+            for (const auto & [at, index] : slots)
+                ptrs[at] = static_cast<const float *>(held[index].request().ptr);
+            kvmem::PageQueryView view{};
+            view.layer_rows = counts.data();
+            view.layers = static_cast<uint32_t>(layer_count);
+            view.rows = rows;
+            view.query_heads = query_heads;
+            view.kv_heads = kv_heads;
+            view.head_dim = head_dim;
+            view.layer_data = ptrs.data();
+            return self.score(keys, view, frame,
+                              max_agg ? kvmem::GqaScoreAggregation::Max
+                                      : kvmem::GqaScoreAggregation::Mean);
+        }, py::arg("keys"), py::arg("layer_rows"), py::arg("rows"), py::arg("query_heads"),
+           py::arg("kv_heads"), py::arg("head_dim"), py::arg("frame"),
+           py::arg("max_aggregation") = false);
+
     m.def("query_scores", score_with_view,
           py::arg("keys"), py::arg("layer_rows"), py::arg("rows"), py::arg("query_heads"),
           py::arg("kv_heads"), py::arg("head_dim"), py::arg("blocks"), py::arg("max_aggregation"),
