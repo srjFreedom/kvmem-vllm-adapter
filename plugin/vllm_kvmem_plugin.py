@@ -1552,6 +1552,26 @@ def _install(cls, module_name, probe, smoke, state):
                         _kb.KEY_ROWS_LIMIT = 1 if _req in (_rt.spec_reqs or set()) else 0
                     except Exception:
                         pass
+                    try:
+                        _rs0 = getattr(self, "req_states", None)
+                        if _rs0 is not None and getattr(_rt, "stats_core", False):
+                            _i0 = _rs0.req_id_to_index.get(_req)
+                            if _i0 is not None:
+                                _now = int(_rs0.num_computed_tokens_np[_i0])
+                                _prev = (state.get("computed_before") or {}).get(_req)
+                                # The previous step's accepted count is known HERE (post-step
+                                # counters lag under async scheduling), and the bridge still holds
+                                # that step's kept rows - so the fold happens lagged by one step,
+                                # exactly like the page accounting.
+                                # ONLY a decode step keeps rows in the bridge (n <= 8); a prefill
+                                # chunk folds into bucket sums instead. Without this guard the
+                                # prefill deltas were folded as "decode rows" and written at
+                                # positions past the prompt (measured: take=3232 at first=53580).
+                                if _prev is not None and _now > _prev and int(_n) <= 8:
+                                    _rt.harvest_decode_rows(_req, _now - _prev)
+                                state.setdefault("computed_before", {})[_req] = _now
+                    except Exception:
+                        pass
                     _rt.advance_tokens(_req, int(_n))
                     # The mean-K statistics are keyed by TRUE positions while the model may run at
                     # compacted ones; publish the offset before the model executes so the capture op

@@ -622,6 +622,50 @@ class VllmSparseRuntime:
         except Exception:
             pass
 
+    def harvest_decode_rows(self, req, take):
+        """Fold the ACCEPTED decode rows of the PREVIOUS step at their true positions.
+
+        Called from the plugin's pre-step hook: the bridge still holds the previous step's rows
+        (nothing has run yet), and the accepted count is known by then - the post-step hook sees
+        pre-postprocess counters, which under async scheduling lags by one step (measured: 3 rows
+        written for 7 accepted tokens).
+        """
+        if not self.stats_core:
+            return 0
+        stats = self._statistics.get(req)
+        take = int(take or 0)
+        if stats is None or take <= 0:
+            return 0
+        try:
+            from vllm import kvmem_bridge as bridge
+            import numpy as _np
+            # The STORE's frontier is authoritative here: `_stats_next` is advanced by the prefill
+            # path too, and using a stale copy wrote rows past the prompt (measured: first=55448).
+            first = int(getattr(stats, "frontier", 0) or 0)
+            written = 0
+            for layer in range(int(stats.layers)):
+                rows = bridge.read_key_rows(layer, take)
+                if rows is None:
+                    continue
+                arr = _np.ascontiguousarray(rows.numpy() if hasattr(rows, "numpy") else rows,
+                                            dtype=_np.float32)
+                for i in range(min(take, int(arr.shape[0]))):
+                    stats._store.write_layer_mean_sum(first + i, 1, layer, arr[i])
+                    written += 1
+            if written:
+                stats.bucket_writes += written
+                stats.steps += 1
+                stats.frontier = first + take
+                self._stats_next[req] = first + take
+                self._stats_written[req] = int(self._stats_written.get(req, 0)) + written
+            return written
+        except Exception:
+            if self.log is not None:
+                import traceback as _tb
+                self.log({"kind": "stats_rows_error", "req": req,
+                          "error": _tb.format_exc()[-400:]})
+            return 0
+
     def harvest_key_statistics(self, req, n_tokens):
         """Drain this step's device bucket sums into the request's kvmem RawKvStore.
 
@@ -663,8 +707,10 @@ class VllmSparseRuntime:
                 return 0
             n = 1
         elif decode and not getattr(self, "stats_decode", False):
-            # One accepted token per step; keep the frontier and the store in step.
-            n = min(int(n), 1)
+            # Decode: fold exactly the ACCEPTED rows of this step. The bridge kept them as rows
+            # rather than bucket sums precisely because acceptance is decided after the step, and
+            # each accepted token still has to land on the true frontier.
+            n = min(int(n), int(getattr(self, "_accepted_rows", 0) or 0))
         if int(getattr(self, "batch_size", 1) or 1) > 1:
             # One position offset is published per step; a batched step would attribute every
             # request's buckets to the same offset.
