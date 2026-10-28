@@ -465,15 +465,22 @@ class SparseOrchestrator:
             return
         if os.environ.get("KVMEM_SCORER_COMPARE", "1") != "1":
             return
-        if getattr(self, "_compare_done", 0) >= 12:
+        # The counter is per ORCHESTRATOR and an orchestrator can serve several requests (parked
+        # sessions are reused), so a low cap silently ended the audit while everything else looked
+        # healthy. Keep a high cap and record every refusal reason instead of returning blind.
+        if getattr(self, "_compare_done", 0) >= 64:
+            _probe_write({"kind": "scorer_compare_skipped", "reason": "cap",
+                          "done": int(getattr(self, "_compare_done", 0))})
             return
         stats = getattr(self, "statistics", None)
         if stats is None:
+            _probe_write({"kind": "scorer_compare_skipped", "reason": "no statistics"})
             return
         try:
             from vllm import kvmem_bridge as bridge
             from kvmem_recall import KvmemRecall, compare_scores
             if not getattr(bridge, "ARMED", False):
+                _probe_write({"kind": "scorer_compare_skipped", "reason": "bridge not armed"})
                 return
             layer_rows = {}
             rows = 0
@@ -484,6 +491,8 @@ class SparseOrchestrator:
                 layer_rows[int(layer)] = q
                 rows = max(rows, int(q.shape[0]))
             if rows <= 0:
+                _probe_write({"kind": "scorer_compare_skipped", "reason": "no query rows",
+                              "layers": len(layer_rows)})
                 return
             kv_heads = int(getattr(stats, "kv_heads", 0) or 0)
             head_dim = int(getattr(stats, "head_dim", 0) or 0)
@@ -509,6 +518,7 @@ class SparseOrchestrator:
                        "query_heads": query_heads, "kv_heads": kv_heads,
                        "core_blocks": len(core), "legacy_blocks": len(legacy)}
                 from kvmem_recall import align_scores
+                index = getattr(self, "retrieval_index", None)
                 lb = int(getattr(index, "block_tokens", 0) or 0)
                 aligned = align_scores(core, int(getattr(stats, "block_tokens", 64)),
                                        len(legacy), lb)
