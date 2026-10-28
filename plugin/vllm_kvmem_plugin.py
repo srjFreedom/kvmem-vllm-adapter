@@ -640,6 +640,33 @@ def _attach_sparse(runner, log_path):
     #     tail is applied to that state twice.
     # They used to be wired only inside the session-reuse branch, so a compaction-only run had
     # capture_state=None and the replay silently corrupted the state.
+    def _set_block_cursor(req, page_count):
+        """Reset the worker's block-table append cursor for a compacted request.
+
+        `append_block_ids` writes each new engine block's pages at
+        `num_blocks.np[group, req]` and advances that cursor. Installing a shorter row left the cursor
+        at the pre-compaction value, so the NEXT block was written at the old slot
+        (measured: 'row capacity (11514 > 11312)' = 114 blocks * 101 pages while the row had 22
+        blocks). Only groups that map several native pages per engine block are touched.
+        """
+        try:
+            st = runtime._state.get(req)
+            idx = getattr(st, "row_index", None) if st is not None else None
+            if idx is None:
+                return False
+            bt = runner.block_tables
+            nb = bt.num_blocks.np
+            bpk = list(getattr(bt, "blocks_per_kv_block", []) or [])
+            done = False
+            for g in range(nb.shape[0]):
+                if g < len(bpk) and int(bpk[g]) > 1:
+                    nb[g, int(idx)] = int(page_count)
+                    done = True
+            return done
+        except Exception:
+            return False
+
+    runtime.set_block_cursor = _set_block_cursor
     if runtime.has_recurrent:
         runtime.capture_state = lambda req: _capture_state_snapshot(runner, runtime, req)
         runtime.restore_state = lambda req, snap: _restore_state_snapshot(runner, runtime, req, snap)
@@ -686,6 +713,14 @@ def _attach_sparse(runner, log_path):
     # Reconstruction on compaction (opt-in): rewrite the engine's token book to the compacted
     # sequence, zero the recurrent state and re-prefill the selected pages. This is what removes the
     # approximation that in-prefill compaction leaves in a hybrid model's state.
+    try:
+        # Native pages per ENGINE block for the full-attention group (1616-token blocks over
+        # 16-token pages -> 101). The compaction needs it to keep the paged table a faithful
+        # reflection of the engine's block list.
+        _bpk = list(getattr(runner.block_tables, "blocks_per_kv_block", []) or [])
+        runtime.block_pages = int(max(_bpk) if _bpk else 1)
+    except Exception:
+        runtime.block_pages = 1
     try:
         runner.kvmem_runtime = runtime      # diagnostic hooks in the runner read the books here
     except Exception:
@@ -1306,7 +1341,8 @@ def register():
             _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl", entry)
             return {"ok": True, "replay": int(n), "computed": int(req.num_computed_tokens)}
 
-        def _compact(request_id, pages, page_tokens, visible_tokens=0, rebuild=False):
+        def _compact(request_id, pages, page_tokens, visible_tokens=0, rebuild=False,
+                     block_pages=0):
             """Resident-book reconciliation (Route A / resident model).
 
             The worker selected a working set and has ALREADY installed it into the block table row
@@ -1389,6 +1425,55 @@ def register():
                     _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
                             {"kind": "compact_rebuild_error", "req": request_id,
                              "error": traceback.format_exc()[-400:]})
+            # Adopt the compacted block list in the ENGINE. The paged table is a flat reflection of
+            # the request's engine blocks (a block owns `block_pages` consecutive page slots, block i
+            # at pages i*block_pages...), so after installing a shorter row the ENGINE must also
+            # think the request has exactly those blocks - otherwise the next allocation appends at
+            # the OLD block position and leaves a gap of stale page ids that the kernel then attends
+            # to (this is the beyond-pool illegal access).
+            try:
+                if int(block_pages or 0) > 1 and pages:
+                    _bp = int(block_pages)
+                    _sel = [int(p) for p in pages]
+                    _blocks = sorted({p // _bp for p in _sel})
+                    _whole = all(len([p for p in _sel if p // _bp == b]) == _bp for b in _blocks)
+                    if not _whole:
+                        _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "compact_blocks_partial", "req": request_id,
+                                 "pages": len(_sel), "blocks": len(_blocks), "block_pages": _bp})
+                    _mgr = None
+                    for _m in list(getattr(scheduler.kv_cache_manager.coordinator,
+                                           "single_type_managers", ()) or ()):
+                        if "FullAttention" in type(_m).__name__:
+                            _mgr = _m
+                            break
+                    _map = getattr(_mgr, "req_to_blocks", None) if _mgr is not None else None
+                    if _map is not None:
+                        _new = []
+                        for _b in _blocks:
+                            _obj = None
+                            try:
+                                _obj = scheduler.kv_cache_manager.block_pool.blocks[_b]
+                            except Exception:
+                                _obj = None
+                            if _obj is not None:
+                                _new.append(_obj)
+                        _old = list(_map.get(request_id) or ())
+                        _freed = [b for b in _old if b not in _new]
+                        if _new:
+                            _map[request_id] = _new
+                        if _freed:
+                            scheduler.kv_cache_manager.block_pool.free_blocks(_freed)
+                        _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "compact_blocks_adopted", "req": request_id,
+                                 "blocks": len(_new), "freed": len(_freed),
+                                 "whole": bool(_whole),
+                                 "free_blocks": int(scheduler.kv_cache_manager.block_pool
+                                                    .get_num_free_blocks())})
+            except Exception:
+                _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "compact_blocks_error", "req": request_id,
+                         "error": traceback.format_exc()[-300:]})
             # Pool accounting: a compaction rewinds the resident book but the ENGINE still owns the
             # evicted blocks (vLLM frees blocks only at request end), so every compaction can leak
             # them and the pool fills until the scheduler preempts - which then recomputes against a

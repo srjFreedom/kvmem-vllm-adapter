@@ -161,6 +161,7 @@ class VllmSparseRuntime:
         self.capture_state = None
         self.restore_state = None
         self.reset_state = None          # zero the recurrent state (reconstruction)
+        self.set_block_cursor = None     # reset the worker's block-table append cursor
         self.compact_rebuild = False     # rewrite the token book on compaction (reconstruction)
         # True when the model has non-attention (GDN/Mamba) KV groups. Their recurrent state is NOT
         # in the paged store, so a resume is only safe when a state snapshot travelled with the
@@ -535,6 +536,11 @@ class VllmSparseRuntime:
                 self.log({"kind": "resume_restore_failed", "req": req, "page": int(page)})
                 return False
         st.row = tuple(row_values[:len(pages)])
+        if self.set_block_cursor is not None:
+            try:
+                self.set_block_cursor(req, len(st.row))
+            except Exception:
+                pass
         st.seq_len = len(pages) * self.page_tokens
         st.tokens = int(hit_tokens)
         st.prefill_done = False
@@ -1764,8 +1770,11 @@ class VllmSparseRuntime:
                         self.reset_state(req)
                     except Exception:
                         _rebuild = False
+                # `block_pages`: how many native pages one ENGINE block owns (101 on this model).
+                # The engine needs it to adopt the compacted block list.
                 res = ch.compact(req, selected, self.page_tokens,
-                                 visible_tokens=int(st.seq_len), rebuild=_rebuild)
+                                 visible_tokens=int(st.seq_len), rebuild=_rebuild,
+                                 block_pages=int(getattr(self, "block_pages", 0) or 0))
                 if _rebuild and isinstance(res, dict) and res.get("rebuild"):
                     # One reconstruction per request: repeating it re-prefills the compacted
                     # sequence again and again (measured: compact_rebuilt fired twice with
@@ -1778,6 +1787,14 @@ class VllmSparseRuntime:
                 else:
                     record["compact_applied"] = bool(res)
                     truncated = bool(res)
+                # The worker's block-table append cursor (`num_blocks.np[group, req]`) counts the
+                # page slots written so far; installing a shorter row must move it, or the next
+                # engine block is written at the old slot ('row capacity (11514 > 11312)').
+                if self.set_block_cursor is not None and st.row:
+                    try:
+                        self.set_block_cursor(req, len(st.row))
+                    except Exception:
+                        pass
                 if not truncated:
                     # The engine's book was NOT shortened, so its own view is already correct.
                     # Installing a compacted row anyway left the two books disagreeing: the model

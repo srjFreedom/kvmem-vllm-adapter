@@ -94,7 +94,8 @@ class BlockChannelScheduler:
                                                   [int(p) for p in req.get("pages", [])],
                                                   int(req.get("page_tokens", 0)),
                                                   int(req.get("visible_tokens", 0) or 0),
-                                                  bool(req.get("rebuild", False))))
+                                                  bool(req.get("rebuild", False)),
+                                                  int(req.get("block_pages", 0) or 0)))
                         self.compacts_applied += 1
                         # `ok` = the engine's book is now consistent with the worker's view;
                         # `truncated` = it actually shortened (so installing the view is needed).
@@ -183,7 +184,8 @@ class BlockChannel:
             raise RuntimeError(f"replay request failed: {reply['error']}")
         return reply
 
-    def compact(self, request_id, pages, page_tokens, visible_tokens=0, rebuild=False):
+    def compact(self, request_id, pages, page_tokens, visible_tokens=0, rebuild=False,
+                block_pages=0):
         """Tell EngineCore that `request_id` compacted to `pages` (in compacted order).
 
         The engine truncates the request's `_all_token_ids` to the tokens of those pages and
@@ -197,7 +199,8 @@ class BlockChannel:
                                       "pages": [int(p) for p in pages],
                                       "page_tokens": int(page_tokens),
                                       "visible_tokens": int(visible_tokens or 0),
-                                      "rebuild": bool(rebuild)}).encode())
+                                      "rebuild": bool(rebuild),
+                                      "block_pages": int(block_pages or 0)}).encode())
             data = sock.recv(4096)
         reply = json.loads(data.decode())
         if "error" in reply:
