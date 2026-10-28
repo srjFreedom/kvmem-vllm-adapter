@@ -579,14 +579,20 @@ class VllmSparseRuntime:
         if layers <= 0 or heads <= 0:
             self._skip("(global)", "no geometry")
             return None
-        try:
-            from kvmem_statistics import KvmemStatistics
-            stats = KvmemStatistics(layers, heads, self.head_dim)
-        except Exception as exc:                       # binding missing / build stale
-            self._skip("(global)", f"store init: {exc}")
-            return None
-        self._statistics[req] = stats
+        stats = self._statistics.get(req)
+        if stats is None:
+            try:
+                from kvmem_statistics import KvmemStatistics
+                stats = KvmemStatistics(layers, heads, self.head_dim)
+            except Exception as exc:                   # binding missing / build stale
+                self._skip("(global)", f"store init: {exc}")
+                return None
+            self._statistics[req] = stats
         self._stats_next.setdefault(req, 0)
+        # The link is re-made on every call: `_ensure` attaches the store before it registers the
+        # orchestrator, so the first attempt found no orchestrator and the request kept a store the
+        # orchestrator never knew about - which silently disabled the core-vs-legacy audit
+        # (measured: orch=True index=True statistics=False on every probe).
         orch = self._orch.get(req)
         if orch is not None:
             orch.statistics = stats
@@ -682,16 +688,53 @@ class VllmSparseRuntime:
             if written and not self._compare_done.get(req):
                 plen = int(self._prompt_len.get(req, 0) or 0)
                 if int(stats.frontier) >= min(plen or 4096, 4096):
-                    self._compare_done[req] = True
+                    self.attach_statistics(req)     # idempotent; re-links orch.statistics
                     orch = self._orch.get(req)
                     index = self._retrieval.get(req)
-                    if orch is not None and index is not None:
+                    # Unconditional probe: the audit silently never fired for four engine cycles
+                    # because one link of this chain was None and the request was marked "done"
+                    # anyway. Print the whole chain once per link state, and only mark it done once
+                    # the audit actually ran.
+                    try:
+                        from vllm import kvmem_bridge as _bridge
+                        armed = bool(getattr(_bridge, "ARMED", False))
+                    except Exception:
+                        armed = None
+                    try:
+                        covered = len(list(index.covered_blocks())) if index is not None else -1
+                    except Exception:
+                        covered = -2
+                    if int(self._stats_written.get("_audit_probe", 0)) < 12:
+                        self._stats_written["_audit_probe"] = int(
+                            self._stats_written.get("_audit_probe", 0)) + 1
+                        self.log({"kind": "stats_audit_probe", "req": str(req)[:12],
+                                  "frontier": int(stats.frontier), "plen": plen,
+                                  "orch": orch is not None, "index": index is not None,
+                                  "covered": covered, "armed": armed,
+                                  "orch_statistics": bool(orch is not None
+                                                          and getattr(orch, "statistics", None)),
+                                  "write_step": True})
+                    if orch is not None and index is not None and armed and covered > 0:
+                        blocks = list(index.covered_blocks())
+                        legacy = []
+                        # The legacy index only has a QUERY after a reselect-time harvest, so reading
+                        # it here raised "no query captured" and the audit silently never ran
+                        # (measured: scorer_compare = 0 records while every other link was healthy).
                         try:
-                            blocks = list(index.covered_blocks())
-                            legacy = [float(v) for v in index.scores(blocks)] if blocks else []
+                            from kvmem_engine_capture import harvest_from_bridge
+                            if self.capture is not None:
+                                harvest_from_bridge(self.capture)
+                            legacy = [float(v) for v in index.scores(blocks)]
+                        except Exception as exc:
+                            self.log({"kind": "stats_audit_legacy_error",
+                                      "req": str(req)[:12],
+                                      "error": f"{type(exc).__name__}: {exc}"})
+                        if legacy:
                             orch._compare_core_scores(blocks, legacy)
-                        except Exception:
-                            pass
+                            self._compare_done[req] = True
+                        else:
+                            self._stats_written["_audit_no_legacy"] = int(
+                                self._stats_written.get("_audit_no_legacy", 0)) + 1
             return written
         except Exception:
             try:

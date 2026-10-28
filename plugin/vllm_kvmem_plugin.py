@@ -93,6 +93,51 @@ def _boot(message):
         pass
 
 
+# --- live console -------------------------------------------------------------------------
+# Iterating on the engine used to cost a full restart (80 s) per one-line change. The workers are
+# Python, so they can be inspected and patched in place: drop code into /tmp/kvmem_console.py while
+# /tmp/kvmem_console.arm exists, and the next step executes it INSIDE the worker with the live
+# runtime/orchestrator/bridge in scope and writes the result to /tmp/kvmem_console.out. One stat()
+# per step when it is not armed. Disarm by removing the arm file.
+CONSOLE_ARM = "/tmp/kvmem_console.arm"
+CONSOLE_CODE = "/tmp/kvmem_console.py"
+CONSOLE_OUT = "/tmp/kvmem_console.out"
+
+
+def _console_step(context):
+    """Execute the pending console snippet in this worker process. Never raises."""
+    import os
+    import io
+    import traceback
+    try:
+        if not os.path.exists(CONSOLE_ARM) or not os.path.exists(CONSOLE_CODE):
+            return
+        try:
+            code = open(CONSOLE_CODE).read()
+        except Exception:
+            return
+        try:
+            os.remove(CONSOLE_CODE)          # one-shot: a snippet never runs twice
+        except Exception:
+            pass
+        buffer = io.StringIO()
+        namespace = dict(context)
+        namespace["__name__"] = "kvmem_console"
+        try:
+            import contextlib
+            with contextlib.redirect_stdout(buffer):
+                exec(compile(code, CONSOLE_CODE, "exec"), namespace)
+        except Exception:
+            buffer.write("EXC:\n" + traceback.format_exc())
+        with open(CONSOLE_OUT, "a") as handle:
+            handle.write(f"===== pid={os.getpid()} step={context.get('step')} "
+                         f"req={context.get('req')} =====\n")
+            handle.write(buffer.getvalue())
+            handle.write("\n")
+    except Exception:
+        pass
+
+
 def _append(path, record):
     try:
         with open(path, "a") as handle:
@@ -578,6 +623,22 @@ def _attach_sparse(runner, log_path):
                 if type(_mod).__name__ == "Qwen3NextAttention":
                     heads = int(getattr(_mod, "num_heads", 0) or 0)
                     kv_heads = int(getattr(_mod, "num_kv_heads", kv_heads) or kv_heads)
+                    # The tensor width is authoritative: with TP>1 `num_kv_heads` may report the
+                    # GLOBAL count while the layer's key tensor is the per-rank slice, and that
+                    # mismatch silently dropped every captured key (statistics filled with zeros).
+                    try:
+                        _kv = int(getattr(_mod, "kv_size", 0) or 0)
+                        _hs = int(getattr(_mod, "head_size", 0) or 0)
+                        if _kv and _hs and _kv % _hs == 0:
+                            _per_rank = _kv // _hs
+                            if _per_rank != int(kv_heads):
+                                _append(log_path, {"kind": "kv_heads_corrected", "pid": os.getpid(),
+                                                   "module_num_kv_heads": int(kv_heads),
+                                                   "kv_size": _kv, "head_size": _hs,
+                                                   "per_rank_kv_heads": _per_rank})
+                            kv_heads = _per_rank
+                    except Exception:
+                        pass
                     head_dim = int(getattr(_mod, "head_size", head_dim) or head_dim)
                     break
         per_rank = max(1, heads // max(1, tp)) if heads else 0
@@ -1352,6 +1413,12 @@ def _install(cls, module_name, probe, smoke, state):
                 cap = getattr(runtime, "capture", None)
                 state["steps"] = state.get("steps", 0) + 1
                 for req, n_new in scheduled.items():
+                    _console_step({"runtime": runtime, "req": req, "runner": self,
+                                   "state": state, "scheduler_output": scheduler_output,
+                                   "step": state.get("steps"), "n_new": int(n_new),
+                                   "orch": runtime._orch.get(req),
+                                   "index": runtime._retrieval.get(req),
+                                   "stats": runtime._statistics.get(req)})
                     if cap is not None:
                         cap.note_tokens(int(n_new))
                     # KVMem mean-K statistics (v0.19 design): the model has just written this
