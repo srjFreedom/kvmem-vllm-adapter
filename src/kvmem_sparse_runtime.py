@@ -1012,6 +1012,42 @@ class VllmSparseRuntime:
         st = self.state(req)
         self._pending_new[req] = int(n_new)
 
+    def sync_row_from_engine(self, req, written, n_tokens=0):
+        """Copy the pages the ENGINE has actually written into the request's row.
+
+        `num_blocks.np[group, req]` is the engine's own count of written page slots: it is advanced
+        by `append_block_ids` for every new block and was reset to the compacted length by the last
+        compaction. Mirroring exactly that prefix keeps the row faithful - mirroring further (which
+        is what the earlier attempt did) copied slots the engine had not written yet, and the
+        attention then read zeros/stale ids (measured: known-good 88K answer turned into garbage).
+
+        Returns the number of entries added.
+        """
+        st = self._state.get(req)
+        w = int(written or 0)
+        if st is None or w <= 0:
+            return 0
+        try:
+            if w <= len(st.row):
+                return 0
+            table = self.view.block_table_rows()[0]
+            values = table[st.row_index].tolist()[:w]
+            st.row = tuple(values)
+            # Keep the attention length consistent with what the row can address.
+            cap = len(st.row) * max(1, self.page_tokens)
+            want = int(getattr(st, "tokens", 0)) + int(n_tokens or 0)
+            st.seq_len = min(want, cap) if want > 0 else cap
+            if self.log is not None:
+                self.log({"kind": "row_synced", "req": req, "row": len(st.row),
+                          "seq_len": int(st.seq_len), "tokens": int(getattr(st, "tokens", 0)),
+                          "n": int(n_tokens or 0)})
+            return len(st.row)
+        except Exception:
+            if self.log is not None:
+                import traceback as _tb
+                self.log({"kind": "row_sync_error", "req": req, "error": _tb.format_exc()[-300:]})
+            return 0
+
     def ensure_row_for_chunk(self, req, n_tokens):
         """Mirror the engine's appended blocks so the row covers the attention length THIS step.
 
@@ -1849,10 +1885,22 @@ class VllmSparseRuntime:
         out = base.clone()
         for row, value in self._seq_override.items():
             if row < out.numel():
-                # NOTE: clamping this to the row's coverage was tried and REMOVED - it did not stop
-                # the beyond-pool fault, and on the healthy no-compaction path the row is briefly
-                # one chunk short when the override is read, so the clamp silently cost attention
-                # (measured: a clean "ZX-4417" became "ZX-4417" + garbage).
+                # The kernel reads ceil(seq_len / page) row entries. The row is synchronised with
+                # the engine's own cursor at step entry, so this only bites when the engine is one
+                # append ahead of us - and reading past the row is an illegal access, so the clamp
+                # is the lesser evil (it costs the newest chunk's attention, not the process).
+                try:
+                    for _req, _st in self._state.items():
+                        if getattr(_st, "row_index", None) == row and _st.row:
+                            _cap = len(_st.row) * max(1, int(self.page_tokens))
+                            if int(value) > _cap:
+                                if self.log is not None:
+                                    self.log({"kind": "kv_len_clamped", "req": _req,
+                                              "seq_len": int(value), "cap": int(_cap)})
+                                value = _cap
+                            break
+                except Exception:
+                    pass
                 out[row] = value
                 # Read-side diagnostic: the kernel attends to `value` positions, i.e. it reads
                 # ceil(value / page) entries of the row. More than the row has = illegal access that

@@ -1857,7 +1857,24 @@ def _install(cls, module_name, probe, smoke, state):
                         _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                                 {"kind": "prefill_book_error", "error": str(_exc)[:160]})
                     try:
-                        _rt.ensure_row_for_chunk(_req, int(_n))
+                        # Mirror exactly what the engine has written (its own cursor), then make the
+                        # attention length match. Both are needed: the row is the KV addressing and
+                        # the length is what the kernel is told to read.
+                        _bt = getattr(self, "block_tables", None)
+                        _bpk = list(getattr(_bt, "blocks_per_kv_block", []) or [])
+                        _nb = getattr(_bt, "num_blocks", None)
+                        if _nb is not None and _bpk:
+                            _idx = None
+                            try:
+                                _idx = getattr(self, "req_states").req_id_to_index.get(_req)
+                            except Exception:
+                                _idx = None
+                            if _idx is not None:
+                                for _g in range(len(_bpk)):
+                                    if int(_bpk[_g]) > 1:
+                                        _rt.sync_row_from_engine(
+                                            _req, int(_nb.np[_g, int(_idx)]), int(_n))
+                                        break
                     except Exception:
                         pass
                     _rt.advance_tokens(_req, int(_n))
