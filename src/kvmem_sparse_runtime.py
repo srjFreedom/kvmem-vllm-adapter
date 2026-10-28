@@ -998,6 +998,56 @@ class VllmSparseRuntime:
         st = self.state(req)
         self._pending_new[req] = int(n_new)
 
+    def ensure_row_for_chunk(self, req, n_tokens):
+        """Make the block table row cover the tokens this step is about to write.
+
+        The row used to be extended in `after_step`, i.e. AFTER the model ran - so a prefill chunk
+        that crossed a page boundary made the kernel read row entries that did not exist yet
+        (measured: row=4864 pages for seq_len=77824 while the step wrote up to 81920 -> FlashInfer
+        illegal memory access). Growing it at step entry, from the engine's own page map, keeps the
+        row at least as long as `seq_len` for every step.
+        """
+        st = self._state.get(req)
+        n = int(n_tokens or 0)
+        if st is None or n <= 0:
+            return 0
+        try:
+            last_rank = (int(getattr(st, "tokens", 0)) + n - 1) // max(1, self.page_tokens)
+            if len(st.row) > last_rank:
+                return 0
+            self._absorb_engine_row(req)
+            grown = list(st.row)
+            page_map = self._page_map.get(req) or {}
+            while len(grown) <= last_rank:
+                logical = len(grown)
+                page = page_map.get(logical)
+                if page is None:
+                    self._grow_from_engine(req, grown, logical)
+                    page = page_map.get(logical)
+                if page is None:
+                    break
+                grown.append(int(page))
+            added = len(grown) - len(st.row)
+            if len(grown) <= last_rank and self.log is not None:
+                # Could not reserve the whole chunk: the engine's page map has no entry for the
+                # logical pages this step will write. Logged loudly because the kernel would then
+                # read row entries that do not exist (illegal memory access).
+                self.log({"kind": "row_short_pre_step", "req": req,
+                          "row": len(grown), "need": int(last_rank) + 1,
+                          "tokens": int(getattr(st, "tokens", 0)), "n": n,
+                          "page_map": len(page_map), "next_page": getattr(st, "next_page", None)})
+            st.row = tuple(grown)
+            if added and self.log is not None:
+                self.log({"kind": "row_grown_pre_step", "req": req, "added": int(added),
+                          "row": len(st.row), "need": int(last_rank) + 1,
+                          "tokens": int(getattr(st, "tokens", 0)), "n": n})
+            return added
+        except Exception:
+            if self.log is not None:
+                import traceback as _tb
+                self.log({"kind": "row_grow_error", "req": req, "error": _tb.format_exc()[-400:]})
+            return 0
+
     def advance_tokens(self, req, n_new):
         self._inflight[req] = int(n_new or 0)
         # QueryReplay boundary: this step prefills the FINAL chunk of the prompt, so snapshot the
