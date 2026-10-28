@@ -128,3 +128,20 @@ scores: 来自旧索引（core 分数此刻还不可用：prefill 早期没有 q
 3. 再回退两本账、重算 N 个 token —— 此时状态从头正确重算，KV 也在新视图下刷新。
 
 没有第 1、2 步，重放只会把循环状态算两遍。这是下一步（第 3 轮）的工作。
+
+## QueryReplay 第 3 次迭代：快照+恢复已生效，但采样点仍然错位（时间盒到这里）
+
+本轮已做：
+- 循环状态钩子改为**有循环组就接线**（原来只在 session reuse 分支里，导致 replay 静默把 GDN 状态算两遍）；
+- prefill 最后一个 chunk 之前**快照一次**，记录 `replay_at`；replay 长度 = `visible - replay_at`（两 rank 一致）；
+- 重放前 `restore_state`，实测日志 `replay_state_restored` 出现。
+
+结果仍然不收敛：`ZX_tokens =`（找到 ZX 但随后像在续写源码）。判断：
+**chunk 粒度的状态快照不足以支撑精确重放**——快照点与理想边界（visible-N）相差最多一个 chunk，
+而引擎的重放在此之后按"少算 N 个 token"重排，位置/状态/KV 三者对不齐。
+
+需要的能力（记录备查）：按**任意 token 位置**切分 prefill 并快照状态（上游靠 prefix checkpoint 做到），
+即 `prefix_checkpoint.hpp` 里 `CheckpointPurpose::QueryReplay` 那一套。这属于 P0.5 级工作量。
+
+因此本轮决定：**把 QueryReplay 记为"部分实现、未收敛"**，先推进其余可交付项（decode 期统计与接受窗口、
+checkpoint 目录、清理旧打分旁路、文档与交付说明），超池路径继续留在计划里。
