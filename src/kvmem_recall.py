@@ -17,6 +17,21 @@ Two things this module deliberately does NOT do:
 A layer with no captured query rows is passed as `None`, which the binding turns into an ABSENT
 layer (`layer_rows[layer] = 0`): upstream is explicit that such a layer "is absent, never a
 zero-valued sample", and feeding zeros is what diluted our layer mean before.
+
+Exact scoring semantics (read from `kvmem/src/host/mean_key_retrieval.cpp`, verified against an
+independent reference to 1e-6 in tests/test_kvmem_recall.py) - re-derive nothing:
+
+    group      = query_heads / kv_heads
+    Mean: sums are divided by (tokens * group)      -> per-(kv-head, channel) mean query vector
+    Max : the RAW token sum is used, undivided      -> one probe per query head
+    per block, per layer:
+        for each kv head:
+            key_norm = |mean_k(block, layer, kv_head)|
+            best     = max over the head's query probes of dot(q, key) / (|q|*key_norm + 1e-6)
+        layer_score = sum(best over kv heads) / kv_heads
+    score(block) = sum(layer_score over ACTIVE layers) / active_layers
+Blocks with no statistics score 0.0 (they are skipped, not penalised), and a layer's absence is
+skipped in both the sum and the denominator.
 """
 from __future__ import annotations
 
