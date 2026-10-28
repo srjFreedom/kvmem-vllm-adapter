@@ -661,8 +661,20 @@ class SparseOrchestrator:
                     #   2. writing a score that is itself NaN/inf straight through.
                     # So: compute a finite floor, then SKIP any non-finite score instead of
                     # believing it.
-                    block_tokens = int(getattr(self.retrieval_index, "block_tokens", 128) or 128)
-                    total_blocks = max(1, (int(self.total_tokens) + block_tokens - 1) // block_tokens)
+                    # The grid and the block count belong to the SELECTOR, not to the legacy index:
+                    # `set_block_scores` requires exactly `store_.block_count()` values, and a table
+                    # of the wrong length is rejected with "one score per selection block is
+                    # required" - which silently left the selector with no ranking at all
+                    # (measured: selected blocks 0,1,2,... i.e. tie-broken by id, mid block dropped,
+                    # generation degenerated into "req req req").
+                    block_tokens = int(self.selector.tokens_per_selection_block())
+                    try:
+                        total_blocks = int(self.selector.selection_blocks())
+                    except Exception:
+                        total_blocks = 0
+                    if total_blocks <= 0:
+                        total_blocks = max(1, (int(self.total_tokens) + block_tokens - 1)
+                                           // max(1, block_tokens))
 
                     def _finite(v):
                         return v == v and v not in (float("inf"), float("-inf"))
