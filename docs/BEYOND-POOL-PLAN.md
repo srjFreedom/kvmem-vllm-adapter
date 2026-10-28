@@ -260,3 +260,23 @@ model_runner.py:1360  assert (num_scheduled_tokens_np >= num_logits).all()
 3. **拼图③必须先做**：`prepare_inputs` 里 logits 行数要按压缩后的账本算，否则重建后第一步就断言。
 
 开关 `KVMEM_COMPACT_REBUILD` 默认关闭，现有可用路径不受影响。
+
+## 第 17 轮：行内重复页 id（一个真 BUG）与池容量的更正
+
+**行有效性探针**（新增）在首几个 prefill 就报：
+
+```
+len=256, uniq=102, dups=154   ← 同一物理页被多个位置引用
+```
+
+来源是我第 9 轮加的 `ensure_row_for_chunk`：它按**页映射（逻辑页）**造行，而行的索引是**常驻 rank**，
+两者错位后就出现重复页。重复页本身不一定崩，但会让注意力读到同一页的多份并污染写入。
+
+改为**默认关闭**（`runtime.row_grow_pre_step`），恢复"引擎自己分配 + after-step 镜像"。修后：
+`row_invalid = 0`，58K 压缩用例重新 `mid_selected=True`。
+
+**池容量更正**：实测 `num_blocks = 12,726`，×16 = **203,616 token**。所以 201K 的 prompt 其实**仍在池内**，
+真正"超池"验收需要 >203K（约 880K 字符以上）。之前按 177K 估算是偏保守的。
+
+201K prompt（7 次压缩）在去掉重复页后仍以 `BatchPrefillWithPagedKVCache` 崩溃，引擎退出 →
+下一轮继续追"行内 page id 是否指向已归还的页"。
