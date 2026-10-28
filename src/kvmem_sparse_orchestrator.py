@@ -660,6 +660,13 @@ class SparseOrchestrator:
                     raw = [float(s) for s in scores]
                     _probe_write({"kind": "scores_fallback_legacy",
                                   "reason": getattr(self, "_core_error", None)})
+                except Exception as exc:
+                    _probe_write({"kind": "scores_fallback_error", "error": str(exc)[:160]})
+                    raw = []
+            else:
+                raw = []
+        if raw:
+            try:
                     # The selector requires exactly one score per selection block
                     # (`store_.block_count()`), while the index only covers blocks that actually
                     # carry statistics. Pad the rest BELOW every real score so unscored blocks are
@@ -687,10 +694,10 @@ class SparseOrchestrator:
                     if total_blocks <= 0:
                         total_blocks = max(1, (int(self.total_tokens) + block_tokens - 1)
                                            // max(1, block_tokens))
-
+    
                     def _finite(v):
                         return v == v and v not in (float("inf"), float("-inf"))
-
+    
                     finite = [v for v in raw if _finite(v)]
                     # Cosine lives in [-1, 1]; keep the floor in a sane range as well, so an outlier
                     # score can never push an extreme value into the core's LRFU decay.
@@ -725,8 +732,8 @@ class SparseOrchestrator:
                     if store is not None and hasattr(store, "disk_stats"):
                         stats["disk"] = store.disk_stats()
                     self.last_score_stats = stats
-                except Exception as exc:
-                    self.last_score_stats = {"error": str(exc)[:120]}
+            except Exception as exc:
+                self.last_score_stats = {"error": str(exc)[:120]}
         if core is None and not getattr(self, "allow_legacy_scores", False):
             _probe_write({"kind": "scores_unavailable",
                           "reason": getattr(self, "_core_error", None),

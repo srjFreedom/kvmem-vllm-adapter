@@ -426,12 +426,17 @@ PYBIND11_MODULE(vllm_kvmem_ext, m) {
             } else {
                 auto array = py::cast<Array>(item);
                 const auto info = array.request();
+                // The core allows a layer to carry FEWER rows than `rows` (`layer_rows[l] <= rows`):
+                // layers can have different capture windows, and the row count is what the scorer
+                // weights by. Requiring equality here rejected such a frame outright ("query rows
+                // must be [rows, query_heads, head_dim]") and dropped retrieval for the request.
                 if (info.ndim != 3 || uint32_t(info.shape[1]) != query_heads ||
-                    uint32_t(info.shape[2]) != head_dim || uint32_t(info.shape[0]) != rows)
-                    throw std::invalid_argument("query rows must be [rows, query_heads, head_dim]");
+                    uint32_t(info.shape[2]) != head_dim || uint32_t(info.shape[0]) > rows ||
+                    uint32_t(info.shape[0]) == 0)
+                    throw std::invalid_argument("query rows must be [<=rows, query_heads, head_dim]");
                 held.push_back(std::move(array));
                 ptrs.push_back(nullptr);             // filled once `held` stops moving
-                counts.push_back(rows);
+                counts.push_back(uint32_t(info.shape[0]));
                 slots.emplace_back(layer, held.size() - 1);
             }
             ++layer;
@@ -482,11 +487,12 @@ PYBIND11_MODULE(vllm_kvmem_ext, m) {
                     auto array = py::cast<Array>(item);
                     const auto info = array.request();
                     if (info.ndim != 3 || uint32_t(info.shape[1]) != query_heads ||
-                        uint32_t(info.shape[2]) != head_dim || uint32_t(info.shape[0]) != rows)
-                        throw std::invalid_argument("query rows must be [rows, query_heads, head_dim]");
+                        uint32_t(info.shape[2]) != head_dim || uint32_t(info.shape[0]) > rows ||
+                        uint32_t(info.shape[0]) == 0)
+                        throw std::invalid_argument("query rows must be [<=rows, query_heads, head_dim]");
                     held.push_back(std::move(array));
                     ptrs.push_back(nullptr);
-                    counts.push_back(rows);
+                    counts.push_back(uint32_t(info.shape[0]));
                     slots.emplace_back(layer, held.size() - 1);
                 }
                 ++layer;
