@@ -688,6 +688,15 @@ def _attach_sparse(runner, log_path):
     # approximation that in-prefill compaction leaves in a hybrid model's state.
     runtime.compact_rebuild = (bool(cfg.get("compact_rebuild", False))
                                or os.environ.get("KVMEM_COMPACT_REBUILD", "") == "1")
+    # The rebuild rewrites ONE engine-side token book, so only rank 0 may ask for it. Both ranks
+    # still send their ordinary compact message (each owns its KV), but a second rebuild would
+    # re-derive the token list from an already-rewritten book (measured: 7 rebuild records and
+    # garbage output).
+    try:
+        runtime.tp_rank = int(getattr(getattr(runner.vllm_config, "parallel_config", None),
+                                      "rank", 0) or 0)
+    except Exception:
+        runtime.tp_rank = 0
     runtime.use_kvmem_plan = bool(cfg.get("use_kvmem_plan", False))
     runtime.use_kvmem_host = bool(cfg.get("use_kvmem_host", True))
     try:

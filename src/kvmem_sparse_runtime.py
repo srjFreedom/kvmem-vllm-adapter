@@ -1775,8 +1775,9 @@ class VllmSparseRuntime:
                 # the compacted sequence, so the selected pages are prefilled from scratch. Only at
                 # the prefill boundary, where the sequence may legitimately change.
                 _st_r = self._state.get(req)
-                _rebuild = bool(getattr(self, "compact_rebuild", False)) and not bool(
-                    getattr(_st_r, "rebuilt", False))
+                _rebuild = (bool(getattr(self, "compact_rebuild", False))
+                            and not bool(getattr(_st_r, "rebuilt", False))
+                            and int(getattr(self, "tp_rank", 0) or 0) == 0)
                 if _rebuild and self.reset_state is not None:
                     try:
                         self.reset_state(req)
