@@ -1015,7 +1015,7 @@ class VllmSparseRuntime:
         (never synthesises from the page map, which mixed logical pages with resident ranks and
         produced duplicate ids).
         """
-        if not bool(getattr(self, "row_grow_pre_step", True)):
+        if not bool(getattr(self, "row_grow_pre_step", False)):
             return 0
         st = self._state.get(req)
         n = int(n_tokens or 0)
@@ -1832,22 +1832,10 @@ class VllmSparseRuntime:
         out = base.clone()
         for row, value in self._seq_override.items():
             if row < out.numel():
-                # Clamp to what the row actually holds: the kernel reads ceil(seq_len/page) row
-                # entries, and a row that is one chunk short made FlashInfer fault (measured:
-                # seq_len=49152 needs 3072 entries, row had 2828). Losing the tail of the CURRENT
-                # chunk's attention is strictly better than an illegal access.
-                try:
-                    for _req, _st in self._state.items():
-                        if getattr(_st, "row_index", None) == row and _st.row:
-                            _cap = len(_st.row) * max(1, int(self.page_tokens))
-                            if int(value) > _cap:
-                                self.log({"kind": "seq_len_clamped", "req": _req,
-                                          "seq_len": int(value), "cap": int(_cap),
-                                          "lost": int(value) - int(_cap)})
-                                value = _cap
-                            break
-                except Exception:
-                    pass
+                # NOTE: clamping this to the row's coverage was tried and REMOVED - it did not stop
+                # the beyond-pool fault, and on the healthy no-compaction path the row is briefly
+                # one chunk short when the override is read, so the clamp silently cost attention
+                # (measured: a clean "ZX-4417" became "ZX-4417" + garbage).
                 out[row] = value
                 # Read-side diagnostic: the kernel attends to `value` positions, i.e. it reads
                 # ceil(value / page) entries of the row. More than the row has = illegal access that
