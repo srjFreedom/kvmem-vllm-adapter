@@ -648,7 +648,11 @@ class SparseOrchestrator:
                         self._compare_core_scores(legacy_blocks, legacy)
                 except Exception:
                     pass
-        elif self.retrieval_index is not None:
+        elif getattr(self, "allow_legacy_scores", False) and self.retrieval_index is not None:
+            # Legacy scoring is OFF by default: v0.19's scorer is the ranking source now, and a
+            # fallback that silently ranks with the old hand-rolled index is exactly the "two
+            # implementations disagree" hazard this migration set out to remove. With no core
+            # scores the working set is simply left alone (logged) instead.
             blocks = self.retrieval_index.covered_blocks()
             if blocks:
                 try:
@@ -723,6 +727,10 @@ class SparseOrchestrator:
                     self.last_score_stats = stats
                 except Exception as exc:
                     self.last_score_stats = {"error": str(exc)[:120]}
+        if core is None and not getattr(self, "allow_legacy_scores", False):
+            _probe_write({"kind": "scores_unavailable",
+                          "reason": getattr(self, "_core_error", None),
+                          "prefill_pressure": bool(prefill_pressure)})
         if prefill_pressure:
             raw = self.selector.select_prefill_pressure_pages(list(mandatory_pages))
         else:
