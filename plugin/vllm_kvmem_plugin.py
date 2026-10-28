@@ -1389,6 +1389,30 @@ def register():
                     _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
                             {"kind": "compact_rebuild_error", "req": request_id,
                              "error": traceback.format_exc()[-400:]})
+            # Pool accounting: a compaction rewinds the resident book but the ENGINE still owns the
+            # evicted blocks (vLLM frees blocks only at request end), so every compaction can leak
+            # them and the pool fills until the scheduler preempts - which then recomputes against a
+            # compacted row. Record the free-block count so the leak is visible.
+            try:
+                _pool = getattr(getattr(scheduler, "kv_cache_manager", None), "block_pool", None)
+                _free = int(_pool.get_num_free_blocks()) if _pool is not None else -1
+                _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "compact_pool", "req": request_id, "visible": int(visible),
+                         "free_blocks": _free})
+            except Exception:
+                pass
+            # Pool accounting: a compaction rewinds the resident book but the ENGINE still owns the
+            # evicted blocks (vLLM frees blocks only at request end), so every compaction can leak
+            # them, the pool fills, and the scheduler preempts - which then recomputes against a
+            # compacted row. Record the free-block count so the leak is visible.
+            try:
+                _pool = getattr(getattr(scheduler, "kv_cache_manager", None), "block_pool", None)
+                _free = int(_pool.get_num_free_blocks()) if _pool is not None else -1
+                _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "compact_pool", "req": request_id, "visible": int(visible),
+                         "free_blocks": _free})
+            except Exception:
+                pass
             _compact_state[request_id] = visible
             entry = {"kind": "compact_applied", "pid": os.getpid(),
                      "req": request_id, "pages": len(pages),
