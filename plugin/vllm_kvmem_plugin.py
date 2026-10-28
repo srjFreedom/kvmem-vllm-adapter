@@ -643,6 +643,28 @@ def _attach_sparse(runner, log_path):
     if runtime.has_recurrent:
         runtime.capture_state = lambda req: _capture_state_snapshot(runner, runtime, req)
         runtime.restore_state = lambda req, snap: _restore_state_snapshot(runner, runtime, req, snap)
+
+        def _reset_state(req):
+            """Zero this request's recurrent state (prep for a reconstruction pass)."""
+            groups = _state_groups(runner)
+            st = runtime._state.get(req)
+            row = getattr(st, "row_index", None) if st is not None else None
+            if not groups or row is None:
+                return False
+            done = False
+            for group, tensors in groups.items():
+                slot = _state_slot(runner, row, group)
+                if slot is None or slot < 0:
+                    continue
+                for tensor in tensors:
+                    try:
+                        tensor[slot].zero_()
+                        done = True
+                    except Exception:
+                        pass
+            return done
+
+        runtime.reset_state = _reset_state
     if bool(cfg.get("session_reuse", False)) and runtime.inrequest_compaction:
         try:
             from kvmem_session_store import get_session_store
@@ -661,6 +683,11 @@ def _attach_sparse(runner, log_path):
         except Exception:
             _append(log_path, {"kind": "session_reuse_error", "pid": os.getpid(),
                                "error": traceback.format_exc()})
+    # Reconstruction on compaction (opt-in): rewrite the engine's token book to the compacted
+    # sequence, zero the recurrent state and re-prefill the selected pages. This is what removes the
+    # approximation that in-prefill compaction leaves in a hybrid model's state.
+    runtime.compact_rebuild = (bool(cfg.get("compact_rebuild", False))
+                               or os.environ.get("KVMEM_COMPACT_REBUILD", "") == "1")
     runtime.use_kvmem_plan = bool(cfg.get("use_kvmem_plan", False))
     runtime.use_kvmem_host = bool(cfg.get("use_kvmem_host", True))
     try:
@@ -1266,7 +1293,7 @@ def register():
             _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl", entry)
             return {"ok": True, "replay": int(n), "computed": int(req.num_computed_tokens)}
 
-        def _compact(request_id, pages, page_tokens, visible_tokens=0):
+        def _compact(request_id, pages, page_tokens, visible_tokens=0, rebuild=False):
             """Resident-book reconciliation (Route A / resident model).
 
             The worker selected a working set and has ALREADY installed it into the block table row
@@ -1309,6 +1336,35 @@ def register():
             # books disagree after the first compaction and the scheduler over-schedules.
             req.num_kvmem_offset = int(getattr(req, "num_logical_tokens", 0)) \
                 - int(req.num_computed_tokens)
+            if rebuild:
+                # RECONSTRUCTION (upstream's CheckpointPurpose::Reconstruction): rewrite the
+                # request's token book to the COMPACTED sequence and rewind both counters to zero,
+                # so the engine prefills the selected pages from scratch. The recurrent state is
+                # zeroed by the worker beforehand, which is what removes the approximation that
+                # prefill-time compaction leaves in it.
+                try:
+                    pages = [int(p) for p in pages]
+                    ids = list(getattr(req, "_all_token_ids", []) or [])
+                    new_ids = []
+                    for p in pages:
+                        new_ids.extend(ids[p * page_tokens:(p + 1) * page_tokens])
+                    if new_ids:
+                        new_ids = new_ids[:visible] if visible else new_ids
+                        req._all_token_ids[:] = new_ids
+                        req.num_prompt_tokens = len(new_ids)
+                        req.num_computed_tokens = 0
+                        req.num_logical_tokens = 0
+                        req.num_kvmem_offset = 0
+                        _compact_state[request_id] = 0
+                        _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "compact_rebuilt", "req": request_id,
+                                 "pages": len(pages), "tokens": len(new_ids)})
+                        return {"ok": True, "truncated": True, "rebuild": True,
+                                "tokens": len(new_ids)}
+                except Exception:
+                    _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                            {"kind": "compact_rebuild_error", "req": request_id,
+                             "error": traceback.format_exc()[-400:]})
             _compact_state[request_id] = visible
             entry = {"kind": "compact_applied", "pid": os.getpid(),
                      "req": request_id, "pages": len(pages),

@@ -41,7 +41,7 @@ class _ReqState:
     #           token can be attributed to the history block it belongs to.
     __slots__ = ("row", "logical", "seq_len", "tokens", "next_page", "steps", "spare",
                  "row_index", "prefill_done", "query_reselected", "resume", "resumed",
-                 "replay_snap", "replay_n", "replay_at", "replay_at_resident")
+                 "replay_snap", "replay_n", "replay_at", "replay_at_resident", "rebuilt")
 
     def __init__(self):
         self.row = ()
@@ -64,6 +64,7 @@ class _ReqState:
         # QueryReplay: recurrent state captured just before the LAST prefill chunk, plus that
         # chunk's token count. Replaying applies those tokens to the GDN state a second time unless
         # the state is restored to this boundary first (a hybrid model cannot "replay" for free).
+        self.rebuilt = False
         self.replay_snap = None
         self.replay_n = 0
         self.replay_at = 0
@@ -155,6 +156,8 @@ class VllmSparseRuntime:
         # NOT in the paged store: capture(req) -> snapshot, restore(req, snapshot) -> bool.
         self.capture_state = None
         self.restore_state = None
+        self.reset_state = None          # zero the recurrent state (reconstruction)
+        self.compact_rebuild = False     # rewrite the token book on compaction (reconstruction)
         # True when the model has non-attention (GDN/Mamba) KV groups. Their recurrent state is NOT
         # in the paged store, so a resume is only safe when a state snapshot travelled with the
         # parked session (otherwise the resumed prefill would read a stale recurrent state -- the
@@ -1768,8 +1771,19 @@ class VllmSparseRuntime:
         ch = getattr(self, "compact_channel", None)
         if ch is not None and selected:
             try:
+                # Reconstruction: zero the recurrent state and rewrite the engine's token book to
+                # the compacted sequence, so the selected pages are prefilled from scratch. Only at
+                # the prefill boundary, where the sequence may legitimately change.
+                _st_r = self._state.get(req)
+                _rebuild = bool(getattr(self, "compact_rebuild", False)) and not bool(
+                    getattr(_st_r, "rebuilt", False))
+                if _rebuild and self.reset_state is not None:
+                    try:
+                        self.reset_state(req)
+                    except Exception:
+                        _rebuild = False
                 res = ch.compact(req, selected, self.page_tokens,
-                                 visible_tokens=int(st.seq_len))
+                                 visible_tokens=int(st.seq_len), rebuild=_rebuild)
                 if isinstance(res, dict):
                     record["compact_applied"] = bool(res.get("ok"))
                     record["compact_truncated"] = bool(res.get("truncated"))
