@@ -199,3 +199,29 @@ row = 5120 pages                （覆盖到 81920）
 即**引擎的 computed 已经跑在常驻账前面**，attention metadata 的长度与行的实际内容仍不一致。
 下一步要查：`seq_lens` / `seq_lens_cpu_upper_bound` 与 `num_kvmem_offset` 在这条路径上的更新次序
 （压缩发生在 chunk 之间，引擎已经为下一个 chunk 记账）。
+
+## 第 9 轮：prefill 期压缩不再崩溃；剩下的障碍是循环状态
+
+修掉"负偏移"后（offset 必须取**引擎自己**的 `num_logical - num_computed`；用运行时账本会在压缩后
+变成负数，把槽位索引整体反向偏移 → 越界），**95,356 token prompt（B=36864，压缩发生在 prefill
+期间）第一次返回 HTTP 200，引擎存活**。
+
+但答案是 `ductductduct...`（复读），而选择端是对的：
+
+```
+reselect: selected=2304 pages, visible=36860
+retrieval_check: top_blocks=[[256,0.3607],[257,0.3607],...]   ← 有排序
+compact_applied: 42114 -> 36864, offset 58498
+replay_snapshot: at=90112 (logical) vs visible=36864 (resident)   ← 坐标混用，replay 长度无效
+```
+
+结论：**prefill 期压缩使 GDN 循环状态带上近似误差，而它是整请求一份、永不重算命中的**。注意力视图
+可以靠检索修好，状态不行。这正是上游 `prefix_checkpoint` 里 `CheckpointPurpose::Reconstruction` /
+`QueryReplay` 存在的原因：**在 prefill 过程中周期性地保存状态镜像，最后从某个有效检查点重算尾部**。
+
+因此超池的收官路径 = objective ③ 的"checkpoint 目录"：
+1. 每次压缩边界存一份**循环状态镜像**（`capture_state` 已有）；
+2. prefill 结束时挑一个"视图已正确"的检查点，恢复状态后重算剩余 token（replay）；
+3. 之前 `replay` 的坐标混用（logical vs resident）必须先统一到 **resident** 口径。
+
+优先做 (3)+(1)：先把 replay 长度改成 resident 口径并禁用无效 replay，再决定是否需要多检查点。
