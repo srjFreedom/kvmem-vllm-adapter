@@ -180,3 +180,22 @@ top=[149,392,393,391,197]。**说明统计→打分→选择→解码整条链�
 
 下一步就是那个接口：channel compact 消息带 kept page ranges → EngineCore 重建 `_all_token_ids` →
 `RequestState.compacted_tokens` 三处使用。这是唯一挡住"prompt 不受显存限制"的东西。
+
+## 第 8 轮：行滞后修好，越界仍有第二个来源
+
+修：块表行原来在 `after_step`（模型跑完之后）才扩展，所以每个跨页边界的 prefill chunk 都在
+"行比 seq_len 短一截"的状态下执行（实测 `row=4864 pages` 而本步要写到 81920 → 需要 5120）。
+现在 `ensure_row_for_chunk()` 在**步进之前**按引擎自己的页映射预留本 chunk 需要的页，实测
+`row` 精确长到 `need`、`row_short_pre_step = 0`。
+
+仍未通过：111K prompt（> B，prefill 期压缩）依旧 `illegal memory access`，而此时三条账是：
+
+```
+engine num_computed = 81920     （已推进）
+runtime tokens/seq_len = 77824  （常驻账）
+row = 5120 pages                （覆盖到 81920）
+```
+
+即**引擎的 computed 已经跑在常驻账前面**，attention metadata 的长度与行的实际内容仍不一致。
+下一步要查：`seq_lens` / `seq_lens_cpu_upper_bound` 与 `num_kvmem_offset` 在这条路径上的更新次序
+（压缩发生在 chunk 之间，引擎已经为下一个 chunk 记账）。
