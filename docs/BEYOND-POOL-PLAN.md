@@ -225,3 +225,24 @@ replay_snapshot: at=90112 (logical) vs visible=36864 (resident)   ← 坐标混�
 3. 之前 `replay` 的坐标混用（logical vs resident）必须先统一到 **resident** 口径。
 
 优先做 (3)+(1)：先把 replay 长度改成 resident 口径并禁用无效 replay，再决定是否需要多检查点。
+
+## 第 11 轮：重建路径跑到了"第三块拼图"上
+
+`KVMEM_COMPACT_REBUILD=1` 已实现并被触发：
+
+```
+compact_rebuilt: pages=2304 tokens=36864      ← 引擎的 token 账本被改写成压缩后的序列
+```
+
+随后撞上仓库设计稿里早就写明的那个断言：
+
+```
+model_runner.py:1360  assert (num_scheduled_tokens_np >= num_logits).all()
+```
+
+即 `DESIGN-compacted-sequence.md` 的第三块拼图：**model_runner 必须按压缩后的账本计算 logits 行**。
+前两块（channel 带页列表、EngineCore 重建 `_all_token_ids`）本轮已完成，第三块是
+`prepare_inputs` 里 `num_scheduled_tokens` / `num_logits` 的口径统一。
+
+在这之上一旦完成，超池路径的最后一块就补齐了：状态从零重算 + token 账本与视图一致。
+该开关默认关闭，不影响现有可用路径。
