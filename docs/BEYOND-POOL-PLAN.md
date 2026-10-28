@@ -246,3 +246,17 @@ model_runner.py:1360  assert (num_scheduled_tokens_np >= num_logits).all()
 
 在这之上一旦完成，超池路径的最后一块就补齐了：状态从零重算 + token 账本与视图一致。
 该开关默认关闭，不影响现有可用路径。
+
+## 第 12 轮：重建路径的收敛条件写清楚了
+
+现象：95K prompt 触发多次 `compact_rebuilt`，随后 `assert num_scheduled_tokens_np >= num_logits`。
+
+已定位的收敛条件（下一次实现按这三条来）：
+
+1. **每个请求只重建一次**，且必须在**所有 rank 的 compact 消息合并之后**再执行——现在两个 TP rank
+   各发一次，EngineCore 会各跑一次重建（实测 5 次）；
+2. **重建只能在 prefill 边界**（最后一次 chunk 之后），不能在 prefill 进行中，否则引擎正要按旧账本
+   排下一个 chunk；
+3. **拼图③必须先做**：`prepare_inputs` 里 logits 行数要按压缩后的账本算，否则重建后第一步就断言。
+
+开关 `KVMEM_COMPACT_REBUILD` 默认关闭，现有可用路径不受影响。
