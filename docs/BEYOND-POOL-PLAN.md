@@ -110,3 +110,21 @@ scores: 来自旧索引（core 分数此刻还不可用：prefill 早期没有 q
 
 注意：重放只修复"采样点之前的 N 个 token"，之前的近似误差仍留在更早的 KV 里——这是上游
 `QueryReplay` 的语义，不是缺陷；要彻底无近似必须让 prefill 全程 resident（即窗口 ≥ prompt）。
+
+## QueryReplay 第一版实测（58K prompt，B=36864）
+
+链路已通：`query_replay` → `replay_applied`（n=2048，computed 36864→34816，logical 58660→56612），
+两个 TP rank 重复下发已用 (req, visible) 去重。
+
+结果：答案从完全截断（`ZX`）变成 **`ZX_tokens =!.`（找到了 ZX，但后续乱码）**。
+
+原因（混合模型的根本限制）：**GDN 循环状态不能被"重放"**。重算这 2048 个 token 会再次把它们
+施加到循环状态上（同一批 token 被计两次），而状态里原本已经包含它们。
+
+正确做法（上游 `CheckpointPurpose::QueryReplay` + StateImage 的语义）：
+1. 在 prefill 经过 `visible - N` 这个边界时，**快照一次循环状态**（runtime 已有
+   `capture_state(req)` / `restore_state(req, snap)` 钩子，是给 session park 用的）；
+2. 重放前先 `restore_state` 回到该边界；
+3. 再回退两本账、重算 N 个 token —— 此时状态从头正确重算，KV 也在新视图下刷新。
+
+没有第 1、2 步，重放只会把循环状态算两遍。这是下一步（第 3 轮）的工作。
