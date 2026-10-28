@@ -634,6 +634,15 @@ def _attach_sparse(runner, log_path):
         runtime.compact_channel = None
     # --- cross-request prefix reuse: park finished sessions, adopt them on a later turn --------
     runtime.has_recurrent = _has_recurrent_groups(runner)
+    # The recurrent-state hooks are needed by TWO features, not just session reuse:
+    #   * parking a session across requests, and
+    #   * QueryReplay, which must restore the GDN state to the replay boundary or the recomputed
+    #     tail is applied to that state twice.
+    # They used to be wired only inside the session-reuse branch, so a compaction-only run had
+    # capture_state=None and the replay silently corrupted the state.
+    if runtime.has_recurrent:
+        runtime.capture_state = lambda req: _capture_state_snapshot(runner, runtime, req)
+        runtime.restore_state = lambda req, snap: _restore_state_snapshot(runner, runtime, req, snap)
     if bool(cfg.get("session_reuse", False)) and runtime.inrequest_compaction:
         try:
             from kvmem_session_store import get_session_store

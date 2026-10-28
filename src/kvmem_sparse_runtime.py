@@ -40,7 +40,8 @@ class _ReqState:
     # logical:  logical page id (true token page) occupying each row position, so a written
     #           token can be attributed to the history block it belongs to.
     __slots__ = ("row", "logical", "seq_len", "tokens", "next_page", "steps", "spare",
-                 "row_index", "prefill_done", "query_reselected", "resume", "resumed")
+                 "row_index", "prefill_done", "query_reselected", "resume", "resumed",
+                 "replay_snap", "replay_n", "replay_at")
 
     def __init__(self):
         self.row = ()
@@ -60,6 +61,12 @@ class _ReqState:
         # first step installs the restored view; `resumed` marks that it happened.
         self.resume = None
         self.resumed = False
+        # QueryReplay: recurrent state captured just before the LAST prefill chunk, plus that
+        # chunk's token count. Replaying applies those tokens to the GDN state a second time unless
+        # the state is restored to this boundary first (a hybrid model cannot "replay" for free).
+        self.replay_snap = None
+        self.replay_n = 0
+        self.replay_at = 0
 
 
 class VllmSparseRuntime:
@@ -940,6 +947,33 @@ class VllmSparseRuntime:
 
     def advance_tokens(self, req, n_new):
         self._inflight[req] = int(n_new or 0)
+        # QueryReplay boundary: this step prefills the FINAL chunk of the prompt, so snapshot the
+        # recurrent state BEFORE it runs. Replaying that chunk afterwards must start from this state
+        # or the tokens are applied to the GDN state twice.
+        try:
+            _st0 = self.state(req)
+            # Capture ONCE, at the boundary that the replay will return to: the last <=2 chunks of
+            # the prompt. The snapshot must be taken at the START of the step (before the model
+            # runs), and the replay length is what is still missing at that moment (capped at the
+            # replay window). Capturing on every step instead let a final 1-token step overwrite it
+            # and reduced the replay to a single token - which reprocesses nothing.
+            _plen = int(self._prompt_len.get(req, 0) or 0)
+            _left = _plen - int(getattr(_st0, "tokens", 0))
+            if (_plen and 0 < _left <= 8192 and getattr(_st0, "replay_snap", None) is None
+                    and self.capture_state is not None):
+                _snap = self.capture_state(req)
+                if _snap:
+                    _st0.replay_snap = _snap
+                    # Remember WHERE the snapshot was taken. The replay length is derived from it and
+                    # the engine's visible length, so both TP ranks agree on n: taking n from "what
+                    # was left" instead let the two ranks disagree (2042 vs 2048) and the first
+                    # message won, which rewound to the wrong position.
+                    _st0.replay_at = int(getattr(_st0, "tokens", 0))
+                    if self.log is not None:
+                        self.log({"kind": "replay_snapshot", "req": req, "left": int(_left),
+                                  "at": int(_st0.replay_at)})
+        except Exception:
+            pass
         """One step of accounting, driven from the entry of the runner's execute_model wrapper.
 
         Committing is deliberately LAGGED by one step: at the entry of step k the model has not yet
@@ -1332,9 +1366,22 @@ class VllmSparseRuntime:
         try:
             st = self.state(req)
             visible = int(getattr(st, "seq_len", 0) or 0)
-            n = min(int(n_tokens or 0), visible)
+            snap = getattr(st, "replay_snap", None)
+            at = int(getattr(st, "replay_at", 0) or 0)
+            n = (visible - at) if (snap and at > 0) else int(n_tokens or 0)
+            n = min(max(int(n), 0), visible)
             if n <= 0:
                 return None
+            if snap is not None and self.restore_state is not None:
+                # Put the recurrent state back at the replay boundary first: the tokens about to be
+                # recomputed are then applied exactly once.
+                try:
+                    self.restore_state(req, snap)
+                except Exception:
+                    pass
+                st.replay_snap = None
+                if self.log is not None:
+                    self.log({"kind": "replay_state_restored", "req": req, "n": int(n)})
             res = ch.replay(req, visible, n)
             if self.log is not None:
                 self.log({"kind": "query_replay", "req": req, "n": int(n),
