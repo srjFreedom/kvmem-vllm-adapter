@@ -440,18 +440,19 @@ class SparseOrchestrator:
         page, slot = int(page), int(slot)
         if not self.store.has(page):
             raise RuntimeError(f"cannot restore page {page}: no canonical bytes")
-        if rank is not None:
-            needed = (int(rank) - page) * self.page_tokens
-        else:
-            needed = (slot - page) * self.page_tokens
-        step = needed - self.store_delta.get(page, 0)
+        # PURE COPY. Address compaction must not touch the bytes: the stored K already carries the
+        # RoPE phase of the token's TRUE position, and the engine is told that true position for
+        # RoPE while only the WRITE address moves (kvmem_slot_offset). Re-baking here used to
+        # rewrite K to the compacted positions, which is exactly what desynchronised every
+        # per-request recurrent state (measured: mixed-script garbage after a compaction while all
+        # accounting invariants still held).
         for layer, kv in enumerate(self.kvs):
             dev = self.store.get(page)[layer].to(kv.device, non_blocking=True)
-            kv[slot].copy_(dev if step == 0 else self._rotate_page_bytes(dev, step))
+            kv[slot].copy_(dev)
         self.resident.add(page)
         self.slot_of[page] = slot
-        self.baked_delta[page] = needed
-        return needed
+        self.baked_delta[page] = 0
+        return 0
 
     # --- v0.19 scoring path ------------------------------------------------------------
     def core_selection_scores(self):
@@ -986,11 +987,9 @@ class SparseOrchestrator:
         slot = self.slot_of.get(int(page))
         if slot is None:
             return None
-        step = self.baked_delta[int(page)] - self.store_delta.get(int(page), 0)
-        stored = self.store.get(page)              # CPU bytes
-        for layer, kv in enumerate(self.kvs):
+        stored = self.store.get(page)              # CPU bytes, already carrying their true-position
+        for layer, kv in enumerate(self.kvs):      # RoPE phase: the device copy must be identical.
             dev = stored[layer].to(kv.device, non_blocking=False)
-            want = dev if step == 0 else self._rotate_page_bytes(dev, step)
-            if not torch.equal(kv[slot], want):
+            if not torch.equal(kv[slot], dev):
                 return False
         return True

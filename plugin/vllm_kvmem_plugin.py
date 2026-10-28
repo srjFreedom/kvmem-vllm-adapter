@@ -1489,6 +1489,24 @@ def _install(cls, module_name, probe, smoke, state):
                     # buckets this step correctly (device tensor -> CUDA graph replays it live).
                     if getattr(_rt, "stats_core", False):
                         _rt.publish_position_offset(_req)
+                    # Adapter half of the position split: RoPE keeps the TRUE position (the engine's
+                    # own `positions`), the WRITE address uses the compacted one. `kvmem_slot_offset`
+                    # is a 0-dim device tensor so a CUDA graph replays the live value; 0 (no
+                    # compaction yet) makes the subtraction a no-op.
+                    try:
+                        _st = _rt.state(_req)
+                        _off = int(getattr(_st, "tokens", 0)) - int(getattr(_st, "seq_len", 0))
+                        if _off < 0:
+                            _off = 0
+                        _buf = getattr(self, "_kvmem_slot_offset", None)
+                        if _buf is None:
+                            import torch as _t
+                            _buf = _t.zeros((), dtype=_t.int64, device="cuda")
+                            self._kvmem_slot_offset = _buf
+                        _buf.fill_(_off)
+                        self.kvmem_slot_offset = _buf
+                    except Exception:
+                        self.kvmem_slot_offset = None
         except Exception:
             _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                     {"kind": "advance_error", "error": traceback.format_exc()})
