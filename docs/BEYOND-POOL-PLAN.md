@@ -54,3 +54,33 @@ B=36864 或 131072，compaction 关（或 B 足以容纳 prompt）
 KVMEM_STATS=core, page-softmax, LRFU 关, MTP 开
 → 88K prompt、needle 居中，答对 ZX-4417，引擎存活
 ```
+
+## 2026-10-29 第二轮探测结果（58K prompt，B=36864，允许 prefill 期压缩）
+
+压缩不再崩引擎（纯拷贝 + 位置拆分生效），**重复压缩账本自洽**：
+
+```
+compact_applied: 49152 -> 36864 (offset 12288)
+compact_applied: 46371 -> 36864
+compact_applied: 36865 -> 36864
+pages=2304 x 16 token = 36864 = visible_tokens   ✔ 三本账一致
+```
+
+但答案是截断的 `ZX`，原因在**选择质量**，不在账本：
+
+```
+reselect: prefill_pressure=true, selected=2304 pages, mandatory=640
+retrieval_check: mid_block=458, mid_selected=false, end_selected=true
+scores: 来自旧索引（core 分数此刻还不可用：prefill 早期没有 query）
+```
+
+结论（与上游设计一致）：**prefill 期只能做 sink+newest 的压力选择**，因为问题还没进窗口，中间段没有 query 可比。needle 落在被丢弃的区间，所以答案被截断。上游对此的做法是 prefill 后做一次 **QueryReplay**（把最后 N 个 token 当作 query 重放一遍去给中间段打分），再装 B 视图。
+
+所以超池路径的完整顺序应当是：
+
+1. prefill 分 chunk；每 chunk 的 KV 立即落 RAM；
+2. prefill 期 resident 只保留 sink + 最新（pressure）——**这一步的近似是设计内允许的**；
+3. prefill 结束 → **QueryReplay**：用 query 窗口给中段打分（page-softmax）→ 装 B 视图 → 解码；
+4. 生成超出 R → 追加 RAM → 重新检索。
+
+下一步实现 QueryReplay（第 3 步），它是"中间内容不丢"的关键。
