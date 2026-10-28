@@ -618,27 +618,45 @@ def _attach_sparse(runner, log_path):
             getattr(hf, "text_config", None), "num_attention_heads")
         kv_heads = _int_attr(hf, "num_key_value_heads") or _int_attr(
             getattr(hf, "text_config", None), "num_key_value_heads") or heads
+        # The hf config reports the GLOBAL kv-head count while this rank's key tensor is the TP
+        # slice: measured key=(54,512) fp16 for a 4-head/256-dim model at TP=2, i.e. 2 heads per
+        # rank. Sizing the capture buffers from the global count made every key fail the width
+        # check and the mean-K statistics stayed all-zero (core scores 0.0 on every block).
+        try:
+            _tp = int(tp or 1)
+            if _tp > 1 and int(kv_heads) % _tp == 0:
+                _global_kv = int(kv_heads)
+                kv_heads = _global_kv // _tp
+                _append(log_path, {"kind": "kv_heads_per_rank", "pid": os.getpid(),
+                                   "hf_global": _global_kv, "tp": _tp,
+                                   "per_rank": int(kv_heads)})
+        except Exception:
+            pass
         if not heads:
             for _name, _mod in getattr(runner, "model", runner).named_modules():
                 if type(_mod).__name__ == "Qwen3NextAttention":
                     heads = int(getattr(_mod, "num_heads", 0) or 0)
                     kv_heads = int(getattr(_mod, "num_kv_heads", kv_heads) or kv_heads)
-                    # The tensor width is authoritative: with TP>1 `num_kv_heads` may report the
-                    # GLOBAL count while the layer's key tensor is the per-rank slice, and that
-                    # mismatch silently dropped every captured key (statistics filled with zeros).
+                    # The TENSOR width is authoritative: with TP>1 `num_kv_heads` reports the GLOBAL
+                    # count while the layer's key tensor is the per-rank slice. That mismatch made
+                    # capture_k refuse every key and the statistics store filled with zeros
+                    # (measured: key=(54,512) fp16 while the buffers were sized 4*256=1024).
+                    _global_kv = int(kv_heads)
+                    _per_rank = _global_kv
                     try:
                         _kv = int(getattr(_mod, "kv_size", 0) or 0)
                         _hs = int(getattr(_mod, "head_size", 0) or 0)
-                        if _kv and _hs and _kv % _hs == 0:
+                        if _kv and _hs and _kv % _hs == 0 and _kv // _hs != _global_kv:
                             _per_rank = _kv // _hs
-                            if _per_rank != int(kv_heads):
-                                _append(log_path, {"kind": "kv_heads_corrected", "pid": os.getpid(),
-                                                   "module_num_kv_heads": int(kv_heads),
-                                                   "kv_size": _kv, "head_size": _hs,
-                                                   "per_rank_kv_heads": _per_rank})
-                            kv_heads = _per_rank
+                        elif _global_kv % max(1, tp) == 0:
+                            _per_rank = _global_kv // max(1, tp)
                     except Exception:
-                        pass
+                        _per_rank = max(1, _global_kv // max(1, tp))
+                    if _per_rank != _global_kv:
+                        _append(log_path, {"kind": "kv_heads_corrected", "pid": os.getpid(),
+                                           "num_kv_heads_global": _global_kv, "tp": tp,
+                                           "per_rank_kv_heads": _per_rank})
+                    kv_heads = _per_rank
                     head_dim = int(getattr(_mod, "head_size", head_dim) or head_dim)
                     break
         per_rank = max(1, heads // max(1, tp)) if heads else 0
