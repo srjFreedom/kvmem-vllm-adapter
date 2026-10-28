@@ -549,7 +549,12 @@ class SparseOrchestrator:
         # The counter is per ORCHESTRATOR and an orchestrator can serve several requests (parked
         # sessions are reused), so a low cap silently ended the audit while everything else looked
         # healthy. Keep a high cap and record every refusal reason instead of returning blind.
-        if getattr(self, "_compare_done", 0) >= 64:
+        # Count the ATTEMPT before doing any work. Every early return below used to leave the counter
+        # untouched, so a failing audit reran on EVERY prefill step - and each attempt copies the
+        # whole 512-row query window of all 16 layers to host (~50 MiB). At 128K that exhausted the
+        # pinned allocator and killed the engine ("Exception in pinned allocator free()").
+        self._compare_done = getattr(self, "_compare_done", 0) + 1
+        if self._compare_done > 64:
             _probe_write({"kind": "scorer_compare_skipped", "reason": "cap",
                           "done": int(getattr(self, "_compare_done", 0))})
             return
@@ -607,7 +612,6 @@ class SparseOrchestrator:
                 rec["legacy_block_tokens"] = lb
                 rec.update(compare_scores(aligned, legacy,
                                           blocks=range(len(aligned)), top=10))
-            self._compare_done = getattr(self, "_compare_done", 0) + 1
             _probe_write(rec)
         except Exception:
             try:
