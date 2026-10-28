@@ -686,6 +686,10 @@ def _attach_sparse(runner, log_path):
     # Reconstruction on compaction (opt-in): rewrite the engine's token book to the compacted
     # sequence, zero the recurrent state and re-prefill the selected pages. This is what removes the
     # approximation that in-prefill compaction leaves in a hybrid model's state.
+    try:
+        runner.kvmem_runtime = runtime      # diagnostic hooks in the runner read the books here
+    except Exception:
+        pass
     runtime.compact_rebuild = (bool(cfg.get("compact_rebuild", False))
                                or os.environ.get("KVMEM_COMPACT_REBUILD", "") == "1")
     # The rebuild rewrites ONE engine-side token book, so only rank 0 may ask for it. Both ranks
