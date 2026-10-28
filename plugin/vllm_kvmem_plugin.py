@@ -1647,7 +1647,24 @@ def _install(cls, module_name, probe, smoke, state):
                     # compaction yet) makes the subtraction a no-op.
                     try:
                         _st = _rt.state(_req)
-                        _off = int(getattr(_st, "tokens", 0)) - int(getattr(_st, "seq_len", 0))
+                        # The offset must describe the ENGINE's own books, not the runtime's copy:
+                        # after an in-prefill compaction the engine's num_computed can be one chunk
+                        # AHEAD of the resident book, which made (tokens - seq_len) negative - and a
+                        # negative offset shifted every slot index past the row (illegal memory
+                        # access). Use num_logical - num_computed from the request state, and never
+                        # publish a negative value.
+                        _off = None
+                        try:
+                            _rso = getattr(self, "req_states", None)
+                            _io = _rso.req_id_to_index.get(_req) if _rso is not None else None
+                            if _io is not None:
+                                _lg = int(_rso.num_logical_tokens_np[_io])
+                                _cp = int(_rso.num_computed_tokens_np[_io])
+                                _off = _lg - _cp
+                        except Exception:
+                            _off = None
+                        if _off is None:
+                            _off = int(getattr(_st, "tokens", 0)) - int(getattr(_st, "seq_len", 0))
                         if _off < 0:
                             _off = 0
                         _buf = getattr(self, "_kvmem_slot_offset", None)
