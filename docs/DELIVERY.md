@@ -66,12 +66,18 @@ PORT=18200 ./deploy/run-kvmem-vllm.sh
 
 ## 六、超池路径的当前边界（2026-10-29 第 25 轮实测，最权威的一条）
 
-**能服务的最大常驻长度**（任何压缩都不发生）受"池 − R − 一个 chunk"约束：
+**池的真实容量**（这条已经把之前的误判纠正了）：vLLM 自己算出来的是
 
 ```
-num_gpu_blocks = 126 × block 1616 = 203,616 token   （池）
-max_model_len  = auto（KVMEM_ENTRY_RESIDENT_PREFILL=1 时 = 池）
+ValueError: To serve at least one request with the model's max seq len (203000),
+            (3.69 GiB KV cache is needed, which is larger than the available KV cache...)
 ```
+
+即 **KV 池 ≈ 177,760 token**（vLLM auto-fit 得到的 max_model_len 正是它）。之前把
+`126 blocks × 1616 = 203,616` 当成池是错的——那是**块表可寻址的行数**，不是 KV 显存容量。
+
+结论：**190K/200K 的 prompt 确实是"超池"**（>177,760），prefill 期压缩不可避免，而那条路正是
+当前崩的地方。
 
 实测：
 

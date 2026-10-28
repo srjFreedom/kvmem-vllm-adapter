@@ -221,8 +221,17 @@ def main(argv=None) -> int:
         # resident. The launcher treats a non-positive MAX_MODEL_LEN as "auto" and skips its
         # N x window check (that check assumes the static N x (B+R) scheme).
         env["KV_CONCURRENCY_EFFECTIVE_LEN"] = str(int(ns.kvmem_budget))
-        args += ["--set", "MAX_MODEL_LEN=-1"]
-        env["MAX_MODEL_LEN"] = "-1"
+        # An explicit ceiling wins: vLLM's auto-fit lands BELOW the KV pool (measured 177,760 on a
+        # 203,616-token pool), and every buffer sized by max_model_len - including the rotary cache -
+        # then rejects a longer prompt with an illegal access instead of a clean error.
+        _mm = int(env.get("KVMEM_MAX_MODEL_LEN", "0") or 0)
+        if _mm > 0:
+            args += ["--set", f"MAX_MODEL_LEN={_mm}"]
+            env["MAX_MODEL_LEN"] = str(_mm)
+            print(f"[kvmem backends/vllm] MAX_MODEL_LEN pinned to {_mm} (engine window)")
+        else:
+            args += ["--set", "MAX_MODEL_LEN=-1"]
+            env["MAX_MODEL_LEN"] = "-1"
         print("[kvmem backends/vllm] KVMEM_ENTRY_RESIDENT_PREFILL=1 -> MAX_MODEL_LEN auto "
               "(engine window = KV pool), prefill stays resident, compaction is decode-only")
         _wanted = 0

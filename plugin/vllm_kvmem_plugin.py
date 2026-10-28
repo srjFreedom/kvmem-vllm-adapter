@@ -1699,6 +1699,14 @@ def register():
         if not getattr(original, "_kvmem_channel_patched", False):
             def schedule(self, *args, **kwargs):
                 _channel_state["scheduler"] = self
+                if not hasattr(self, "kvmem_no_preempt"):
+                    # Preemption rewinds a request to a recompute, which cannot be done safely for a
+                    # KVMem view (it faults in the attention kernel). KVMem always waits instead;
+                    # KVMEM_NO_PREEMPT=0 opts out. The environment is NOT reliable inside
+                    # EngineCore, so the config is the source of truth, with the default being "wait".
+                    _scfg0 = _sched_cfg(self)
+                    self.kvmem_no_preempt = str(
+                        _scfg0.get("no_preempt", "1")).strip().lower() not in ("0", "false", "no")
                 _channel_state["probe_log"] = _sched_cfg(self).get("probe_log")
                 if _channel_state["server"] is None:
                     scfg = _sched_cfg(self)
