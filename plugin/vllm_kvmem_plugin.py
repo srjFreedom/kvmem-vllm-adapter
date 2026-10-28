@@ -1357,6 +1357,14 @@ def register():
                         req.num_computed_tokens = 0
                         req.num_logical_tokens = 0
                         req.num_kvmem_offset = 0
+                        # Drafts and placeholders describe the sequence BEFORE the rewrite; keeping
+                        # them makes the next schedule ask for more logits rows than it schedules
+                        # (measured: scheduled=4, logits=5 -> assert in prepare_inputs).
+                        try:
+                            req.spec_token_ids = []
+                            req.num_output_placeholders = 0
+                        except Exception:
+                            pass
                         _compact_state[request_id] = visible      # peer message sees "already applied"
                         _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
                                 {"kind": "compact_rebuilt", "req": request_id,
