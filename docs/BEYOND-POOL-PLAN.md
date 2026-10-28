@@ -145,3 +145,38 @@ scores: 来自旧索引（core 分数此刻还不可用：prefill 早期没有 q
 
 因此本轮决定：**把 QueryReplay 记为"部分实现、未收敛"**，先推进其余可交付项（decode 期统计与接受窗口、
 checkpoint 目录、清理旧打分旁路、文档与交付说明），超池路径继续留在计划里。
+
+## 2026-10-29 第 7 轮：关键进展 + 超池边界确认
+
+### 打通：B 内压缩 + page-softmax 检索能捞回中间内容
+
+修掉两个接线错误后（① 打分管线被嵌在 legacy 分支里，core 分数算完被丢掉；② 绑定要求每层行数严格
+等于 rows，核心允许 `layer_rows[l] <= rows`），58K prompt（B=36864，prefill 末压缩）实测：
+
+```
+retrieval_check: mid_selected = True
+top_blocks: [[600,0.0885],[601,0.0885],[1220,0.0826],...]      ← page-softmax 排序进入选择器
+answer: "ZX_tokens\n\nThe code is ZX-4417.\n\nThe code"        ← needle 被捞回来了
+```
+
+对照（B=131072、不压缩、88,256 token）：`answer = ZX-4417`，`core_scores` 704 块 / sum=480 /
+top=[149,392,393,391,197]。**说明统计→打分→选择→解码整条链在不压缩时完全正确。**
+
+### 仍然阻塞：prefill 进行中的压缩（>池的唯一路径）
+
+111K prompt（< 池 177K，但 > B，因此触发 prefill 期压缩）：
+`CUDA error: an illegal memory access`（引擎存活，请求 500）。
+
+与第 3 轮定位一致：prefill 期间引擎的 `_all_token_ids` 仍是原始长度，块表却已被压缩 →
+`BatchPrefillWithPagedKVCache` 越界。
+
+### 结论
+
+| 场景 | 状态 |
+|---|---|
+| prompt ≤ B | ✅ 正确（不压缩，或 prefill 末压缩后检索） |
+| B < prompt ≤ 池（常驻 prefill，末压缩） | ✅ 58K 实测：mid_selected=True，答案含 ZX-4417 |
+| prompt > 池（需 prefill 期压缩） | ❌ FlashInfer 越界，需 compacted-sequence 接口 |
+
+下一步就是那个接口：channel compact 消息带 kept page ranges → EngineCore 重建 `_all_token_ids` →
+`RequestState.compacted_tokens` 三处使用。这是唯一挡住"prompt 不受显存限制"的东西。
