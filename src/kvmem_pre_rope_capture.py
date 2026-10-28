@@ -36,8 +36,15 @@ def unrotate(x: torch.Tensor, positions: torch.Tensor, inv_freq: torch.Tensor,
     x:         (tokens, heads, head_dim) post-RoPE values
     positions: (tokens,) int positions used for this step
     """
-    if x.shape[-1] < rotary_dim:
-        raise ValueError("tensor is narrower than rotary_dim")
+    # Clamp instead of raising: a rotary_dim larger than the head width, odd, or zero used to abort
+    # the caller (and with it the whole harvest), leaving the request with no query at all.
+    rotary_dim = int(rotary_dim)
+    if rotary_dim <= 0 or x.shape[-1] < rotary_dim:
+        rotary_dim = int(x.shape[-1])
+    if rotary_dim % 2:
+        rotary_dim -= 1
+    if rotary_dim <= 0:
+        return x
     out = x.clone()
     half = rotary_dim // 2
     # float32 keeps the temporaries small: a 4K-token chunk x 16 heads x 256 in float64 is >100 MB

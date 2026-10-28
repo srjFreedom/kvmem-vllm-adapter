@@ -75,6 +75,10 @@ def entry_compaction_env(cfg, env):
     return "0", None
 
 
+def _env_flag(name):
+    return str(os.environ.get(name, "")).strip().lower() in ("1", "true", "yes", "on")
+
+
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     module = _cli_module()
@@ -86,6 +90,12 @@ def main(argv=None) -> int:
     # from this flag; the worker's compact signal connects to it.
     if cfg['inrequest_compaction']:
         cfg['block_channel'] = True
+        # Cross-request prefix reuse: park a finished conversation's session (KV pages in the H
+        # tier + recurrent-state snapshot) keyed by native block hashes, and resume the next turn
+        # from it instead of prefilling the whole conversation again. Opt-in: each parked session
+        # keeps its share of the host budget until it is evicted.
+        if _env_flag("KVMEM_SESSION_REUSE"):
+            cfg['session_reuse'] = True
         # The logical ceiling must travel WITH the config: the fork's scheduler and the runtime both
         # need it to distinguish "resident KV length" from "served position" (a 199K prompt stalled
         # at 180,000 = max_model_len because ctx was missing and the cap fell back to the window).

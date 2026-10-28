@@ -133,6 +133,88 @@ def _paged_attn_tensors(runner):
     return paged, attn_groups, config
 
 
+def _state_groups(runner):
+    """KV-cache groups that are NOT paged attention (GDN / Mamba) as {group: [tensors]}.
+
+    Their state is per-request recurrent data, NOT in the paged store: a resume must carry a
+    snapshot of it or the resumed prefill reads a stale state (the documented failure where draft
+    acceptance collapses and the generation repeats).
+    """
+    out = {}
+    try:
+        caches = getattr(runner, "kv_caches", None) or []
+        gids = getattr(runner, "kv_cache_group_ids", None) or []
+        groups = getattr(getattr(runner, "kv_cache_config", None), "kv_cache_groups", None) or []
+        for i, cache in enumerate(caches):
+            g = gids[i] if i < len(gids) else None
+            if g is None or int(g) >= len(groups):
+                continue
+            spec = getattr(groups[int(g)], "kv_cache_spec", None)
+            if type(spec).__name__ == "FullAttentionSpec":
+                continue
+            items = cache if isinstance(cache, (list, tuple)) else (cache,)
+            out.setdefault(int(g), []).extend(t for t in items if hasattr(t, "shape"))
+    except Exception:
+        return {}
+    return out
+
+
+def _has_recurrent_groups(runner):
+    return bool(_state_groups(runner))
+
+
+def _state_slot(runner, row, group):
+    try:
+        return int(runner.block_tables.block_tables[int(group)].gpu[int(row), 0].item())
+    except Exception:
+        return None
+
+
+def _capture_state_snapshot(runner, runtime, req):
+    """Copy this request's recurrent state to RAM (the parked session's RAM tier)."""
+    groups = _state_groups(runner)
+    st = runtime._state.get(req)
+    row = getattr(st, "row_index", None) if st is not None else None
+    if not groups or row is None:
+        return None
+    snap = {}
+    for group, tensors in groups.items():
+        slot = _state_slot(runner, row, group)
+        if slot is None or slot < 0:
+            continue
+        try:
+            snap[int(group)] = (slot, [t[slot].detach().to("cpu").clone() for t in tensors])
+        except Exception:
+            continue
+    return snap or None
+
+
+def _restore_state_snapshot(runner, runtime, req, snapshot):
+    """Put the parked recurrent state back into the request's own state slots."""
+    if not snapshot:
+        return False
+    groups = _state_groups(runner)
+    st = runtime._state.get(req)
+    row = getattr(st, "row_index", None) if st is not None else None
+    if not groups or row is None:
+        return False
+    restored = False
+    for group, (_src_slot, saved) in snapshot.items():
+        tensors = groups.get(int(group))
+        if not tensors or len(tensors) != len(saved):
+            continue
+        dst = _state_slot(runner, row, group)
+        if dst is None or dst < 0:
+            continue
+        for tensor, value in zip(tensors, saved):
+            try:
+                tensor[dst].copy_(value.to(tensor.device, non_blocking=False))
+                restored = True
+            except Exception:
+                pass
+    return restored
+
+
 def _probe_runner(runner, log_path):
     record = {"kind": "probe", "pid": os.getpid()}
     try:
@@ -424,6 +506,26 @@ def _attach_sparse(runner, log_path):
             runtime.compact_channel = None
     else:
         runtime.compact_channel = None
+    # --- cross-request prefix reuse: park finished sessions, adopt them on a later turn --------
+    runtime.has_recurrent = _has_recurrent_groups(runner)
+    if bool(cfg.get("session_reuse", False)) and runtime.inrequest_compaction:
+        try:
+            from kvmem_session_store import get_session_store
+            _bs = int(getattr(getattr(getattr(runner, "vllm_config", None), "cache_config", None),
+                               "block_size", 0) or 0)
+            runtime.enable_session_reuse(get_session_store("worker"), _bs)
+            runtime.capture_state = (
+                lambda req: _capture_state_snapshot(runner, runtime, req))
+            runtime.restore_state = (
+                lambda req, snap: _restore_state_snapshot(runner, runtime, req, snap))
+            _ch = getattr(runtime, "compact_channel", None)
+            runtime.session_park = getattr(_ch, "session_park", None)
+            _append(log_path, {"kind": "session_reuse_on", "pid": os.getpid(),
+                               "block_size": _bs, "recurrent": runtime.has_recurrent,
+                               "channel": runtime.session_park is not None})
+        except Exception:
+            _append(log_path, {"kind": "session_reuse_error", "pid": os.getpid(),
+                               "error": traceback.format_exc()})
     runtime.use_kvmem_plan = bool(cfg.get("use_kvmem_plan", False))
     runtime.use_kvmem_host = bool(cfg.get("use_kvmem_host", True))
     try:
@@ -481,15 +583,26 @@ def _attach_sparse(runner, log_path):
         per_rank = max(1, heads // max(1, tp)) if heads else 0
         layers = int(getattr(hf, "num_hidden_layers", 0) or 64)
         head_dim = int(cfg.get("head_dim", 256))
+        # The query buffer must be a FLOAT buffer, NOT the KV cache dtype. With `--kv-cache-dtype
+        # fp8` the paged tensors are uint8/fp8, and allocating the query buffer with that dtype
+        # made `buf.copy_(query)` truncate every query value in [-1, 1] to 0 - so the whole query
+        # summary was a zero vector, every cosine came back 0, the ranking was flat, the compacted
+        # view kept arbitrary blocks instead of the ones matching the question, and the generation
+        # repeated (measured: q_dtype=torch.uint8, q_absmax=0.0, k_norm=4.35).
+        import torch as _torch
+        _act_dtype = getattr(getattr(runner, "vllm_config", None), "model_config", None)
+        _act_dtype = getattr(_act_dtype, "dtype", None) or _torch.bfloat16
+        if getattr(_act_dtype, "is_floating_point", False) is False:
+            _act_dtype = _torch.bfloat16
         ok = bool(per_rank) and _bridge.ensure(layers=layers, heads=per_rank,
                                               head_dim=head_dim,
                                               device=getattr(view, "device", "cuda"),
-                                              dtype=getattr(getattr(view, "paged_kv", lambda: [None])()[0],
-                                                            "dtype", None) or None)
+                                              dtype=_act_dtype)
         _append(log_path, {"kind": "bridge_ensure", "ok": bool(ok), "pid": os.getpid(),
                            "tokens": int(os.environ.get("KVMEM_CAPTURE_TOKENS", 0) or 0),
                            "layers": layers, "heads_per_rank": per_rank,
-                           "kv_heads": kv_heads, "head_dim": head_dim, "tp": tp})
+                           "kv_heads": kv_heads, "head_dim": head_dim, "tp": tp,
+                           "buf_dtype": str(_act_dtype)})
     except Exception:
         _append(log_path, {"kind": "bridge_ensure_error", "error": traceback.format_exc()})
     global _ACTIVE_RUNTIME
@@ -968,6 +1081,125 @@ def register():
         _channel_state = {"scheduler": None, "server": None}
         # request_id -> visible length of the last applied compaction (TP-rank idempotency).
         _compact_state = {}
+        # request ids already examined for a resume (a waiting request is looked at once).
+        _resume_decided = set()
+
+        def _resume_decided_is_enabled(scheduler=None):
+            """Session reuse is opt-in and only meaningful with in-request compaction on.
+
+            The config MUST come from the scheduler's own `vllm_config.additional_config`: this runs
+            in EngineCore, which has no model runner, so `_config()` (fed from the runner) is empty
+            there and the whole resume path would silently never arm.
+            """
+            cfg = None
+            try:
+                ac = getattr(getattr(scheduler, "vllm_config", None),
+                             "additional_config", None) or {}
+                cfg = ac.get("kvmem") if isinstance(ac, dict) else None
+            except Exception:
+                cfg = None
+            if not isinstance(cfg, dict) or not cfg:
+                cfg = _config() or {}
+            try:
+                return bool(cfg.get("session_reuse", False)) and bool(
+                    cfg.get("inrequest_compaction", False))
+            except Exception:
+                return False
+
+        def _session_park_payload(payload):
+            """EngineCore side of a park: keep the routing geometry, never the KV."""
+            try:
+                from kvmem_session_store import get_meta_store
+                hashes = [bytes.fromhex(str(h)) for h in payload.get("hashes", [])]
+                get_meta_store().park(
+                    hashes,
+                    covered_tokens=int(payload.get("covered", 0) or 0),
+                    page_tokens=int(payload.get("page_tokens", 0) or 0),
+                    pages_per_block=int(payload.get("pages_per_block", 1) or 1),
+                    capacity_pages=int(payload.get("capacity_pages", 0) or 0),
+                    has_state=bool(payload.get("has_state", False)))
+                _append(_sched_cfg(_channel_state.get("scheduler")).get("probe_log")
+                        or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "session_meta_parked", "pid": os.getpid(),
+                         "blocks": len(hashes),
+                         "covered": int(payload.get("covered", 0) or 0),
+                         "capacity": int(payload.get("capacity_pages", 0) or 0)})
+            except Exception:
+                _append(_sched_cfg(_channel_state.get("scheduler")).get("probe_log")
+                        or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "session_meta_error", "error": traceback.format_exc()})
+
+        def _maybe_resume(scheduler):
+            """Point a fresh request at a parked session: only the two books move, nothing else.
+
+            vLLM already reads `request.num_computed_tokens` for a waiting request (prefix caching
+            is off here, so every new request takes that branch) and allocates blocks for
+            `[0, num_computed + n)`. Setting the resident book to |sel| pages therefore makes the
+            engine allocate exactly the pages the worker will fill from RAM, and setting the served
+            book to the hit length makes it schedule ONLY the genuinely new tokens.
+            """
+            if not _resume_decided_is_enabled(scheduler):
+                return
+            try:
+                from kvmem_session_store import block_hash_sequence, get_meta_store
+                store = get_meta_store()
+                if not len(store):
+                    return
+                cache = getattr(scheduler, "cache_config", None)
+                block_size = int(getattr(cache, "block_size", 0) or 0)
+                if block_size <= 0:
+                    return
+                waiting = list(getattr(scheduler, "waiting", None) or [])
+                live = {getattr(r, "request_id", None) for r in waiting}
+                for rid in list(_resume_decided):
+                    if rid not in live:
+                        _resume_decided.discard(rid)
+                for request in waiting:
+                    rid = getattr(request, "request_id", None)
+                    if rid is None or rid in _resume_decided:
+                        continue
+                    _resume_decided.add(rid)
+                    if int(getattr(request, "num_computed_tokens", 0) or 0) > 0:
+                        continue
+                    ids = list(getattr(request, "prompt_token_ids", None) or ())
+                    if len(ids) < block_size:
+                        _append(_sched_cfg(scheduler).get("probe_log")
+                                or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "resume_skip", "req": rid, "why": "short prompt",
+                                 "n": len(ids), "block": block_size, "pid": os.getpid()})
+                        continue
+                    _hashes = block_hash_sequence(ids, block_size)
+                    found = store.lookup(_hashes)
+                    if found is None:
+                        _append(_sched_cfg(scheduler).get("probe_log")
+                                or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "resume_skip", "req": rid, "why": "no prefix match",
+                                 "blocks": len(_hashes), "parked": len(store), "pid": os.getpid()})
+                        continue
+                    meta, blocks = found
+                    hit = int(blocks) * block_size
+                    pt = int(meta.page_tokens or 0)
+                    ppb = max(1, int(meta.pages_per_block or 1))
+                    if pt <= 0:
+                        continue
+                    pages = min(int(meta.capacity_pages or 0), hit // pt)
+                    pages = (pages // ppb) * ppb
+                    if pages <= 0:
+                        continue
+                    visible = pages * pt
+                    request.num_computed_tokens = visible
+                    request.num_logical_tokens = hit
+                    request.num_kvmem_offset = hit - visible
+                    _append(_sched_cfg(scheduler).get("probe_log")
+                            or "/tmp/kvmem_sparse.jsonl",
+                            {"kind": "resume_decided", "pid": os.getpid(), "req": rid,
+                             "hit": hit, "resident": visible, "pages": pages,
+                             "offset": hit - visible,
+                             "prompt": int(getattr(request, "num_prompt_tokens", 0) or 0)})
+            except Exception:
+                _append("/tmp/kvmem_sparse.jsonl",
+                        {"kind": "resume_decide_error", "error": traceback.format_exc()})
+
         original = Scheduler.schedule
         if not getattr(original, "_kvmem_channel_patched", False):
             def schedule(self, *args, **kwargs):
@@ -978,9 +1210,10 @@ def register():
                         _channel_state["server"] = BlockChannelScheduler(
                             _alloc, path=scfg.get("block_channel_path",
                                                   "/tmp/kvmem_block_channel.sock"),
-                            compactor=_compact).start()
+                            compactor=_compact, session_sink=_session_park_payload).start()
                         _append(scfg.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
                                 {"kind": "block_channel_attached", "pid": os.getpid()})
+                _maybe_resume(self)
                 return original(self, *args, **kwargs)
             schedule._kvmem_channel_patched = True
             Scheduler.schedule = schedule
@@ -1004,6 +1237,33 @@ def _install(cls, module_name, probe, smoke, state):
 
     def execute_model(self, scheduler_output, *args, **kwargs):
         _config_from_runner(self)
+        # Cross-request prefix reuse MUST be recorded before anything calls into the sparse runtime:
+        # the runtime creates a request's orchestrator on first sight (`_ensure`), and a resumed
+        # request can only ADOPT the parked one if the promotion hint is already on the runtime.
+        # Recording it later (inside prepare_inputs) was measured: a brand-new orchestrator was
+        # opened for the resumed request and the engine then read an empty row.
+        _rt0 = state.get("sparse")
+        if _rt0 is not None:
+            try:
+                for _nr in (getattr(scheduler_output, "scheduled_new_reqs", None)
+                            or getattr(scheduler_output, "new_reqs", None) or ()):
+                    _rid = getattr(_nr, "req_id", None)
+                    if _rid is None:
+                        continue
+                    _ids = getattr(_nr, "prompt_token_ids", None)
+                    _rt0.note_prompt_ids(_rid, _ids)
+                    _nlg = int(getattr(_nr, "num_logical_tokens", 0) or 0)
+                    _npc = int(getattr(_nr, "num_computed_tokens", 0) or 0)
+                    if _nlg > _npc:
+                        _rt0.note_resume(_rid, _nlg, _npc)
+                    if bool(_config().get("session_reuse", False)):
+                        _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "note_prompt_ids", "req": str(_rid),
+                                 "n": len(_ids or ()), "nlg": _nlg, "npc": _npc,
+                                 "pid": os.getpid()})
+            except Exception:
+                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "note_new_reqs_error", "error": traceback.format_exc()})
         # The sparse pre-hook runs inside prepare_pos_seq_lens(); it needs this step's request
         # ids, which only the scheduler output knows.
         try:
@@ -1148,6 +1408,30 @@ def _install(cls, module_name, probe, smoke, state):
                 try:
                     rt = state.get("sparse")
                     if rt is not None:
+                        # Cross-request prefix reuse: a NEW request carries its prompt tokens (the
+                        # resume key) and, when EngineCore matched a parked session, a served count
+                        # ABOVE its resident book -- that pair is the resume signal. Both values
+                        # travel in NewRequestData already, so no extra channel is needed.
+                        # V2 runner: `scheduled_new_reqs` (NewRequestData list); the
+                        # older/simpler name is kept as a fallback.
+                        for _nr in (getattr(scheduler_output, "scheduled_new_reqs", None)
+                                    or getattr(scheduler_output, "new_reqs", None) or ()):
+                            _rid = getattr(_nr, "req_id", None)
+                            if _rid is None:
+                                continue
+                            try:
+                                _ids = getattr(_nr, "prompt_token_ids", None)
+                                rt.note_prompt_ids(_rid, _ids)
+                                if bool(_config().get("session_reuse", False)):
+                                    _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                            {"kind": "note_prompt_ids", "req": str(_rid),
+                                             "n": len(_ids or ()), "pid": os.getpid()})
+                                _nlg = int(getattr(_nr, "num_logical_tokens", 0) or 0)
+                                _npc = int(getattr(_nr, "num_computed_tokens", 0) or 0)
+                                if _nlg > _npc:
+                                    rt.note_resume(_rid, _nlg, _npc)
+                            except Exception:
+                                pass
                         reqs = list(getattr(batch_req_state, "req_ids", None) or [])
                         counts = getattr(batch_req_state, "num_scheduled_tokens", None)
                         if reqs and counts is not None:

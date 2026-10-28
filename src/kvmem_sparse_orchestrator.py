@@ -319,13 +319,33 @@ class SparseOrchestrator:
     def kv(self):
         return self.kvs[0]
 
-    def write_page(self, page, bytes_as_written, slot):
-        """Record a page whose bytes are `bytes_as_written`, baked at `(slot - page)*tokens`.
+    def _baked_delta(self, baked, slot, page):
+        """The RoPE rotation (`tokens`) the stored bytes carry, relative to the page's LOGICAL start.
+
+        A page's tokens sit at true positions `page*page_tokens + i`. "Baked" is how far the bytes
+        in hand were rotated away from that frame: 0 when the engine wrote them at their true
+        positions (an uncompacted prefill), `(rank - page) * page_tokens` when they were written
+        into a compacted view at `rank`.
+
+        `baked` is authoritative and the caller passes it. The `slot - page` fallback only
+        reproduces it while a request's engine page ids happen to run parallel to its compacted
+        ranks -- true for the first request out of the pool and for the tests, NOT true across a
+        resume or for a second concurrent request, whose pool pages start at a different base.
+        Getting that wrong bakes a constant `(base_new - base_old)` rotation into the whole
+        restored context, which silently degenerates the answer instead of failing.
+        """
+        if baked is not None:
+            return int(baked)
+        return (int(slot) - int(page)) * self.page_tokens
+
+    def write_page(self, page, bytes_as_written, slot, baked=None):
+        """Record a page whose bytes are `bytes_as_written`, baked `baked` tokens off its logical
+        position (see `_baked_delta`).
 
         The store keeps those bytes verbatim; the device copy is one hop from them, so a page can
         be re-derived any number of times without compounding fp8 rounding.
         """
-        delta = (int(slot) - int(page)) * self.page_tokens
+        delta = self._baked_delta(baked, slot, page)
         layers = (list(bytes_as_written) if isinstance(bytes_as_written, (list, tuple))
                   else [bytes_as_written] * len(self.kvs))
         # The store always holds one tensor per paged layer, so every consumer can index by layer.
@@ -342,8 +362,10 @@ class SparseOrchestrator:
         """Accumulate this page's pre-RoPE KEY statistics into the retrieval index.
 
         The bytes are already in hand when a page is committed, so this costs no extra I/O: only a
-        pass over `page_tokens x head_dim` per layer. `store_delta[page]` is exactly the rotation
-        baked into them, so un-rotating by its negative yields the true pre-RoPE frame.
+        pass over `page_tokens x head_dim` per layer. `store_delta[page]` is the rotation baked into
+        them relative to the page's logical start, so un-rotating by its negative takes them back to
+        the frame they were written in (the same key content at a fixed offset), which is what the
+        mean-K index compares.
         """
         index = getattr(self, "retrieval_index", None)
         if index is None or not layers:
@@ -366,13 +388,15 @@ class SparseOrchestrator:
             index.add(int(page), layer, k)
         return block
 
-    def commit_written_page(self, page, slot):
-        """Record a page the ENGINE just wrote at compacted `slot` (live path).
+    def commit_written_page(self, page, slot, baked=None):
+        """Record a page the ENGINE just wrote into device page `slot` (live path).
 
-        The engine wrote it at the compacted position (the caller overrode `positions`), so the
-        bytes are baked at `(slot - page)*tokens`; we store them verbatim with that delta.
+        `baked` is the rotation the engine actually applied (see `_baked_delta`): 0 while the
+        request prefills at true positions, `(rank - page) * page_tokens` once a compacted view has
+        re-based its positions. The caller knows which; without it the `slot - page` fallback bakes
+        the engine's page-id base into the page, which only cancels inside one request.
         """
-        delta = (int(slot) - int(page)) * self.page_tokens
+        delta = self._baked_delta(baked, slot, page)
         page_bytes = [kv[int(slot)].clone() for kv in self.kvs]
         self.store.put(page, page_bytes)
         self.store_delta[int(page)] = delta
@@ -381,22 +405,27 @@ class SparseOrchestrator:
         self.slot_of[int(page)] = int(slot)
         self.baked_delta[int(page)] = delta
 
-    def restore_page(self, page, slot=None, channel=None, request_id=None):
-        """Bring an evicted page back; without a slot, ask EngineCore for a free block."""
+    def restore_page(self, page, slot=None, channel=None, request_id=None, rank=None):
+        """Bring an evicted page back into `slot`, rotated to `rank` (or to `slot`) in the view."""
         if slot is None:
             if channel is None:
                 raise RuntimeError("restore_page needs a slot or a block channel")
             slot = channel.request(request_id or "restore", 1)[0]
-        """Bring an evicted page back from the host store into `slot`.
-
-        The store keeps the canonical bytes forever, so a restore is exactly ONE rotation hop by
-        `needed - store_delta` (never a rotation of a rotation). The control plane - asking the
-        scheduler for a free block - is the caller's job; this is the data plane.
-        """
+        # The store keeps the canonical bytes forever, so a restore is exactly ONE rotation hop by
+        # `needed - store_delta` (never a rotation of a rotation). The control plane - asking the
+        # scheduler for a free block - is the caller's job; this is the data plane.
+        #
+        # `needed` is the position the bytes must end up at, in the SAME semantic frame as
+        # `store_delta` (relative to the page's logical start). Inside one request's own row the
+        # compacted rank and the engine page id run parallel, so `slot - page` works; a resume
+        # writes the page at a different base, and there only the RANK describes the new position.
         page, slot = int(page), int(slot)
         if not self.store.has(page):
             raise RuntimeError(f"cannot restore page {page}: no canonical bytes")
-        needed = (slot - page) * self.page_tokens
+        if rank is not None:
+            needed = (int(rank) - page) * self.page_tokens
+        else:
+            needed = (slot - page) * self.page_tokens
         step = needed - self.store_delta.get(page, 0)
         for layer, kv in enumerate(self.kvs):
             dev = self.store.get(page)[layer].to(kv.device, non_blocking=True)
@@ -416,24 +445,56 @@ class SparseOrchestrator:
             if blocks:
                 try:
                     scores = self.retrieval_index.scores(blocks)
+                    raw = [float(s) for s in scores]
                     # The selector requires exactly one score per selection block
                     # (`store_.block_count()`), while the index only covers blocks that actually
-                    # carry statistics. Pad to the full table with -inf so unscored blocks are never
-                    # chosen by relevance (sink/recent blocks still enter via the mandatory set).
+                    # carry statistics. Pad the rest BELOW every real score so unscored blocks are
+                    # never chosen by relevance (sink/recent still enter via the mandatory set).
+                    #
+                    # EVERY value handed to the core must be FINITE. Two separate ways to violate
+                    # that, both of which made the core reject the whole table with
+                    # "nonfinite LFRU retrieval score" and silently drop retrieval for the request
+                    # (the selection then degenerated to sink+recent and dropped the question):
+                    #   1. padding with `-inf`;
+                    #   2. writing a score that is itself NaN/inf straight through.
+                    # So: compute a finite floor, then SKIP any non-finite score instead of
+                    # believing it.
                     block_tokens = int(getattr(self.retrieval_index, "block_tokens", 128) or 128)
                     total_blocks = max(1, (int(self.total_tokens) + block_tokens - 1) // block_tokens)
-                    full = [float("-inf")] * total_blocks
-                    for block, value in zip(blocks, scores):
+
+                    def _finite(v):
+                        return v == v and v not in (float("inf"), float("-inf"))
+
+                    finite = [v for v in raw if _finite(v)]
+                    # Cosine lives in [-1, 1]; keep the floor in a sane range as well, so an outlier
+                    # score can never push an extreme value into the core's LRFU decay.
+                    pad = min(max(min(finite) - 1.0, -2.0), -1e-6) if finite else -2.0
+                    full = [pad] * total_blocks
+                    nonfinite = 0
+                    for block, value in zip(blocks, raw):
                         index = int(block)
-                        if 0 <= index < total_blocks:
-                            full[index] = float(value)
-                    self.selector.set_block_scores(full)
+                        if not (0 <= index < total_blocks):
+                            continue
+                        if not _finite(value):
+                            nonfinite += 1
+                            continue
+                        full[index] = value
+                    # If NOTHING usable came back, do not feed the core at all: a table made only of
+                    # the floor is not a ranking, and an extreme floor (1e9) can overflow the core's
+                    # LRFU decay the same way the original `-inf` did. Leaving the selector with no
+                    # scores is the honest state, and `stats` records why.
+                    if finite:
+                        self.selector.set_block_scores(full)
                     # Diagnostic: the highest-scoring selection blocks, so a caller can check
                     # whether the block that carries the needed record was even ranked.
                     ranked = sorted(range(len(full)), key=lambda i: full[i], reverse=True)[:8]
                     self.last_top_blocks = [(int(b), round(float(full[b]), 4)) for b in ranked]
                     stats = {"blocks": len(blocks), "total_blocks": total_blocks,
-                             "top": max(scores) if scores else None}
+                             "top": max(finite) if finite else None,
+                             "nonfinite": nonfinite,
+                             "score_min": min(finite) if finite else None,
+                             "score_max": max(finite) if finite else None,
+                             "diag": getattr(self.retrieval_index, "last_diag", None)}
                     store = getattr(self, "store", None)
                     if store is not None and hasattr(store, "disk_stats"):
                         stats["disk"] = store.disk_stats()
@@ -498,7 +559,11 @@ class SparseOrchestrator:
                 try:
                     layers = [kv[int(slot)] for kv in self.kvs]
                     self.store.put(int(page), layers)
-                    delta = (int(slot) - int(page)) * self.page_tokens
+                    # `baked_delta` is the rotation this device copy already carries (semantic
+                    # frame) and is authoritative; the id difference is only the fallback for a
+                    # page the runtime never tracked.
+                    delta = int(self.baked_delta.get(
+                        int(page), (int(slot) - int(page)) * self.page_tokens))
                     self.store_delta[int(page)] = delta
                     self.baked_delta[int(page)] = delta
                     recovered.append(page)
@@ -652,6 +717,55 @@ class SparseOrchestrator:
         k = _dequant(out[..., self.k_slice])
         out[..., self.k_slice] = _quantize(delta_rotate(k, delta, self.inv_freq, self.rotary_dim))
         return out
+
+    # --- cross-request resume ----------------------------------------------------------
+    def canonicalize_store(self):
+        """Re-bake every stored page into the page's own LOGICAL frame (`store_delta == 0`).
+
+        `store_delta[p]` is the rotation the stored bytes carry relative to page `p`'s logical
+        start, so rotating by `-store_delta[p]` recovers the frame the engine wrote at true
+        positions. That is now a well-defined operation (it was not, while the delta was recorded
+        in the engine's page-id space), but it still costs one dequant/rotate/requant hop per page,
+        so the resume path does NOT use it: `restore_page_rank` hops straight from the stored bytes
+        to the new rank, exactly like a compaction does.
+        """
+        moved = 0
+        for page in list(self.store.pages):
+            delta = int(self.store_delta.get(int(page), 0))
+            if delta == 0:
+                continue
+            layers = self.store.get(int(page))
+            fixed = self._rotate_page_bytes(layers, -float(delta))
+            self.store.put(int(page), fixed)
+            self.store_delta[int(page)] = 0
+            # The device copy now carries the old frame; drop residency so it can never be read.
+            self.resident.discard(int(page))
+            self.slot_of.pop(int(page), None)
+            self.baked_delta.pop(int(page), None)
+            moved += 1
+        return moved
+
+    def usable_pages(self, total_tokens=None):
+        """Every logical page this session still holds canonical bytes for, ascending.
+
+        A resume may only bring back pages that actually exist in the store: a selected page with no
+        bytes would install a hole in the view and the model would read garbage for it.
+        """
+        limit = None if total_tokens is None else max(1, int(total_tokens))
+        pages = sorted(int(p) for p in self.store.pages)
+        if limit is None:
+            return pages
+        return [p for p in pages if p * self.page_tokens < limit]
+
+    def restore_page_rank(self, page, dst_page, rank):
+        """Load a stored page into tensor page `dst_page` at compacted position `rank`.
+
+        This is the resume path's data plane. The logical page `p` is written back at a rank that
+        differs from the rank it was parked at, and the engine page id it lands in is unrelated to
+        either, so the rotation is derived from `(rank - p) * page_tokens` -- never from the id
+        difference (see `_baked_delta`). One hop from the stored bytes, like a compaction.
+        """
+        return self.restore_page(page, slot=dst_page, rank=rank)
 
     def needle(self, page):
         """The device copy of `page` must equal its stored bytes rotated by the remaining delta."""

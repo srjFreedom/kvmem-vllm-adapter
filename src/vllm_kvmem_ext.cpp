@@ -8,7 +8,9 @@
 #include <cstdio>
 
 #include "kvmem/memory_contract.hpp"
-#include "kvmem/nvme_kv_tier.hpp"
+// nvme_kv_tier.hpp was removed in upstream v0.19 (shared SSD tier retired). The two Python
+// call sites (kvmem_sparse_orchestrator / kvmem_history_cache) are guarded by try/except and a
+// disk-config condition, so the RAM-only path degrades to self._disk = None without this binding.
 #include "vllm_kvmem/vllm_backend.hpp"
 #include "vllm_kvmem/vllm_sparse_selector.hpp"
 
@@ -334,29 +336,7 @@ PYBIND11_MODULE(vllm_kvmem_ext, m) {
         .def("phase", &MemorySession::phase)
         .def("disconnect", &MemorySession::disconnect);
     // --- NVMe KV tier (disk layer, D budget) -------------------------------------------------
-    py::class_<kvmem::NvmeKvTier>(m, "NvmeKvTier")
-        .def(py::init([](const std::string &dir, uint64_t total_bytes, uint64_t slot_bytes,
-                         bool durable, bool preallocate) {
-                kvmem::NvmeKvTierConfig cfg;
-                cfg.dir = dir;
-                cfg.total_bytes = total_bytes;
-                cfg.slot_bytes = slot_bytes;
-                cfg.durable = durable;
-                cfg.preallocate = preallocate;
-                return std::make_unique<kvmem::NvmeKvTier>(cfg);
-            }),
-            py::arg("dir"), py::arg("total_bytes"), py::arg("slot_bytes"),
-            py::arg("durable") = false, py::arg("preallocate") = false)
-        .def("enabled", &kvmem::NvmeKvTier::enabled)
-        .def("slot_count", &kvmem::NvmeKvTier::slot_count)
-        .def("slot_bytes", &kvmem::NvmeKvTier::slot_bytes)
-        .def("write_block", [](kvmem::NvmeKvTier & self, uint32_t block, py::bytes payload) {
-                std::string buf = payload;
-                self.write_block(block, buf.data(), buf.size());
-            })
-        .def("read_block", [](kvmem::NvmeKvTier & self, uint32_t block, uint64_t nbytes) {
-                std::string buf(nbytes, '\0');
-                self.read_block(block, buf.data(), nbytes);
-                return py::bytes(buf);
-            });
+    // Removed with upstream v0.19: the shared SSD tier (nvme_kv_tier.hpp) was retired and the
+    // RAM-only PinnedKvTier does not expose this binding. The Python call sites are guarded, so
+    // a missing NvmeKvTier degrades to self._disk = None (the current RAM-only behaviour).
 }

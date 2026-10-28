@@ -25,15 +25,20 @@ class BlockChannelScheduler:
     gap (the three-book reconciliation). ``compactor(request_id, pages, page_tokens)`` performs it.
     """
 
-    def __init__(self, allocator, path=DEFAULT_PATH, backlog=8, compactor=None):
+    def __init__(self, allocator, path=DEFAULT_PATH, backlog=8, compactor=None,
+                 session_sink=None):
         self._allocator = allocator      # callable(request_id, count) -> list[int]
         self._compactor = compactor      # callable(request_id, pages, page_tokens) -> bool
+        # callable(payload) -- a finished session was parked in the worker; EngineCore keeps the
+        # routing metadata so it can decide a later resume without touching any KV.
+        self._session_sink = session_sink
         self._path = path
         self._server = None
         self._thread = None
         self._stop = threading.Event()
         self.requests_served = 0
         self.compacts_applied = 0
+        self.sessions_parked = 0
 
     def start(self):
         if self._server is not None:
@@ -83,6 +88,11 @@ class BlockChannelScheduler:
                         else:
                             conn.sendall(json.dumps({"ok": bool(ok),
                                                      "truncated": bool(ok)}).encode())
+                    elif kind == "session_park":
+                        if self._session_sink is not None:
+                            self._session_sink(req)
+                        self.sessions_parked += 1
+                        conn.sendall(json.dumps({"ok": True}).encode())
                     else:
                         blocks = self._allocator(req.get("request"), int(req.get("count", 1)))
                         self.requests_served += 1
@@ -119,6 +129,20 @@ class BlockChannel:
         if "error" in reply:
             raise RuntimeError(f"block request failed: {reply['error']}")
         return [int(b) for b in reply["blocks"]]
+
+    def session_park(self, payload):
+        """Announce a parked session (block hashes + geometry) to EngineCore."""
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(self._timeout)
+            sock.connect(self._path)
+            body = dict(payload)
+            body["kind"] = "session_park"
+            sock.sendall(json.dumps(body).encode())
+            data = sock.recv(4096)
+        reply = json.loads(data.decode())
+        if "error" in reply:
+            raise RuntimeError(f"session park failed: {reply['error']}")
+        return bool(reply.get("ok", False))
 
     def compact(self, request_id, pages, page_tokens, visible_tokens=0):
         """Tell EngineCore that `request_id` compacted to `pages` (in compacted order).

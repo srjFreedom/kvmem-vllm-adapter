@@ -40,7 +40,7 @@ class _ReqState:
     # logical:  logical page id (true token page) occupying each row position, so a written
     #           token can be attributed to the history block it belongs to.
     __slots__ = ("row", "logical", "seq_len", "tokens", "next_page", "steps", "spare",
-                 "row_index", "prefill_done", "query_reselected")
+                 "row_index", "prefill_done", "query_reselected", "resume", "resumed")
 
     def __init__(self):
         self.row = ()
@@ -56,6 +56,10 @@ class _ReqState:
         # the captured window); without it a prompt compacted during prefill never re-reads its
         # middle on a short generation.
         self.query_reselected = False
+        # Cross-request resume: `resume` holds (parked entry, hit_tokens, visible_tokens) until the
+        # first step installs the restored view; `resumed` marks that it happened.
+        self.resume = None
+        self.resumed = False
 
 
 class VllmSparseRuntime:
@@ -130,6 +134,26 @@ class VllmSparseRuntime:
         # the book below the prompt, so the runtime must not churn slots trying.
         self._prompt_len = {}
         self._over_budget_logged = set()
+        # Cross-request prefix reuse (parked sessions keyed by native block hashes). Off by
+        # default: the store hands the session's host share back only when it is evicted, so this
+        # holds real RAM for every parked conversation.
+        self.session_reuse = False
+        self.session_store = None
+        self.kv_block_size = 0
+        self._prompt_ids = {}
+        # req -> (hit_tokens, visible_tokens) decided by EngineCore for a resumed session.
+        self._resume = {}
+        # Optional hooks supplied by the plugin for the non-attention (GDN/Mamba) state, which is
+        # NOT in the paged store: capture(req) -> snapshot, restore(req, snapshot) -> bool.
+        self.capture_state = None
+        self.restore_state = None
+        # True when the model has non-attention (GDN/Mamba) KV groups. Their recurrent state is NOT
+        # in the paged store, so a resume is only safe when a state snapshot travelled with the
+        # parked session (otherwise the resumed prefill would read a stale recurrent state -- the
+        # documented "draft acceptance collapses / generation repeats" failure).
+        self.has_recurrent = False
+        # callable(payload) that publishes a park to EngineCore (block channel), or None.
+        self.session_park = None
         self._orch = {}
         self._state = {}
         # row_index -> the compacted length the ATTENTION kernel must read for that row.
@@ -183,6 +207,46 @@ class VllmSparseRuntime:
 
     def _ensure(self, req):
         if req not in self._orch:
+            adopted = self._adopt_session(req)
+            if adopted is not None:
+                # Continue a parked session: its orchestrator already owns the whole context in the
+                # host tier, so nothing is re-prefilled and no new host share is opened.
+                entry, hit_tokens, visible_tokens = adopted
+                orch = entry.orchestrator
+                # The parked device pages belong to a FINISHED request and have been returned to
+                # the pool, so their residency bookkeeping is stale: every page is rebuilt from the
+                # store on demand instead (the store is the only authority).
+                orch.resident.clear()
+                orch.slot_of.clear()
+                orch.baked_delta.clear()
+                orch.slots = []
+                orch.steps_since_reselect = 0
+                self._orch[req] = orch
+                self._owned_slots[req] = set()
+                st = _ReqState()
+                st.resume = (entry, hit_tokens, visible_tokens)
+                self._state[req] = st
+                # A resumed request needs its OWN retrieval index. The parked orchestrator's index
+                # was released with the previous request and carries no query for THIS turn, and
+                # `self._retrieval[req]` was never populated on this early return - so
+                # `runtime.retrieval_index(req)` came back None, `_active_index()` returned None,
+                # `harvest_from_bridge` bailed out before reading the bridge (measured:
+                # `layers_fed=0`, `capture.calls=0`), `scores()` raised "no query captured" and the
+                # compacted selection degenerated to sink+recent - dropping the question itself,
+                # which reads as repeated output.
+                if self.retrieval_enabled:
+                    try:
+                        from kvmem_retrieval_index import KvmemRetrievalIndex
+                        _kv = self.view.paged_kv()
+                        index = KvmemRetrievalIndex(self.select_block_tokens, self.page_tokens,
+                                                    self.head_dim, len(_kv))
+                        self._retrieval[req] = index
+                        orch.retrieval_index = index
+                        if orch.planner is not None:
+                            orch.planner.pre_rope_statistics = True
+                    except Exception:
+                        pass
+                return
             kv_tensors = self.view.paged_kv()
             session = max(1, len(self._orch) + 1)
             store = None
@@ -266,6 +330,212 @@ class VllmSparseRuntime:
             self._owned_slots[req] = set()
             self._state[req] = _ReqState()
 
+    # --- cross-request prefix reuse (parked sessions) -----------------------------------
+    def enable_session_reuse(self, store=None, kv_block_size=0):
+        """Turn on park/adopt for finished requests, keyed by native block hashes."""
+        from kvmem_session_store import get_session_store
+        if store is None:
+            store = get_session_store("worker")
+        self.session_store = store
+        self.kv_block_size = int(kv_block_size or self.kv_block_size or 0)
+        self.session_reuse = True
+        # A parked session holds a slice of H until it is evicted; hand it back then.
+        store._on_evict = self._release_parked
+        return store
+
+    def _release_parked(self, entry):
+        pool = getattr(self, "budget_pool", None)
+        session = getattr(entry, "session_id", None)
+        if pool is not None and session is not None:
+            try:
+                pool.close(session)
+            except Exception:
+                pass
+
+    def note_prompt_ids(self, req, ids):
+        """Remember the prompt tokens: they are the resume key and the logical book origin."""
+        try:
+            self._prompt_ids[req] = tuple(int(t) for t in (ids or ()))
+        except Exception:
+            pass
+
+    def note_resume(self, req, hit_tokens, visible_tokens):
+        """EngineCore decided `req` continues a parked session after `hit_tokens` tokens."""
+        try:
+            self._resume[req] = (int(hit_tokens), int(visible_tokens))
+        except Exception:
+            pass
+
+    def _session_hashes(self, req):
+        ids = self._prompt_ids.get(req)
+        if not ids or not self.kv_block_size:
+            return []
+        from kvmem_session_store import block_hash_sequence
+        return block_hash_sequence(ids, self.kv_block_size)
+
+    def _park_session(self, req):
+        """Keep a finished request's session (KV pages + recurrent state) instead of dropping it."""
+        if not self.session_reuse or self.session_store is None:
+            return False
+        orch = self._orch.get(req)
+        if orch is None:
+            return False
+        hashes = self._session_hashes(req)
+        pages = orch.usable_pages()
+        if not hashes or not pages:
+            self.log({"kind": "session_park_skipped", "req": req,
+                      "reason": "no hashes" if not hashes else "no pages",
+                      "blocks": len(hashes), "pages": len(pages),
+                      "prompt_ids": len(self._prompt_ids.get(req, ()) or ()),
+                      "kv_block_size": int(self.kv_block_size)})
+            return False
+        state = None
+        if self.capture_state is not None:
+            try:
+                state = self.capture_state(req)
+            except Exception:
+                state = None
+        if self.has_recurrent and state is None:
+            # Refuse to park: resuming without the recurrent state is worse than a full prefill.
+            self.log({"kind": "session_park_skipped", "req": req,
+                      "reason": "recurrent state unavailable"})
+            return False
+        covered = min(int(getattr(orch, "total_tokens", 0) or 0),
+                      len(self._prompt_ids.get(req, ()) or ()) or int(orch.total_tokens))
+        self.session_store.park(hashes, orch, covered, self.page_tokens,
+                                mamba_state=state, session_id=getattr(orch, "session_id", None))
+        # Tell EngineCore how much of this session may be brought back: the resident book it will
+        # allocate is |sel| pages, so the number must be block-aligned and never exceed what the
+        # store can actually fill.
+        ppb = max(1, int(self.pages_per_block))
+        budget = int(self.selector.budget_pages())
+        # Whole-block rounding is REQUIRED: the engine allocates the resident book in whole KV
+        # blocks (1616 tokens = pages_per_block pages of 16), and a book that ends mid-block made
+        # the resumed turn answer with empty/garbage output (measured: 316 pages -> empty answer,
+        # 303 pages -> correct answer). The cost is up to one block (<= pages_per_block tokens) of
+        # the parked context not being brought back; allowing partial blocks needs the fork's row
+        # mapping to be re-checked first.
+        capacity = (min(len(pages), budget) // ppb) * ppb
+        payload = {"hashes": [h.hex() for h in hashes], "covered": int(covered),
+                   "page_tokens": int(self.page_tokens), "pages_per_block": ppb,
+                   "capacity_pages": int(capacity), "has_state": state is not None,
+                   "request": str(req)}
+        if self.session_park is not None and capacity > 0:
+            try:
+                self.session_park(payload)
+            except Exception:
+                self.log({"kind": "session_park_publish_failed", "req": req})
+        self.log({"kind": "session_parked", "req": req, "blocks": len(hashes),
+                  "covered": covered, "pages": len(pages), "capacity": capacity,
+                  "state": state is not None})
+        return True
+
+    def _resume_selection(self, orch, count, total_tokens):
+        """Exactly `count` pages to bring back: sink head, then the newest tail, then inward.
+
+        Without a query there are no retrieval scores yet, so the KVMem policy degenerates to
+        "sink + recent" and fills inward from the newest tokens. The first decode reselect then
+        re-scores the middle with the real query, exactly like a normal compaction.
+        """
+        avail = orch.usable_pages(total_tokens)
+        count = max(0, min(int(count), len(avail)))
+        if count <= 0:
+            return []
+        sink = max(1, int(getattr(self, "sink_tokens", 0) or 0) // self.page_tokens)
+        recent = max(1, int(getattr(self, "recent_tokens", 0) or 0) // self.page_tokens)
+        chosen, seen = [], set()
+
+        def take(seq):
+            for p in seq:
+                if len(chosen) >= count:
+                    return
+                if p in seen:
+                    continue
+                seen.add(p)
+                chosen.append(p)
+
+        take(avail[:sink])
+        take(reversed(avail[-recent:]))
+        take(reversed(avail))
+        return sorted(chosen)
+
+    def _complete_resume(self, req, st, row_index):
+        """Install a resumed session's working set into the engine's already-allocated row.
+
+        EngineCore has set the resident book to `visible_tokens` (= |sel| * page_tokens) and the
+        served book to the hit length, so the engine has allocated exactly |sel| pages for this
+        request. The KV for those logical pages lives in the parked store and is restored here at
+        the compacted rank each page occupies -- one rotation hop from the stored bytes.
+        """
+        entry, hit_tokens, visible_tokens = st.resume
+        st.resume = None
+        orch = self._orch.get(req)
+        if orch is None:
+            return False
+        count = int(visible_tokens) // self.page_tokens
+        pages = self._resume_selection(orch, count, int(hit_tokens))
+        self._absorb_engine_row(req)
+        try:
+            values = [int(v) for v in self.view.block_table_rows()[0][row_index].tolist()]
+        except Exception:
+            values = []
+        # Take the row PREFIX of exactly |sel| entries: the engine allocated |sel| pages for the
+        # resident book it was given. Page id 0 is a legitimate page (this geometry numbers pages
+        # from 0), so it must NOT be filtered out as "empty" -- dropping it shifted the resident
+        # book by one page (16 tokens) against the engine's, and the resumed turn answered with
+        # garbage.
+        row_values = values[:len(pages)]
+        if not pages or len(row_values) < len(pages) or any(v <= 0 for v in row_values):
+            self.log({"kind": "resume_no_room", "req": req, "pages": len(pages),
+                      "row": len(row_values), "visible": int(visible_tokens)})
+            return False
+        for rank, page in enumerate(pages):
+            try:
+                orch.restore_page_rank(page, row_values[rank], rank)
+            except Exception:
+                self.log({"kind": "resume_restore_failed", "req": req, "page": int(page)})
+                return False
+        st.row = tuple(row_values[:len(pages)])
+        st.seq_len = len(pages) * self.page_tokens
+        st.tokens = int(hit_tokens)
+        st.prefill_done = False
+        st.resumed = True
+        # KVMem's R cadence counts OUTPUT tokens from the resume point, not from the parked
+        # session's last compaction.
+        orch._tokens_at_reselect = st.seq_len
+        orch.prompt_tokens = len(self._prompt_ids.get(req, ()) or ())
+        orch.note_tokens(st.tokens)
+        if self.restore_state is not None:
+            try:
+                self.restore_state(req, entry.mamba_state)
+            except Exception:
+                self.log({"kind": "resume_state_failed", "req": req})
+        self.log({"kind": "session_resumed", "req": req, "hit": int(hit_tokens),
+                  "resident": st.seq_len, "pages": len(pages),
+                  "state": entry.mamba_state is not None})
+        return True
+
+    def _adopt_session(self, req):
+        """Take the parked session for `req` out of the store, if EngineCore asked for a resume."""
+        pending = self._resume.pop(req, None)
+        if pending is None or not self.session_reuse or self.session_store is None:
+            return None
+        hit_tokens, visible_tokens = pending
+        hashes = self._session_hashes(req)
+        if not hashes:
+            return None
+        found = self.session_store.lookup(hashes)
+        if found is None:
+            self.log({"kind": "resume_miss", "req": req, "hit": hit_tokens})
+            return None
+        entry, _blocks = found
+        if int(entry.covered_tokens) < int(hit_tokens):
+            self.log({"kind": "resume_short", "req": req, "covered": entry.covered_tokens,
+                      "hit": hit_tokens})
+            return None
+        self.session_store.take(entry)
+        return entry, int(hit_tokens), int(visible_tokens)
+
     def retrieval_index(self, req):
         return self._retrieval.get(req)
 
@@ -274,9 +544,20 @@ class VllmSparseRuntime:
         return list(self._orch.keys())
 
     def release(self, req):
-        """Drop a finished request and give its H share back to the shared pool."""
+        """Drop a finished request and give its H share back to the shared pool.
+
+        With session reuse on, the request's session is PARKED instead (KV pages + recurrent-state
+        snapshot, keyed by the prompt's block hashes) and its H share is kept until the park is
+        evicted, so a later turn can resume it instead of prefilling the whole conversation again.
+        """
         st = self._state.get(req)
         row = getattr(st, "row_index", None) if st is not None else None
+        parked = False
+        if self.session_reuse and st is not None:
+            try:
+                parked = self._park_session(req)
+            except Exception:
+                parked = False
         orch = self._orch.pop(req, None)
         self._retrieval.pop(req, None)
         self._state.pop(req, None)
@@ -303,7 +584,10 @@ class VllmSparseRuntime:
         self._pending_new.pop(req, None)
         self._inflight.pop(req, None)
         self._prev_n.pop(req, None)
-        if orch is not None and getattr(self, "budget_pool", None) is not None:
+        self._prompt_ids.pop(req, None)
+        self._resume.pop(req, None)
+        if (orch is not None and not parked
+                and getattr(self, "budget_pool", None) is not None):
             session = getattr(orch, "session_id", None)
             if session is not None:
                 self.budget_pool.close(session)
@@ -338,6 +622,11 @@ class VllmSparseRuntime:
         # --kvmem-inrequest-compaction off). Retrieval statistics can still be collected.
         if not bool(getattr(self, "inrequest_compaction", False)):
             return None
+        if st.resume is not None and row_index is not None:
+            # First step of a request that continues a parked session: fill the engine's freshly
+            # allocated resident pages from the store and adopt the parked token book. This must run
+            # BEFORE the `not st.row` early-return below (a resumed request has no row yet).
+            self._complete_resume(req, st, int(row_index))
         if not st.row:
             return None
         row_index = req if row_index is None else int(row_index)
@@ -571,7 +860,9 @@ class VllmSparseRuntime:
                 slot = self._page_map[req].get(logical)
                 if slot is None:
                     continue
-                orch.commit_written_page(logical, slot)
+                # No view is installed yet, so the engine wrote these tokens at their TRUE
+                # positions: the page's bytes carry no offset from its logical start.
+                orch.commit_written_page(logical, slot, baked=0)
             st.tokens += n_new_tokens
             orch.note_tokens(st.tokens)
         elif st.row and n_new_tokens:
@@ -616,9 +907,14 @@ class VllmSparseRuntime:
                         grown.append(int(page))
                     st.row = tuple(grown)
                 slot = int(st.row[rank])
-                touched[logical] = slot
-            for logical, slot in touched.items():
-                orch.commit_written_page(logical, slot)
+                touched[logical] = (slot, rank)
+            for logical, (slot, rank) in touched.items():
+                # The engine wrote these tokens into COMPACTED positions, so the page's bytes are
+                # baked `(rank - logical) * page_tokens` away from its logical start. Recording the
+                # rank (not the engine page id) is what lets a later resume, or a second request
+                # whose pool pages start at another base, restore the page to the right position.
+                orch.commit_written_page(logical, slot,
+                                         baked=(rank - logical) * self.page_tokens)
                 if st.spare == slot:
                     st.spare = None
             st.tokens += n_new_tokens
@@ -663,6 +959,38 @@ class VllmSparseRuntime:
         if (prefill and st.tokens and orch.selector is not None
                 and bool(getattr(self, "inrequest_compaction", False))):
             if self.no_prefill_compact:
+                # Resident prefill: the prompt is written into the WHOLE physical pool with no
+                # mid-prefill compaction (that path is not reliable). The borrowed pool is given
+                # back when the LAST chunk completes the prompt - and it must happen HERE, inside
+                # a PREFILL step, never on the first decode step: that step carries speculative
+                # drafts, and moving the block table underneath the verifier desynchronises the
+                # two books. Measured on the first decode step: the request stalled with
+                #   kvmem: prompt served but no sampled token  logical=43800 computed=36864
+                # and the scheduler then re-classified the next step as a prefill chunk.
+                #
+                # A prefill step is safe: it writes at true positions (no drafts in flight), and by
+                # the time `after_step` reaches this branch `st.tokens` already covers the chunk and
+                # its pages are committed to the host store, so `_reselect` selects only pages that
+                # really carry bytes.
+                _plen = int(self._prompt_len.get(req, 0) or 0)
+                if _plen and int(st.tokens) >= _plen and not st.query_reselected:
+                    try:
+                        _rp = len(getattr(orch, "resident", ()) or ())
+                        _bp = int(self.budget_tokens) // max(1, int(self.page_tokens))
+                    except Exception:
+                        _rp, _bp = 0, 0
+                    if _rp > _bp:
+                        st.query_reselected = True
+                        self.log({"kind": "post_prefill_shrink", "req": req,
+                                  "tokens": int(st.tokens), "prompt": _plen,
+                                  "resident_pages": int(_rp), "budget_pages": int(_bp)})
+                        try:
+                            self._reselect(req, probe=True)
+                        except Exception:
+                            if self.log is not None:
+                                import traceback as _tb
+                                self.log({"kind": "post_prefill_shrink_error", "req": req,
+                                          "error": _tb.format_exc()[-500:]})
                 return st
             high = self.prefill_high_watermark
             finishing = False  # query reselect happens on the first decode step (see below)
@@ -833,14 +1161,17 @@ class VllmSparseRuntime:
         try:
             map_now = self._page_map.setdefault(req, {})
             known = orch.store.pages
-            # Include the IN-FLIGHT chunk: `advance_tokens` commits the previous step, so at the
-            # moment of a prefill-time reselect the chunk that was just written (up to
-            # max_num_batched_tokens ~8K tokens) is not in the store yet. The selection can only
-            # pick committed pages, so without this the whole chunk is dropped from the visible set
-            # while the served counter keeps counting it - a hole in the context (measured: an 80K
-            # prompt answered with noise, and with prefill compaction disabled it answered
-            # correctly twice in a row).
-            inflight = max(0, int(self._inflight.get(req, 0) or 0))
+            # The in-flight chunk must NOT be added here. `advance_tokens` deliberately LAGS
+            # accounting by one step: at the entry of step k it commits step k-1 and only then
+            # reselects, so `st.tokens` is exactly the WRITTEN frontier and `_inflight` holds the
+            # count of a step whose KV has not been produced yet. Adding it made the runtime claim
+            # pages that carry no bytes - which is the very failure the lagging was introduced to
+            # fix ("selected pages without canonical bytes", see advance_tokens' docstring) - and
+            # it inflated the frontier: a step logged tokens=42352 while the engine's own
+            # num_computed_tokens for the same moment was 41149.
+            # `after_step` has already committed every page up to `st.tokens` on both the plain and
+            # the streaming branch, so there is nothing left to sweep.
+            inflight = 0
             upto = -(-(int(st.tokens) + inflight) // self.page_tokens)
             for lp in range(upto):
                 if lp in known:
@@ -849,7 +1180,9 @@ class VllmSparseRuntime:
                 if slot is None:
                     continue
                 try:
-                    orch.commit_written_page(lp, int(slot))
+                    # `page_map` entries are pre-compaction logical pages, whose bytes the engine
+                    # wrote at TRUE positions.
+                    orch.commit_written_page(lp, int(slot), baked=0)
                 except Exception:
                     continue
             # The IN-FLIGHT chunk is not reachable through `page_map`: after a compaction the row is
@@ -877,40 +1210,53 @@ class VllmSparseRuntime:
                     if lp in known:
                         continue
                     try:
-                        orch.commit_written_page(lp, int(st.row[rank]))
+                        # Post-compaction in-flight pages were written into COMPACTED positions.
+                        orch.commit_written_page(
+                            lp, int(st.row[rank]),
+                            baked=(rank - lp) * self.page_tokens)
                     except Exception:
                         continue
         except Exception:
             pass
         prompt_tokens = int(getattr(orch, "prompt_tokens", 0) or 0)
-        mandatory = list(range(0, -(-prompt_tokens // self.page_tokens))) if prompt_tokens else []
+        _page = max(1, int(self.page_tokens))
+        _budget_pages = max(1, int(self.budget_tokens) // _page)
+        _sink_pages = max(0, int(getattr(self, "sink_tokens", 0) or 0) // _page)
+        _prompt_fits = bool(prompt_tokens) and prompt_tokens <= int(self.budget_tokens)
+        if _prompt_fits:
+            # The prompt fits the budget: pin EVERY prompt page. There is nothing to choose and the
+            # engine keeps `_all_token_ids` covering the prompt.
+            mandatory = list(range(0, -(-prompt_tokens // _page)))
+        else:
+            # The prompt does NOT fit the budget: pin ONLY the two bands KVMem never drops - the
+            # SINK head - and leave everything in between to the retrieval ranking, which is what
+            # makes the compacted view a COMPRESSION instead of a truncation.
+            #
+            # Pinning the whole prompt here (the old behaviour) clamped the set to the NEWEST
+            # `budget_pages - sink_pages` pages, so sink + newest filled all of B and the
+            # retrieval-chosen middle could never enter: the scores were computed, the selector
+            # ran, and zero middle pages were selected.
+            mandatory = list(range(min(_sink_pages, _budget_pages)))
         # The RECENT tail of the OUTPUT must stay too: retrieval has no scores for freshly written
         # blocks (they are padded with -inf), so without this the model loses the lines it just
         # produced and the output degenerates into fragments (measured: long context + retrieval).
         recent = int(getattr(self, "recent_tokens", 0) or 0)
-        # The RECENT window must include the chunk that is executing right now: its pages are on
-        # the device but not yet counted in `st.tokens`, and dropping them silently loses the
-        # newest ~8K prompt tokens (the model then answers from stale context - intermittent,
-        # because whether those pages are kept otherwise depends on the retrieval scores).
-        recent_end = int(st.tokens) + max(0, int(self._inflight.get(req, 0) or 0))
+        # `st.tokens` is the WRITTEN frontier (accounting is lagged one step on purpose, see
+        # advance_tokens). Adding `_inflight` here pushed the recent window past the newest written
+        # token, so the pages it pinned did not exist yet and the window itself was offset.
+        recent_end = int(st.tokens)
         if recent > 0 and recent_end:
-            first = max(0, (recent_end - recent) // self.page_tokens)
-            last = (recent_end - 1) // self.page_tokens
+            first = max(0, (recent_end - recent) // _page)
+            last = (recent_end - 1) // _page
             mandatory = sorted(set(mandatory) | set(range(first, last + 1)))
-        # Force the prompt pages only when the prompt fits the budget. If it does not, the entry
-        # policy failed to trim it; forcing them would make the view exceed B and the plan would be
-        # rejected anyway (the compact also refuses to go below the prompt).
-        # Clamp the mandatory set to what the budget can hold (the planner refuses mandatory blocks
-        # that the trim removed): keep the NEWEST pages, they are the tail of the context.
-        try:
-            _ppb = max(1, int(self.select_block_tokens) // max(1, self.page_tokens))
-            _sink_pages = max(0, int(getattr(self, "sink_tokens", 0) or 0) // max(1, self.page_tokens))
-            _room = max(1, int(self.budget_tokens) // max(1, self.page_tokens) - _sink_pages)
-            if len(mandatory) > _room:
-                mandatory = mandatory[-_room:]
-        except Exception:
-            pass
-        forced = mandatory if prompt_tokens and prompt_tokens <= int(self.budget_tokens) else []
+        # Never let the mandatory bands alone overflow the budget (sink + recent is 10,240 tokens at
+        # the shipped defaults, well below B; this only fires on an odd configuration).
+        if len(mandatory) > _budget_pages:
+            mandatory = mandatory[-max(1, _budget_pages - _sink_pages):]
+        # Force the prompt pages only when the prompt fits the budget. If it does not, forcing them
+        # would make the view exceed B and the plan would be rejected anyway (the compact also
+        # refuses to go below the prompt).
+        forced = mandatory if _prompt_fits else []
         stats = orch.reselect(slots=_take, mandatory_pages=mandatory,
                               forced_pages=forced, prefill_pressure=prefill_pressure)
         selected = list(orch.last_view.row_pages)

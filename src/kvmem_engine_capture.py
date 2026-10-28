@@ -239,6 +239,15 @@ def _capture_on_op(self, layer_name, query, key):
 EngineCapture.on_op = _capture_on_op
 
 
+def _all_finite(t) -> bool:
+    """True when every element of `t` is finite. Diagnostic helper: never raises."""
+    try:
+        import torch as _t
+        return bool(_t.isfinite(t).all())
+    except Exception:
+        return True
+
+
 def harvest_from_bridge(capture):
     """Read the fork's query bridge and turn it into per-layer query summaries.
 
@@ -254,21 +263,93 @@ def harvest_from_bridge(capture):
         return 0
     index = capture._index_getter()
     if index is None:
+        # Diagnostic: "fed 0" was indistinguishable from "no index" and from "every layer empty",
+        # which hid the fact that the harvest never even started.
+        if getattr(capture, "_log", None) is not None:
+            capture._log({"kind": "bridge_harvest_no_index",
+                          "armed": bool(getattr(bridge, "ARMED", False)),
+                          "layers": len(getattr(bridge, "_query", {}) or {})})
         return 0
     from kvmem_pre_rope_capture import rotary_inv_freq, unrotate
     fed = 0
+    rows = 0
+    dbg = None
+    n_layers = int(getattr(index, "layers", 1 << 30) or (1 << 30))
     for layer, (q, pos) in bridge.read_all().items():
-        if q is None or pos is None or q.numel() == 0:
+        # Every boundary below is guarded on its own: one bad layer must never take down the whole
+        # harvest (an out-of-range layer, a shape mismatch or an exception used to abort the loop and
+        # leave the request with NO query at all).
+        try:
+            if q is None or pos is None or q.numel() == 0:
+                continue
+            layer = int(layer)
+            if layer < 0 or layer >= n_layers:
+                if getattr(capture, "_log", None) is not None:
+                    capture._log({"kind": "bridge_harvest_bad_layer", "layer": layer,
+                                  "index_layers": n_layers})
+                continue
+            rows += int(q.shape[0])
+            rotary_dim = int(getattr(capture, "rotary_dim", 64))
+            base = float(getattr(capture, "rope_theta", 1e7))
+            key = (rotary_dim, base, str(q.device))
+            if key not in capture._inv_freq:
+                capture._inv_freq[key] = rotary_inv_freq(rotary_dim, base, device=q.device)
+            try:
+                q_pre = unrotate(q, pos[:q.shape[0]], capture._inv_freq[key], rotary_dim)
+            except Exception:
+                # Fall back to the captured query unchanged: the rotation frame is then approximate,
+                # but a slightly-wrong direction still ranks far better than no ranking at all.
+                q_pre = q
+                if getattr(capture, "_log", None) is not None:
+                    capture._log({"kind": "bridge_harvest_unrotate_fallback", "layer": layer})
+            if dbg is None:
+                # Recorded BEFORE the non-finite check: a broken payload is exactly the evidence we
+                # need, and it must not be swallowed by the filter.
+                try:
+                    dbg = {"layer": layer, "rows": int(q.shape[0]),
+                           "q_dtype": str(q.dtype), "q_dev": str(q.device),
+                           "q_absmax": float(q.abs().max()),
+                           "q_finite": bool(_all_finite(q)),
+                           "pos_absmax": float(pos[:q.shape[0]].abs().max()),
+                           "qpre_absmax": float(q_pre.abs().max()),
+                           "rotary_dim": int(rotary_dim)}
+                except Exception:
+                    dbg = None
+            if not _all_finite(q_pre):
+                # One non-finite layer would make the layer-mean NaN and flatten the whole ranking,
+                # so it is dropped here instead of being averaged in.
+                if getattr(capture, "_log", None) is not None:
+                    capture._log({"kind": "bridge_harvest_skip_nonfinite", "layer": layer})
+                continue
+            index.begin_query(layer)
+            index.add_query(layer, q_pre)
+            fed += 1
+        except Exception:
+            if getattr(capture, "_log", None) is not None:
+                import traceback as _tb
+                capture._log({"kind": "bridge_harvest_layer_error", "layer": int(layer),
+                              "error": _tb.format_exc()[-300:]})
             continue
-        rotary_dim = int(getattr(capture, "rotary_dim", 64))
-        base = float(getattr(capture, "rope_theta", 1e7))
-        key = (rotary_dim, base, str(q.device))
-        if key not in capture._inv_freq:
-            capture._inv_freq[key] = rotary_inv_freq(rotary_dim, base, device=q.device)
-        q_pre = unrotate(q, pos[:q.shape[0]], capture._inv_freq[key], rotary_dim)
-        index.begin_query(int(layer))
-        index.add_query(int(layer), q_pre)
-        fed += 1
+    if dbg is not None and getattr(capture, "_log", None) is not None:
+        rec = {"kind": "bridge_harvest_dbg"}
+        rec.update(dbg)
+        try:
+            rec["cap"] = bridge.capture_diag()
+        except Exception:
+            pass
+        capture._log(rec)
     if fed:
         capture.captured += 1
+    elif getattr(capture, "_log", None) is not None:
+        # Nothing usable: record how many layers reported data, so "empty buffers" and "no index"
+        # stay distinguishable - AND the capture instrumentation, which is the only thing that can
+        # say WHEN the payload became non-finite (an empty harvest used to carry no evidence at all).
+        rec = {"kind": "bridge_harvest_empty",
+               "layers_with_rows": int(rows),
+               "layers_read": len(getattr(bridge, "_query", {}) or {})}
+        try:
+            rec["cap"] = bridge.capture_diag()
+        except Exception:
+            pass
+        capture._log(rec)
     return fed
