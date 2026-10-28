@@ -644,20 +644,27 @@ class VllmSparseRuntime:
         n = int(n_tokens or 0)
         if n <= 0:
             return 0
-        if req in (getattr(self, "spec_reqs", None) or ()):
-            self._skip(req, "drafts")
-            return 0
-        if not self.stats_decode:
-            # Prompt steps are exact; a decode step's acceptance is decided later, and any skipped
-            # step would leave a hole in `_stats_next` (the true frontier), so P0 writes the prompt
-            # only. `st.prefill_done` is the runtime's own record that decode has started.
-            try:
-                if bool(getattr(self.state(req), "prefill_done", False)):
-                    self._skip(req, "prefill_done")
-                    return 0
-            except Exception:
-                self._skip(req, "no state")
+        # Which tokens of this step may enter the statistics:
+        #   * a prompt step contributes every scheduled token (the bridge accumulated them all);
+        #   * a draft-carrying decode step contributes ONLY the target row - the plugin publishes
+        #     KEY_ROWS_LIMIT=1 before such a step, so the bucket sums hold exactly that token and the
+        #     accepted frontier advances by 1, not by 1+K;
+        #   * a draft-free decode step contributes its single token.
+        drafts = req in (getattr(self, "spec_reqs", None) or ())
+        decode = False
+        try:
+            decode = bool(getattr(self.state(req), "prefill_done", False))
+        except Exception:
+            decode = False
+        if drafts:
+            import vllm.kvmem_bridge as _kb
+            if int(getattr(_kb, "KEY_ROWS_LIMIT", 0) or 0) != 1:
+                self._skip(req, "drafts")
                 return 0
+            n = 1
+        elif decode and not getattr(self, "stats_decode", False):
+            # One accepted token per step; keep the frontier and the store in step.
+            n = min(int(n), 1)
         if int(getattr(self, "batch_size", 1) or 1) > 1:
             # One position offset is published per step; a batched step would attribute every
             # request's buckets to the same offset.

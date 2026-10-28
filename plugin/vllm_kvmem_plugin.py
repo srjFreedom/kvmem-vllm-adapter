@@ -1543,6 +1543,15 @@ def _install(cls, module_name, probe, smoke, state):
                 elif _rt is not None:
                     _hot_apply(self, _rt, probe or smoke or "/tmp/kvmem_sparse.jsonl")
                 for _req, _n in list(_counts.items()):
+                    # Publishes how many leading rows of this step may enter the key statistics:
+                    # a draft-carrying step writes 1 target + K drafts and only the target is
+                    # certain to be accepted (eager path; the compiled path is documented as
+                    # eager-only for KVMem retrieval).
+                    try:
+                        from vllm import kvmem_bridge as _kb
+                        _kb.KEY_ROWS_LIMIT = 1 if _req in (_rt.spec_reqs or set()) else 0
+                    except Exception:
+                        pass
                     _rt.advance_tokens(_req, int(_n))
                     # The mean-K statistics are keyed by TRUE positions while the model may run at
                     # compacted ones; publish the offset before the model executes so the capture op
