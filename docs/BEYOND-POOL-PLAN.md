@@ -84,3 +84,29 @@ scores: 来自旧索引（core 分数此刻还不可用：prefill 早期没有 q
 4. 生成超出 R → 追加 RAM → 重新检索。
 
 下一步实现 QueryReplay（第 3 步），它是"中间内容不丢"的关键。
+
+## QueryReplay 的实现钩子（下一轮直接照这个改）
+
+目标：prefill 结束后，用 query 窗口给中段打分并装 B 视图，然后把**最后 N 个 token 重算一遍**，让
+采样点看到完整的 B（而不是只看过被削掉中段的近似历史）。
+
+现有可复用的机制（已读源码确认）：
+
+| 需要 | 位置 | 说明 |
+|---|---|---|
+| 逻辑指针 `num_logical_tokens` | `vllm/v1/core/sched/scheduler.py`（调度基准、ctx 上限都用它） | 由 `num_computed + num_kvmem_offset` 推出，重放时要把两者一起回退 |
+| 常住指针 `num_computed_tokens` | 同上 + `_compact`（plugin:1212）改写 | 压缩已在回退它，重放只是回退更多 |
+| 三本账通道 | `src/kvmem_block_channel.py` 的 `compact` 消息 | 新增一种 `replay` 消息：`(req, visible, replay_tokens)` |
+| 打分器 | `kvmem_recall.KvmemRecall`（page-softmax，已验证） | prefill 结束即可用（query=最后 512 token） |
+
+步骤：
+
+1. `compact(replay_tokens=N)`：EngineCore 侧把 `num_computed_tokens = visible - N`，
+   `num_kvmem_offset = num_logical - num_computed`，并把 `num_logical_tokens` 也回退 N；
+2. scheduler 下一轮会把这 N 个 token 当成新的 prefill chunk 调度（token ids 从逻辑列表取），
+   写入位置由 `positions - offset` 算出，仍落在同一批行槽位；
+3. 这 N 个 token 的前向此时看到的是**已装好的 B 视图**（sink+中段+recent），KV 与 GDN 状态被刷新；
+4. 之后正常解码；R 用满后再走一次同样的流程。
+
+注意：重放只修复"采样点之前的 N 个 token"，之前的近似误差仍留在更早的 KV 里——这是上游
+`QueryReplay` 的语义，不是缺陷；要彻底无近似必须让 prefill 全程 resident（即窗口 ≥ prompt）。
