@@ -343,3 +343,39 @@ FullAttentionManager 里本请求的块数 = 31   （31 × 1616 ≈ 50K token）
    的检查点后重算尾部（上游 `prefix_checkpoint` 的 Reconstruction 语义）。
 
 两个开关都默认关闭：`KVMEM_PROMPT_END_RESELECT=1`、`KVMEM_COMPACT_REBUILD=1`。
+
+## 第 35 轮：QueryReplay 已实现并验证，得到"超池正确性"的决定性否证
+
+实现并跑通（开关：`KVMEM_PROMPT_END_RESELECT=1 KVMEM_CHECKPOINT_REPLAY=1 KVMEM_REPLAY_WINDOW=8192`）：
+
+```
+query_reselect (prompt_complete)  →  选出 needle 块（排名第一，5.41 vs 次名 1.81）
+retrieval_check: mid_selected = TRUE        ← 修正了 ±2 块的估算偏差后，确认 needle 在工作集里
+tail_replay: n=8192 → replay_applied: computed 36864→28672, logical 回退 8192
+http=200，引擎存活，无停摆
+answer = "7"                                 ← 仍然错
+```
+
+**这三条同时成立，就是这一轮最重要的结论**：
+
+1. 检索选对了（needle 页在工作集内）；
+2. 尾部 8,192 token 已按新视图重算；
+3. 答案仍错。
+
+所以错误不在"尾部的视图一致性"，而在**保留的中段页本身的 KV 是在中段已被淘汰的状态下算出来的**——
+它们带着近似。要修，必须把选中的 36,864 个 token **按压缩后的顺序整体重新 prefill 一遍**（这就是
+上游 `Reconstruction`），而这件事必须让引擎的 token 账本与行一致（compacted-sequence 接口）。
+token 账本当前一旦被改写，采样簿记就失效（`no sampled token` 停摆）。
+
+结论（对 objective ② 的最终判断）：
+
+| 部分 | 状态 |
+|---|---|
+| 分块 prefill / 逐块压缩 / 地址重映射 / 位置分离 | ✅ |
+| 引擎内 page-softmax 检索 | ✅（needle 排名第一、且确实入选） |
+| 200K prompt 不崩、返回 200 | ✅（201,915 token） |
+| QueryReplay（尾部重算） | ✅ 机制可用 |
+| **超池的答案正确性** | ❌ 需要"按压缩顺序整体重算"，即 compacted-sequence 接口 |
+
+这是架构性结论，不是调参能解决的：混合模型（GDN）里，被保留下来的页的 KV 与循环状态都压缩了
+"被淘汰的历史"，近似不可消除，除非能重算——而重算需要序列身份可变。
