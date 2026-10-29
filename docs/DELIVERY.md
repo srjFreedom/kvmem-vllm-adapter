@@ -183,3 +183,25 @@ ValueError: To serve at least one request with the model's max seq len (203000),
 | D 会话复用 | `KVMEM_SESSION_REUSE=1` + catalog 接管 | 两轮均 200，`session_reuse_on` 正常 ✅ |
 
 **结论**：本次迁移的可交付部分全部通过回归；超池的"通道"通过、"正确性"受架构限制。
+
+## 十一、第 44 轮：NVFP4 模型上的 200K 验收（正确答案）
+
+按用户要求把测试模型换成 NVFP4（`/home/srj/models/Coder390/NVFP4/W4A16-fp8mtp`，`qwen3_5_text`，
+64 层 / 16 层全注意力 / kv_heads 4 / head_dim 256，与 FP8 版同构，只是权重量化不同、速度更快）。
+
+**实测（`B=200000`，不压缩）：**
+
+```
+prompt_tokens = 196,673        （needle 在 1/4 处）
+answer        = ZX-4417-QJ7    ✅ 正确
+http          = 200，引擎存活
+```
+
+这是本适配器第一次在 **~197K token 的 prompt + 居中 needle** 上给出正确答案。
+
+诚实说明：这条路径是"整段常驻"（没有触发压缩）。NVFP4 的 4-bit 权重更省显存，KV 池比 FP8 版的
+179,182 token 更大（否则 196,673 的 prompt 在准入阶段就会被拒），所以这次是 **prompt ≤ 池** 的场景，
+不是"超池"。真正的超池（prompt > 池）仍然受第十节所述的近似限制。
+
+同一模型上 128,898 token prompt（B=131072）也答对，耗时 2m58（FP8 版同规模约 3m20），
+压测速度确实更快。
