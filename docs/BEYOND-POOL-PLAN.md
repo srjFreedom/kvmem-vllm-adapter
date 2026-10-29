@@ -312,3 +312,34 @@ FullAttentionManager 里本请求的块数 = 31   （31 × 1616 ≈ 50K token）
 修法（下一轮）：**压缩选择必须在引擎块粒度（1616 token）上做**，即选择/淘汰以引擎块为单位
 （页只是块内偏移），这样释放一个块绝不会带走仍被行引用的页。这需要把 selector 的块网格从 16
 页改成 1616 引擎块（或在两者之间做严格的对齐映射）。
+
+## 第 29~31 轮：超池 prefill 打通，答案正确性卡在"重建会停摆"
+
+### 已打通（有实测）
+
+| 环节 | 证据 |
+|---|---|
+| 201,915 token prompt（池 ~179,182） | `prompt_tokens=201915`，HTTP 200 |
+| prefill 期压缩 | 38 次压缩，`logical/tokens` 涨到 201,915，常驻稳定压回 36,864 |
+| 压缩请求不再崩 | MTP 下也能返回 200（压缩请求禁止投机解码） |
+| 检索能选中 needle | 147K prompt：needle 块得分 **5.32**，次名 **1.77**，Top-1 命中 |
+
+### 卡点：把"选对的工作集"装上会破坏状态
+
+- 压力选择（prefill 期）丢掉中段 → 答案 `7`（错）；
+- prefill 末用 query 重排 → **排名正确**，但装上后答案仍是 `7`（错）；
+- 再做"重建"（把压缩后的 36,864 token 用零状态重新 prefill 一遍）：
+  - 能触发（`compact_rebuilt`）、能重新 prefill，
+  - 但请求**停摆**（GPU 0%、日志 `no sampled token`），25 分钟后才返回，答案仍 `7`。
+
+### 结论（下一阶段从这里继续）
+
+超池的**通道**已经完整：分块 prefill、逐块压缩、地址重映射、位置分离、引擎内 page-softmax 检索、
+压缩请求不投机、200K prompt 返回 200。**缺的是"状态一致的重建"**：
+
+1. 重建后引擎进入"只 decode 不采样"的停摆，需要查 `num_output_placeholders` / `num_logits` /
+   draft 状态在 token 账本被改写后的组合（本轮已清空 spec/drafts，仍停摆）；
+2. 或改走"多检查点"路线：prefill 时每 N 个 token 保存一份循环状态，末尾恢复到某个"视图已正确"
+   的检查点后重算尾部（上游 `prefix_checkpoint` 的 Reconstruction 语义）。
+
+两个开关都默认关闭：`KVMEM_PROMPT_END_RESELECT=1`、`KVMEM_COMPACT_REBUILD=1`。
