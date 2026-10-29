@@ -441,3 +441,35 @@ vLLM 在启动时就强制 `max_model_len ≤ KV 池`。而 KVMem 的前提恰�
 适配器现在只能在这个不变式之内工作（prompt ≤ 池）。要打破它，必须实现 compacted-sequence 接口
 （token 账本 + 位置 + 采样），单纯"请求内压缩"不够——这也是为什么所有超池实验最终都停在
 "行宽/窗口"或"改写账本后采样失效"这两处。
+
+## 第 51 轮（续）：用断点定位"窗口>池时请求不进调度"——根因是 Mamba 块随 max_model_len 放大
+
+用调试设施（把 `kvmem_dbg` 接进 EngineCore 的 `Scheduler.schedule`，断点落 `/tmp/kvmem_dbg.bp`），
+一次命中就把调度器局部变量全部落盘：
+
+```
+# 断点 @ scheduler.py:899 (allocate_slots)
+request.num_prompt_tokens   = 245,556
+request.num_computed_tokens = 0
+num_new_tokens              = 4,096
+free_blocks                 = 75
+groups = [('MambaManager', 200000, 5), ('MambaManager', 200000, 5),
+          ('MambaManager', 200000, 5), ('FullAttentionManager', 1616, 1)]
+# 换成小请求（16 token）后：
+groups = [('MambaManager', 200000, 5), ('MambaManager', 200000, 5),
+          ('MambaManager', 200000, 5), ('FullAttentionManager', 1616, 1)]
+free_blocks = 59
+```
+
+关键：**Mamba 组的 `block_size = max_model_len`（200,000）**，且每个请求每组已占 **5 个块**。
+所以：
+- 窗口 200K 时，一个请求的 Mamba 状态块按 200K token 的尺度计，3 组 × 5 块就把 75 块的池吃掉一半；
+- 245K 的 prompt 还需要 152 个注意力块（245K/1616），池里根本没有 → `allocate_slots` 永远失败 →
+  请求停在 `waiting`（我们关了抢占，所以是"等"而不是"崩"）。
+
+**结论**：`KVMEM_SKIP_KV_CHECK` 只能跳过启动检查；在混合模型（3 个 Mamba 组）里，Mamba 块的尺寸
+随 `max_model_len` 放大，因此"窗口 > 池"仍然不可行。要真正超越物理池，必须让 Mamba 状态块与
+`max_model_len` 解耦（固定为状态本身的大小），这属于 fork 层的结构性改动。
+
+这也解释了为什么之前所有"窗口>池"的尝试都停在调度：不是注意力 KV 不够，而是 **Mamba 状态块按窗口
+放大把池吃掉了**。

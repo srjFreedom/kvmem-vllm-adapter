@@ -1739,6 +1739,17 @@ def register():
         if not getattr(original, "_kvmem_channel_patched", False):
             def schedule(self, *args, **kwargs):
                 _channel_state["scheduler"] = self
+                # Wire the live debugger into EngineCore as well: kvmem_dbg.install() sets a tracer on
+                # the CURRENT process, and the worker console can only reach the worker. With this one
+                # check, dropping /tmp/kvmem_dbg.bp and sending a request lets a breakpoint dump the
+                # scheduler's locals (waiting queue, num_new_tokens, free blocks) instead of adding
+                # print statements and restarting.
+                if os.path.exists("/tmp/kvmem_dbg.bp"):
+                    try:
+                        import kvmem_dbg
+                        kvmem_dbg.install()
+                    except Exception:
+                        pass
                 if not hasattr(self, "kvmem_no_preempt"):
                     # Preemption rewinds a request to a recompute, which cannot be done safely for a
                     # KVMem view (it faults in the attention kernel). KVMem always waits instead;
