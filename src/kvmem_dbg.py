@@ -118,10 +118,27 @@ def _tracer(frame, event, arg):
 
 
 def install():
-    """Install the tracer on this thread and (via threading.settrace) on future ones."""
+    """Install the tracer on this thread and (via threading.settrace) on future ones.
+
+    If already installed, RELOAD the breakpoint file when it changed: otherwise every new breakpoint
+    needed a process restart, which is exactly what this facility exists to avoid.
+    """
     if _STATE["installed"]:
-        return "already installed"
+        try:
+            mtime = os.path.getmtime(BP_PATH)
+        except OSError:
+            return "already installed"
+        if mtime <= float(_STATE.get("mtime") or 0):
+            return "already installed"
+        _STATE["points"] = _load()
+        _STATE["mtime"] = mtime
+        _write(f"=== reloaded {len(_STATE['points'])} breakpoint(s) pid={os.getpid()}\n")
+        return f"reloaded {len(_STATE['points'])}"
     _STATE["points"] = _load()
+    try:
+        _STATE["mtime"] = os.path.getmtime(BP_PATH)
+    except OSError:
+        _STATE["mtime"] = 0
     if not _STATE["points"]:
         return "no breakpoints"
     threading.settrace(_tracer)

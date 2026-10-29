@@ -559,3 +559,15 @@ GPU_UTIL=0.65                       # 池 ~122K < prompt（真正的超池）
 B=36864 INREQUEST_COMPACTION=1 KVMEM_RESIDENT_PREFILL_COMPACT=1
 # 不要设 KVMEM_MAMBA_BLOCK_TOKENS（第 52 轮已证否）
 ```
+
+## 第 54 轮：测试样本尺寸纠正 + 窗口/池分离
+
+断点读到的真实数字：`/tmp/nv200real.json` 实际是 **369,931 token**（1.36M 字符 ÷ 3.68），
+不是我之前估的 196,673。它比窗口 200,000 大 → 请求被卡在 `waiting`（`num_prompt_tokens=369931`,
+`max_model_len=200000`），这正是"看起来卡在调度"的真正原因之一。
+
+把窗口抬到 400,000（`KVMEM_SKIP_KV_CHECK=1` 允许）后重跑，请求仍不前进（120 秒内 0 次压缩、GPU 0%），
+说明还有第二道门槛，需要下一轮用断点（把 hits 调大或先用 `remove()` 清点）继续定位。
+
+**经验**：以后所有 prompt 的 token 数必须用引擎报的 `prompt_tokens` 为准（字符数不可靠，
+同一份文本在不同 tokenizer 下可以差 2 倍），并且测试前先确认 `prompt_tokens < max_model_len`。
