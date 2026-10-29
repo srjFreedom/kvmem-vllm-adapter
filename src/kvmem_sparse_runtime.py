@@ -162,7 +162,10 @@ class VllmSparseRuntime:
         self.restore_state = None
         self.reset_state = None          # zero the recurrent state (reconstruction)
         self.set_block_cursor = None     # reset the worker's block-table append cursor
-        self.reselect_at_prompt_end = False   # re-rank at prompt end (needs a state rebuild)
+        # Off by default: re-ranking at the prompt boundary replaces the working set the recurrent
+        # state was built against, so it is only sound together with a reconstruction - and the
+        # reconstruction currently stalls the request ("no sampled token").
+        self.reselect_at_prompt_end = os.environ.get("KVMEM_PROMPT_END_RESELECT", "0") == "1"
         self.compact_rebuild = False     # rewrite the token book on compaction (reconstruction)
         # True when the model has non-attention (GDN/Mamba) KV groups. Their recurrent state is NOT
         # in the paged store, so a resume is only safe when a state snapshot travelled with the
@@ -1128,7 +1131,7 @@ class VllmSparseRuntime:
                 if self.log is not None:
                     self.log({"kind": "query_reselect", "req": req, "tokens": int(_stq.tokens),
                               "prompt": _plq, "n_new": int(n_new or 0), "why": "prompt_complete"})
-                self._reselect(req, probe=True)
+                self._reselect(req, probe=True, rebuild=True)
         except Exception:
             if self.log is not None:
                 import traceback as _tb
@@ -1599,7 +1602,7 @@ class VllmSparseRuntime:
                           "error": _tb.format_exc()[-400:]})
             return None
 
-    def _reselect(self, req, prefill_pressure=False, probe=False):
+    def _reselect(self, req, prefill_pressure=False, probe=False, rebuild=False):
         st = self._state[req]
         cap = getattr(self, "capture", None)
         if cap is not None and getattr(self, "retrieval_enabled", False):
@@ -1845,7 +1848,11 @@ class VllmSparseRuntime:
                 # the compacted sequence, so the selected pages are prefilled from scratch. Only at
                 # the prefill boundary, where the sequence may legitimately change.
                 _st_r = self._state.get(req)
-                _rebuild = (bool(getattr(self, "compact_rebuild", False))
+                # A reconstruction rewrites the token book, so it may only happen where the sequence
+                # is allowed to change shape: at the prompt boundary, explicitly asked for. Firing it
+                # from the first pressure compaction broke a 147K prefill in 90 seconds.
+                _rebuild = (bool(rebuild)
+                            and bool(getattr(self, "compact_rebuild", True))
                             and not bool(getattr(_st_r, "rebuilt", False))
                             and int(getattr(self, "tp_rank", 0) or 0) == 0)
                 if _rebuild and self.reset_state is not None:

@@ -725,8 +725,9 @@ def _attach_sparse(runner, log_path):
         runner.kvmem_runtime = runtime      # diagnostic hooks in the runner read the books here
     except Exception:
         pass
-    runtime.compact_rebuild = (bool(cfg.get("compact_rebuild", False))
-                               or os.environ.get("KVMEM_COMPACT_REBUILD", "") == "1")
+    # Experimental: rewriting the engine's token book stalls the request today ("no sampled
+    # token"), so it stays OFF unless explicitly enabled.
+    runtime.compact_rebuild = (os.environ.get("KVMEM_COMPACT_REBUILD", "0") == "1")
     # The rebuild rewrites ONE engine-side token book, so only rank 0 may ask for it. Both ranks
     # still send their ordinary compact message (each owns its KV), but a second rebuild would
     # re-derive the token list from an already-rewritten book (measured: 7 rebuild records and
