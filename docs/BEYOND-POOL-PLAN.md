@@ -706,3 +706,24 @@ scheduler_reserve_full_isl = False   （准入闸门确已解除）
 
 **超池的正确性仍未达成**：它需要"按压缩顺序整体重算"（compacted-sequence 接口），
 以及把 Mamba 每请求 15 块的固定开销从"注意力可用容量"里正确扣除。
+
+## 整体重算（reconstruction）当前进度
+
+已实现并可触发：
+
+1. **引擎侧** `compact(rebuild=True)`：按 `pages` 重建 `_all_token_ids`、清零 `num_computed/num_logical`、
+   清空 drafts/placeholders、标记 `req.kvmem_rebuilt`（只做一次）。
+2. **运行时侧**：重建成功后把两本账归零（`tokens/seq_len = 0`）、`row = 选中的页（按位置排序）`、
+   `prefill_done = False`、`spare = None`，然后让引擎从位置 0 重新 prefill 选中的 36,864 token。
+3. **循环状态**：`reset_state(req)` 清零，重算后从头建立。
+
+已修掉的两个致命点（都有报错证据）：
+- 重建后请求的 `num_kvmem_offset = 0`，导致"压缩请求禁止投机"的门失效 →
+  `assert (num_scheduled_tokens_np >= num_logits)` 打死 EngineCore。现在标记 `kvmem_rebuilt` 并纳入同一道门；
+- 运行时两本账没跟着归零 → 位置偏移/行同步仍按旧的长序列描述 → 第一个 decode 步停摆。
+
+仍需解决：
+- **开关时好时坏**：两次运行都传了 `KVMEM_COMPACT_REBUILD=1`，一次 `compact_rebuilt=1`、一次为 0。
+  已给运行时加了 worker 环境变量兜底，但还没验证（下一次运行要先确认 `runtime.compact_rebuild` 为真，
+  用 console 读，不要再靠日志猜）。
+- 重建后引擎 re-prefill 36,864 token 的耗时与是否停摆，需要在开关确认生效后再测。
