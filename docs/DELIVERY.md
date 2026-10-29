@@ -224,3 +224,26 @@ GPU_UTIL=0.55 → 启动失败：not enough GPU memory to serve even a single to
 **但它只降低测试成本，不改变结论**：在上面 0.65 的配置里跑 133K prompt（B=36864、压缩开），
 仍然是 `illegal memory access`（引擎退出），与大盘子下的超池表现一致。所以"缩小池"是方便的
 **测试手段**，不是修复超池正确性的方法；正确性仍受第十节所述的近似限制。
+
+## 十三、目标逐项评估（第 49 轮，最终）
+
+| objective 条目 | 状态 | 证据 |
+|---|---|---|
+| ① KVMEM_STATS 开启后 88K 崩溃（pinned allocator），统计路径长上下文稳定 | **完成** | 88,256 token prompt → `ZX-4417`；统计 frontier 精确（含 decode 期按接受数推进） |
+| ② 超池：chunked prefill + 逐 chunk 落 RAM + 地址压缩 + 引擎内 page-softmax 检索，200K prompt + 居中 needle 答对 | **部分完成** | 200K（196,673 token）prompt + 居中 needle **答对**（NVFP4、池内常驻，5m10s）；超池（prompt > 池）**未达成**：压缩通道可跑（最多 45 次压缩不崩），但正确性受"保留页近似"限制；启动不变式已可用 `KVMEM_SKIP_KV_CHECK=1` 解除（窗口 200K > 池 122K 可启动），但该配置下请求停在调度阶段（本轮实测：无任何运行时探针、GPU 0%） |
+| ③ decode 期统计 / 接受窗口 | **完成** | `frontier` 精确跟随已接受 token；bridge 保留解码行、按上一接受数折叠 |
+| ③ checkpoint 目录替代自写 session store | **完成** | `CheckpointCatalog` 落地；session store 的状态镜像改为引用目录中的 checkpoint（一个所有者、统一容量与淘汰），并有单测证据 |
+| ③ graph recall / AttentionFeedback | **未做** | 依赖注意力质量采样，本轮未涉及 |
+| ④ 清理旧打分旁路、更新 deploy/文档、交付说明 | **完成** | legacy 打分默认关闭；旧探针清理；`deploy/run-kvmem-vllm.sh` 记录全部旋钮；`DELIVERY.md` / `BEYOND-POOL-PLAN.md` 含完整证据链 |
+
+### 超池的完整因果链（按发现顺序）
+
+1. 入口裁剪把 prompt 裁到 B（已用「不裁入口」取代）；
+2. prefill 期压缩 → 非法访问：负 offset / 行短一截 / 引擎块 ≠ KVMem 页（逐项修复）；
+3. 池枯竭 `assert block`：块 1616 vs 页 16 → `KVMEM_BLOCK_SIZE=16`（已修）；
+4. 压缩静默失效：`UnboundLocalError: raw`（已修，0 → 32 次压缩）；
+5. 行宽 = 窗口 < 池：`max_model_len ≤ pool` 的启动检查 → `KVMEM_SKIP_KV_CHECK=1`（已解除）；
+6. **剩余**：窗口 > 池时请求停在调度（不产生任何运行时探针）；以及即便压缩正常，保留页 KV 与
+   循环状态仍带"被淘汰历史"的近似（1 次压缩可读、20+ 次全错）。
+
+第 6 条是下一步唯一的入口。
