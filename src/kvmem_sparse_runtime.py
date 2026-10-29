@@ -1926,6 +1926,19 @@ class VllmSparseRuntime:
                     # sequence again and again (measured: compact_rebuilt fired twice with
                     # 36864 then 32768 tokens before the engine tripped an assert).
                     _st_r.rebuilt = True
+                    # The ENGINE now re-prefills the compacted sequence from position 0, so the
+                    # runtime's two books have to go back to 0 as well - otherwise `sync_row` and
+                    # the published position offset keep describing the old (long) sequence and the
+                    # request stalls at the first post-rebuild decode step ("no sampled token").
+                    _st_r.tokens = 0
+                    _st_r.seq_len = 0
+                    _st_r.row = tuple(int(p) for p in selected)   # selected is position-sorted
+                    _st_r.prefill_done = False                    # the coming steps ARE a prefill
+                    _st_r.spare = None
+                    if self.log is not None:
+                        self.log({"kind": "reconstruction_started", "req": req,
+                                  "pages": len(selected), "tokens": len(selected) * self.page_tokens,
+                                  "reply": {k: res.get(k) for k in ("rebuild", "tokens", "ok")}})
                 if isinstance(res, dict):
                     record["compact_applied"] = bool(res.get("ok"))
                     record["compact_truncated"] = bool(res.get("truncated"))

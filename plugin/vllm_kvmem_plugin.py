@@ -782,7 +782,8 @@ def _attach_sparse(runner, log_path):
     # path proven, so it stays OFF unless explicitly enabled. The config is the reliable channel -
     # KVMEM_* set on the API server does not reach the workers.
     runtime.compact_rebuild = (bool(cfg.get("compact_rebuild", False))
-                               or os.environ.get("KVMEM_COMPACT_REBUILD", "0") == "1")
+                               or os.environ.get("KVMEM_COMPACT_REBUILD", "") in
+                               ("1", "true", "yes", "on"))
     # The rebuild rewrites ONE engine-side token book, so only rank 0 may ask for it. Both ranks
     # still send their ordinary compact message (each owns its KV), but a second rebuild would
     # re-derive the token list from an already-rewritten book (measured: 7 rebuild records and
@@ -1494,6 +1495,14 @@ def register():
                                 {"kind": "compact_rebuilt", "req": request_id,
                                  "pages": len(pages), "tokens": len(new_ids)})
                         _rebuilt_requests.add(request_id)
+                        try:
+                            # A rebuilt request must not speculate either: after the rewrite its
+                            # num_kvmem_offset is 0, so the offset-based gate no longer catches it,
+                            # and the draft rows then exceed what the re-prefill step schedules
+                            # ('assert (num_scheduled_tokens_np >= num_logits) in prepare_inputs').
+                            req.kvmem_rebuilt = True
+                        except Exception:
+                            pass
                         return {"ok": True, "truncated": True, "rebuild": True,
                                 "tokens": len(new_ids)}
                 except Exception:
