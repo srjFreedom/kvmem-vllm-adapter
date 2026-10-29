@@ -105,6 +105,14 @@ def main(argv=None) -> int:
             _ctx = 0
         if _ctx > 0:
             cfg['ctx'] = _ctx
+    # Experimental switches travel inside the plugin config: the worker processes do NOT inherit
+    # KVMEM_* from the API server (the harness filters them), so an env read inside the runtime is
+    # silently always-false. `ADDITIONAL_CONFIG_JSON` is the channel that does survive.
+    for _k, _cfgk in (("KVMEM_PROMPT_END_RESELECT", "prompt_end_reselect"),
+                      ("KVMEM_CHECKPOINT_REPLAY", "checkpoint_replay"),
+                      ("KVMEM_COMPACT_REBUILD", "compact_rebuild")):
+        if os.environ.get(_k, "") in ("1", "true", "yes", "on"):
+            cfg[_cfgk] = True
     payload = json.dumps({"kvmem": cfg}, separators=(",", ":"))
     if "--dry-run" in argv:
         json.dump({"additional_config": payload, "plugin_config": cfg}, sys.stdout,

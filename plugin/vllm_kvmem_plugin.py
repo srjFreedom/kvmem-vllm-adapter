@@ -737,6 +737,20 @@ def _attach_sparse(runner, log_path):
                                       "rank", 0) or 0)
     except Exception:
         runtime.tp_rank = 0
+    # Experimental switches arrive through the plugin config (env does not reach the workers).
+    try:
+        if cfg.get("prompt_end_reselect"):
+            runtime.reselect_at_prompt_end = True
+        if cfg.get("checkpoint_replay"):
+            runtime.checkpoint_replay = True
+        _append(log_path, {"kind": "checkpoint_flags", "pid": os.getpid(),
+                           "prompt_end_reselect": bool(runtime.reselect_at_prompt_end),
+                           "checkpoint_replay": bool(runtime.checkpoint_replay),
+                           "catalog": runtime.checkpoints is not None,
+                           "cfg_keys": [k for k in cfg if "replay" in k or "reselect" in k
+                                        or "rebuild" in k]})
+    except Exception:
+        pass
     runtime.use_kvmem_plan = bool(cfg.get("use_kvmem_plan", False))
     runtime.use_kvmem_host = bool(cfg.get("use_kvmem_host", True))
     try:
@@ -1412,7 +1426,10 @@ def register():
                         # (measured: scheduled=4, logits=5 -> assert in prepare_inputs).
                         try:
                             req.spec_token_ids = []
-                            req.num_output_placeholders = 0
+                            # One placeholder = "a token is in flight", which is the state of a
+                            # request that has JUST finished prefilling. Setting 0 made the sampler
+                            # emit nothing after the rebuild ("no sampled token", 26-minute stall).
+                            req.num_output_placeholders = 1
                         except Exception:
                             pass
                         _compact_state[request_id] = visible      # peer message sees "already applied"
