@@ -417,3 +417,27 @@ kvmem: prompt served but no sampled token
 `is_prefill_chunk` / `num_output_placeholders` / `num_tokens_with_spec` 三者的组合让它以为还要走一个
 满 chunk 的 prefill。下一阶段要从这里入手（在 `schedule()` 里为"刚完成重建"的请求打印/校正
 `num_new_tokens`）。
+
+## 第 46~47 轮：超池最后一个成因被证实 —— vLLM 的不变式本身
+
+修掉 `raw` 未初始化（第 46 轮）之后，同一配置的压缩次数从 0 变成 32，随后失败点变成了：
+
+```
+Block table write for request 0, group 3 exceeds row capacity (6673 > 6464)
+```
+
+6,464 页 = 103,424 token = 引擎窗口；而池是 7,676 页 = 122,816 token。也就是说**块表行是按
+`max_model_len` 开的，而 `max_model_len` 比池还小**（vLLM 的 auto-fit 会扣掉保留量）。
+
+试着把窗口开到 200,000（`KVMEM_MAX_MODEL_LEN=200000`），vLLM 直接拒绝启动：
+
+```
+ValueError: To serve at least one request with the model's max seq len (200000),
+            (3.64 GiB KV cache is needed, which is larger than the available KV cache memory (1.97 GiB))
+```
+
+**结论（这是超池的最终成因，比"近似"更根本）**：
+vLLM 在启动时就强制 `max_model_len ≤ KV 池`。而 KVMem 的前提恰恰相反——**逻辑窗口 > 物理池**。
+适配器现在只能在这个不变式之内工作（prompt ≤ 池）。要打破它，必须实现 compacted-sequence 接口
+（token 账本 + 位置 + 采样），单纯"请求内压缩"不够——这也是为什么所有超池实验最终都停在
+"行宽/窗口"或"改写账本后采样失效"这两处。
