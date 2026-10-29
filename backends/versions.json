@@ -7,8 +7,8 @@
     "license_file": "engines/vllm/LICENSE",
     "local_changes": "KVMem integration (query bridge, capture_q call sites, scheduler resident books and re-admission), the SM75/FP8 profiles and the 0.3.0 beyond-pool reconstruction; the engine is fetched at base_commit and only ever replaced through this patch - install.sh no longer writes into a user's daily fork",
     "patch": "backends/patches/vllm-kvmem.patch",
-    "patch_sha256": "42d4a88e3fd194dd44de47767c1e55eac7e76c7fda0766e91b20390f49ea0102",
-    "patched_tree": "d3b1c8ebecca8afec59705ff4080890ae8154619"
+    "patch_sha256": "80ddda1be7652df2cb29790b50d8b64b0b10a8cc6e6f11c28a463b80903be883",
+    "patched_tree": "461cd30d3cba987d81f15afea402a6faa42371d0"
   },
   "model": {
     "note": "weights are not in git (tens of GB); point MODEL at an FP8+MTP export"

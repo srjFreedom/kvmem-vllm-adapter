@@ -1412,7 +1412,7 @@ index 87fdbfb..0f73e6c 100644
      # Version of dataclass repr with token IDs obfuscated.
      def anon_repr(self) -> str:
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 253ea9d..bccd0fc 100644
+index 253ea9d..3f5bece 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -1,6 +1,7 @@
@@ -1806,7 +1806,7 @@ index 253ea9d..bccd0fc 100644
              # Drop-mode stale output (same-step resume) is discarded entirely.
              if output_is_stale and request.drop_stale_output:
                  continue
-@@ -2179,6 +2383,22 @@ class Scheduler(SchedulerInterface):
+@@ -2179,6 +2383,44 @@ class Scheduler(SchedulerInterface):
                  sampled_token_ids[req_index] if sampled_token_ids else []
              )
  
@@ -1825,11 +1825,33 @@ index 253ea9d..bccd0fc 100644
 +                        request.num_prompt_tokens,
 +                        num_scheduled_tokens.get(req_id, 0),
 +                        request.num_output_placeholders)
++                # A prefill step can be handed spec-draft slots it never uses: the sampler emits
++                # nothing, so the rejection rollback below never runs and the served/resident
++                # counters stay ahead of `num_tokens` forever. `num_new_tokens` then computes to 0
++                # and the request spins in RUNNING forever (observed with MTP/4 on a 10K prompt).
++                # Roll the overshoot back to the prompt boundary; the next step schedules the
++                # single remaining token and decoding continues.
++                # The resident book must stop one token short of `num_tokens`: that trailing
++                # token is exactly what the next decode step schedules. Anything above it was a
++                # draft slot this step never sampled.
++                _target = max(0, request.num_tokens - 1)
++                if request.num_computed_tokens > _target:
++                    _overflow = request.num_computed_tokens - _target
++                    request.num_computed_tokens = _target
++                    request.num_logical_tokens = max(
++                        0, min(request.num_logical_tokens, _target))
++                    request.num_kvmem_offset = 0
++                    request.spec_token_ids.clear()
++                    logger.info(
++                        "kvmem: rolled back %d unsampled draft slot(s) req=%s "
++                        "computed=%d logical=%d tokens=%d",
++                        _overflow, request.request_id, request.num_computed_tokens,
++                        request.num_logical_tokens, request.num_tokens)
 +
              scheduled_spec_token_ids = (
                  scheduler_output.scheduled_spec_decode_tokens.get(req_id)
              )
-@@ -2196,6 +2416,11 @@ class Scheduler(SchedulerInterface):
+@@ -2196,6 +2438,11 @@ class Scheduler(SchedulerInterface):
                  if not output_is_stale:
                      if request.num_computed_tokens > 0:
                          request.num_computed_tokens -= num_rejected
@@ -1841,7 +1863,7 @@ index 253ea9d..bccd0fc 100644
                      if request.num_output_placeholders > 0:
                          request.num_output_placeholders -= num_rejected
                  spec_decoding_stats = self.make_spec_decoding_stats(
-@@ -2246,7 +2471,7 @@ class Scheduler(SchedulerInterface):
+@@ -2246,7 +2493,7 @@ class Scheduler(SchedulerInterface):
                  stopped = True
              elif (
                  self.is_mm_encoder_only
@@ -1850,7 +1872,7 @@ index 253ea9d..bccd0fc 100644
              ):
                  # An encoder instance runs the encoder and publishes the
                  # embeddings instead of sampling, so it stops as soon as the
-@@ -2577,7 +2802,13 @@ class Scheduler(SchedulerInterface):
+@@ -2577,7 +2824,13 @@ class Scheduler(SchedulerInterface):
  
              # Check for stop and update request state.
              # This must be called before we make the EngineCoreOutput.
@@ -1865,7 +1887,7 @@ index 253ea9d..bccd0fc 100644
              if stopped:
                  del new_token_ids[num_new:]  # Trim new tokens if needed.
                  break
-@@ -2637,6 +2868,17 @@ class Scheduler(SchedulerInterface):
+@@ -2637,6 +2890,17 @@ class Scheduler(SchedulerInterface):
                      request.spec_token_ids = []
                  continue
  
@@ -1883,7 +1905,7 @@ index 253ea9d..bccd0fc 100644
              # Add newly generated spec token ids to the request.
              if self.structured_output_manager.should_advance(request):
                  metadata = request.structured_output_request
-@@ -2800,6 +3042,8 @@ class Scheduler(SchedulerInterface):
+@@ -2800,6 +3064,8 @@ class Scheduler(SchedulerInterface):
  
          self.encoder_cache_manager.free(request)
          request_id = request.request_id
@@ -1892,7 +1914,7 @@ index 253ea9d..bccd0fc 100644
          self._prefill_barrier_admission_blocked.discard(request_id)
          self.finished_req_ids.add(request_id)
          if self.finished_req_ids_dict is not None:
-@@ -3005,6 +3249,16 @@ class Scheduler(SchedulerInterface):
+@@ -3005,6 +3271,16 @@ class Scheduler(SchedulerInterface):
          connector_stats_payload = (
              kv_connector_stats.to_dict() if kv_connector_stats else None
          )
@@ -1909,7 +1931,7 @@ index 253ea9d..bccd0fc 100644
          return SchedulerStats(
              num_running_reqs=len(self.running),
              num_waiting_reqs=len(self.waiting),
-@@ -3017,6 +3271,8 @@ class Scheduler(SchedulerInterface):
+@@ -3017,6 +3293,8 @@ class Scheduler(SchedulerInterface):
              kv_connector_stats=connector_stats_payload,
              cudagraph_stats=cudagraph_stats,
              perf_stats=perf_stats,
@@ -1918,7 +1940,7 @@ index 253ea9d..bccd0fc 100644
          )
  
      def make_spec_decoding_stats(
-@@ -3322,6 +3578,7 @@ class Scheduler(SchedulerInterface):
+@@ -3322,6 +3600,7 @@ class Scheduler(SchedulerInterface):
                      marked_invalid_block_ids |= request_invalid_block_ids
                      total_affected_tokens += req_num_computed_tokens
                      request.num_computed_tokens = 0
