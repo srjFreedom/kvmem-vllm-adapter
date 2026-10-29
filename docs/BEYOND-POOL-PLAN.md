@@ -651,3 +651,27 @@ B=100,000（接近池容量）时请求**卡住**（0 次压缩、GPU 从 100% �
 
 下一阶段要查的是**这个空档里调度器为什么不再调度**（断点挂 `schedule`，看 `num_new_tokens` 与
 `request_token_budget`），以及阈值是否应该改成"池余量驱动"而不是"B 驱动"。
+
+## 第 59 轮：真正的容量墙是"块池"，不是 122K token
+
+断点（B=110K 停住时）给出：
+
+```
+running = [(req, computed=81920)] → 随后 86016
+free_blocks = 9          （池总共 75 块）
+scheduler_reserve_full_isl = False   （准入闸门确已解除）
+```
+
+**块池是 75 块**（每块 1,616 token = 121,200 token），其中每个请求的 3 个 Mamba 组固定占 **15 块**
+（每组 1 状态 + 4 投机），所以**注意力实际只有 ~60 块 ≈ 96,960 token**，再减去一个 chunk 的 3 块，
+真实可用 ~92K token。
+
+这解释了全部现象：
+- B=36,864（≤92K）→ 稳定、能跑完；
+- B=90K/100K/110K（>92K）→ 在 resident≈86K、free_blocks=9 时停住（压缩阈值还没到，池先干了）；
+- "池 122,816 token" 是页视图的容量，不是可分配的块容量——两者差 20%（Mamba 状态）。
+
+**修法**（本轮已写代码但未生效，留给下一阶段）：让 watermark 由**块池**推导
+（`(num_gpu_blocks - 3*(1+spec) - chunk - slack) * block_size`），而不是由 B 推导。
+本轮新增的 `pool_ceiling_tokens` 发布逻辑没有生效（日志里没有 `attention ceiling = ...`），
+需要确认插件那段代码是否在正确的初始化路径上（很可能被放在了一个不常走的 try 块里）。

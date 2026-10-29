@@ -201,7 +201,16 @@ class VllmSparseRuntime:
         # makes attention read reserved pages (verified: ids start at 101 on this model).
         self.first_page = int(first_page)
         # Spill before the pool fills: resident pages per request during prefill.
+        # The watermark is capped by the POOL's effective ceiling when the plugin publishes it:
+        # B-driven thresholds left a dead zone where a large B never compacted before the pool ran
+        # out (measured: stall at resident 86,016 with 0 compactions for B=90K/100K/110K).
+        self.pool_ceiling_tokens = 0
         self.prefill_high_watermark = self.selector.budget_pages() + 64
+        if int(getattr(self, "pool_ceiling_tokens", 0) or 0) > 0:
+            import math as _m
+            self.prefill_high_watermark = min(
+                self.prefill_high_watermark,
+                max(64, int(self.pool_ceiling_tokens) // max(1, self.page_tokens)))
         # --- mean-K statistics owned by kvmem's RawKvStore (v0.19 recall design) --------------
         # KVMEM_STATS=core fills one kvmem statistics store per request from the engine's
         # device-side 64-token bucket sums (kvmem_bridge.capture_k). The Python mean-key index

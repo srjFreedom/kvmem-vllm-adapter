@@ -732,6 +732,28 @@ def _attach_sparse(runner, log_path):
     except Exception:
         pass
     try:
+        # Effective attention ceiling: the block pool is shared by the 3 Mamba groups (each request
+        # holds 1 state block + num_speculative_blocks per group) and the attention group. Measured
+        # with a breakpoint: at GPU_UTIL=0.65 the pool is 75 blocks, Mamba holds 15, and the prefill
+        # stops at resident 86,016 with free_blocks=9 - i.e. well BELOW num_gpu_blocks*block_size.
+        # The compaction watermark must therefore be derived from the pool, not from B, or a large B
+        # never triggers it before the pool runs dry (B=100K/110K both stalled silently).
+        _cc = getattr(getattr(runner, "vllm_config", None), "cache_config", None)
+        _nb = int(getattr(_cc, "num_gpu_blocks", 0) or 0)
+        _bs = int(getattr(_cc, "block_size", 0) or 0)
+        _spec = int(getattr(getattr(runner, "vllm_config", None), "num_speculative_tokens", 0) or 0)
+        if _nb and _bs:
+            _reserve = (3 * (1 + _spec) + 3 + 2)      # mamba state blocks + one chunk + slack
+            runtime.pool_ceiling_tokens = max(0, (_nb - _reserve) * _bs)
+            _append(log_path, {"kind": "pool_ceiling", "pid": os.getpid(),
+                               "blocks": _nb, "block_size": _bs,
+                               "reserve_blocks": _reserve,
+                               "ceiling_tokens": int(runtime.pool_ceiling_tokens)})
+            print(f"[kvmem] attention ceiling = {runtime.pool_ceiling_tokens} tokens "
+                  f"({_nb} blocks x {_bs}, reserve {_reserve})")
+    except Exception:
+        pass
+    try:
         # Native pages per ENGINE block for the full-attention group (1616-token blocks over
         # 16-token pages -> 101). The compaction needs it to keep the paged table a faithful
         # reflection of the engine's block list.
