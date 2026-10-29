@@ -117,7 +117,7 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 | 变量 | 默认 | 用途 |
 |---|---|---|
 | `USE_LOCAL_FORK` | `1` | `1` 用本机已有的 vLLM fork；`0` 按 `backends/versions.json` 拉固定 commit |
-| `VLLM_ROOT` | `$HOME/vLLM-2080Ti-Definitive` | vLLM fork 路径（`USE_LOCAL_FORK=1` 时）|
+| `VLLM_ROOT` | `engines/vllm`（仓库内）| 自备 vLLM fork 的路径（仅 `USE_LOCAL_FORK=1` 时需要，且必须显式给出）|
 | `KVMA_SRC` | `$HOME/src/kvmem-v018rc1` | kvmem 源码（编译原生扩展要头文件+库）；不存在会自动拉 `v0.18.0` |
 | `PY` | `$VLLM_ROOT/.venv/bin/python` | 用哪个 Python 环境；**已有可用 venv 时指过来就不用建** |
 | `GPU_UTIL` / `MAX_BATCHED_TOKENS` / … | 见上文"引擎与硬件" | 同样可在这层用环境变量覆盖 |

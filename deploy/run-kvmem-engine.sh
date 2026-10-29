@@ -6,7 +6,10 @@
 #  引擎窗口 N×(B+R) 也用 --set MAX_MODEL_LEN 传进来；这里的默认值只是兜底。
 #  要调档位，就在环境变量或 ~/.config/kvmem-vllm.env 里改，不用改本文件。
 # ============================================================================
-cd "${VLLM_DIR:-$HOME/vLLM-2080Ti-Definitive}" || exit 1
+_REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# Default to the engine this repository pins and patches (scripts/prepare-backends.py);
+# point VLLM_DIR at another checkout only if you maintain one yourself.
+cd "${VLLM_DIR:-$_REPO/engines/vllm}" || exit 1
 
 # 非 YaRN 档下 launcher 原样透传（合并逻辑只在 ENABLE_YARN=1 时执行）
 if [ -n "${HF_OVERRIDES_FILE:-}" ]; then export HF_OVERRIDES_JSON="$(cat "$HF_OVERRIDES_FILE")"; fi

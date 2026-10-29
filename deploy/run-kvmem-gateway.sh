@@ -28,7 +28,7 @@ fi
         echo "history cache: H=${HIST_KIB}KiB D=${HIST_DISK_MIB}MiB"
 } >> "$LOG"
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-GW=("${VLLM_PY:-${VLLM_ROOT:-$HOME/vLLM-2080Ti-Definitive}/.venv/bin/python}" \
+GW=("${VLLM_PY:-${VLLM_ROOT:-$HERE/../engines/vllm}/.venv/bin/python}" \
   "$HERE/../scripts/kvmem_gateway.py" \
     --host "$HOST" --upstream "$UPSTREAM" --port "$PORT" \
     --kvmem-ctx "$CTX" --kvmem-budget "$B" --kvmem-gen-reserve "$R" \

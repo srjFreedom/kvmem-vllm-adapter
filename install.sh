@@ -11,12 +11,12 @@
 #   2. kvmem 源码（编译扩展要它的头文件和 kvmem 库）
 #   3. 模型权重
 #
-# 默认不碰任何已有的 vLLM 目录（尤其 ~/vLLM-2080Ti-Definitive 这类日常实例）。
+# 默认不碰任何仓库外的已有 vLLM 目录（它们可能是别人的日常实例）。
 # 只有显式 USE_LOCAL_FORK=1 VLLM_ROOT=<自备 fork> 才会改写那个 fork。
 # ============================================================================
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
-VLLM_ROOT=${VLLM_ROOT:-$HOME/vLLM-2080Ti-Definitive}
+VLLM_ROOT=${VLLM_ROOT:-$ROOT/engines/vllm}
 KVMA_SRC=${KVMA_SRC:-$HOME/src/kvmem-v018rc1}
 PY=${PY:-"$VLLM_ROOT/.venv/bin/python"}
 PATCH="$ROOT/patches/qwen3-next-capture-q.patch"
@@ -46,8 +46,8 @@ echo "  python : $PY"
 say "2/5 固定引擎版本 + 应用 KVMem 集成补丁（kvmem 同款：子模块 + 补丁）"
 # 已经在这台机器上装好的 fork 直接打补丁；否则由 prepare-backends 拉取固定 commit 再打。
 if [ "${USE_LOCAL_FORK:-0}" = "1" ] && [ -d "$VLLM_ROOT/.git" ]; then
-  if [ "$VLLM_ROOT" = "$HOME/vLLM-2080Ti-Definitive" ] && [ "${ALLOW_DAILY_FORK:-0}" != "1" ]; then
-    echo "拒绝改写日常实例 $VLLM_ROOT；确需如此请显式 ALLOW_DAILY_FORK=1" >&2
+  if [ "$VLLM_ROOT" = "$ROOT/engines/vllm" ]; then
+    echo "USE_LOCAL_FORK=1 需要显式 VLLM_ROOT=<你自己的 fork>；仓库内引擎走补丁流程（USE_LOCAL_FORK=0）" >&2
     exit 1
   fi
   if (cd "$VLLM_ROOT" && git diff --quiet -- vllm/model_executor/models/qwen3_next.py) \

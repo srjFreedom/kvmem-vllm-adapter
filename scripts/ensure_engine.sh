@@ -18,7 +18,8 @@ if [[ "$health" != "200" ]]; then
 fi
 
 # The engine's start time comes from the pid file the launcher writes.
-pidfile=$(ls -t "${VLLM_ROOT:-$HOME/vLLM-2080Ti-Definitive}"/run-logs/*.pid 2>/dev/null | head -1)
+_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+pidfile=$(ls -t "${VLLM_ROOT:-$_ROOT/engines/vllm}"/run-logs/*.pid 2>/dev/null | head -1)
 started=0
 if [[ -n "$pidfile" ]]; then
   started=$(stat -c %Y "$pidfile" 2>/dev/null || echo 0)

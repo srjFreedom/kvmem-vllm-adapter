@@ -105,7 +105,7 @@ printf 'CTX=%s\nB=%s\nR=%s\nSINK=%s\nRECENT=%s\nSESSIONS=%s\nHOST_MIB=%s\nN=%s\n
   "$CTX" "$B" "$R" "$SINK" "$RECENT" "$SESSIONS" "$HOST_MIB" "$N" "$PORT" "$CAPTURE_TOKENS" > "$PARAMS_FILE"
 
 RUN=(env MAX_NUM_SEQS="$N" \
-  ${VLLM_PY:-${VLLM_ROOT:-$HOME/vLLM-2080Ti-Definitive}/.venv/bin/python} \
+  ${VLLM_PY:-${VLLM_ROOT:-$ADAPTER/engines/vllm}/.venv/bin/python} \
   "$ADAPTER/backends/vllm/worker.py" \
     --model "$MODEL" --port "$PORT" --served-name "$SERVED_NAME" \
     --tensor-parallel-size 2 --max-num-seqs "$N" \

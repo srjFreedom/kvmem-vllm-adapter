@@ -49,8 +49,11 @@ add_test(NAME vllm_contract_test COMMAND vllm_contract_test)
 # ---------------------------------------------------------------------------
 if(DEFINED ENV{VLLM_PY})
   set(_VENV_PY "$ENV{VLLM_PY}")
+elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/engines/vllm/.venv/bin/python")
+  # The engine that install.sh pins and patches; any other checkout needs VLLM_PY.
+  set(_VENV_PY "${CMAKE_CURRENT_SOURCE_DIR}/engines/vllm/.venv/bin/python")
 else()
-  set(_VENV_PY "$ENV{HOME}/vLLM-2080Ti-Definitive/.venv/bin/python")
+  set(_VENV_PY "")
 endif()
 if(EXISTS "${_VENV_PY}")
   set(Python_EXECUTABLE "${_VENV_PY}" CACHE FILEPATH "venv python" FORCE)

@@ -259,7 +259,7 @@ rejection, SSE behaviour); throughput lives in [Performance](#performance).
 ## Tests and probe
 
 ```bash
-PY=$HOME/vLLM-2080Ti-Definitive/.venv/bin/python
+PY=$PWD/engines/vllm/.venv/bin/python
 for t in tests/*_test.py; do PYTHONPATH="build/python:src:plugin" $PY "$t"; done   # 39, all PASS
 python3 scripts/check_integration_surface.py        # 28/28 vLLM/kvmem touch points
 ./run-gpu-tests.sh                                  # GPU mode (stop the service first)

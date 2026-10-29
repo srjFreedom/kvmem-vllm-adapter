@@ -187,7 +187,7 @@ curl -s localhost:18200/metrics      # vllm:* 指标（prefill/decode/KV 使用�
 ## 测试与探针
 
 ```bash
-PY=$HOME/vLLM-2080Ti-Definitive/.venv/bin/python
+PY=$PWD/engines/vllm/.venv/bin/python
 for t in tests/*_test.py; do PYTHONPATH="build/python:src:plugin" $PY "$t"; done   # 39 个，全 PASS
 python3 scripts/check_integration_surface.py        # 28/28 个 vLLM/kvmem 接触点
 ./run-gpu-tests.sh                                  # GPU 模式（需先停服务）

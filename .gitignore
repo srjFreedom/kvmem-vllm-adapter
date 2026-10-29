@@ -6,6 +6,9 @@ build/
 __pycache__/
 *.py[cod]
 
+# local GPU verification helper (machine-specific venv; not shipped)
+run-gpu-tests.sh
+
 # runtime scratch
 *.jsonl
 *.log
