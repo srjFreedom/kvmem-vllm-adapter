@@ -136,7 +136,8 @@ VLLM_ROOT=/path/to/fork KVMA_SRC=/path/to/kvmem PY=/path/to/venv/bin/python ./in
 两层，仓库默认值就是可用的起点——**不需要站点脚本**：
 
 ```
-run-current.sh      通用启动入口，不含任何站点参数（systemd 指向它）
+start-kvmem-vllm.sh 0.3.0 配置（kvmem 预算为主、vLLM 窗口为辅）；systemd 跑它
+run-current.sh      通用启动入口，不含任何站点参数
    │ exec
 run-kvmem-vllm.sh   实现（每个参数都是 ${VAR:-default}）
 ```
@@ -146,7 +147,7 @@ run-kvmem-vllm.sh   实现（每个参数都是 ${VAR:-default}）
 （单元存在则加载）：
 
 ```bash
-N=2 B=53248 GPU_UTIL=0.98 ./deploy/run-current.sh
+CONCURRENCY=2 BUDGET=53248 GPU_UTIL=0.98 ./start-kvmem-vllm.sh
 ```
 
 完整参数说明见 **[docs/PARAMETERS.md](docs/PARAMETERS.md)**。

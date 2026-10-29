@@ -1,56 +1,113 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  start-kvmem-vllm.sh —— 0.3.0 验证过的配置（常驻模式 + 超池整体重算）
+# KVMem + vLLM (SM75 fork) —— 0.3.0 组合启动
 #
-#  这一份是"一套站点配置"，不放通用逻辑：通用启动在 deploy/run-current.sh，
-#  参数含义见 docs/PARAMETERS.md。下面每个变量都能用同名环境变量覆盖。
+#   结构对齐 start-kvmem-coder390-q6.sh：kvmem 参数在前、是主口径；vLLM 参数在后、
+#   只负责"怎么把这块显存和窗口摆下"。每项都可用同名环境变量覆盖：
+#       BUDGET=65536 RESERVE=32768 GPU_UTIL=0.9 DRYRUN=1 ./start-kvmem-vllm.sh
 #
-#  必填：MODEL=<权重目录>            （served 名默认 Qwen3.8-27B-FP8-MTP）
-#  常用：PORT=18200  B=36864  R=48000  GPU_UTIL=0.65  N=1
+#   kvmem 侧（主）
+#     BUDGET   选中历史预算 B            RESERVE  追加工作区 R（输出上限 <= R）
+#     SINK     头部固定                 RECENT   尾部固定
+#     CTX      逻辑上下文上限           HOST_MIB H 层主机内存预算
+#     SESSIONS H 池会话份数             BLOCK    选片网格
+#     CAPTURE  每步 query 捕获窗口       DRAFT    MTP 投机 token 数
+#     OVER_POOL=1 允许 prompt 超出物理池：prefill 期压缩 + prompt 末整体重算
+#   vLLM 侧（辅）
+#     GPU_UTIL 显存占比  MAX_BATCHED_TOKENS prefill chunk（取 1616 的整数倍）
+#     MAX_MODEL_LEN 引擎窗口  SERVED_NAME 对外 id  CHAT_TEMPLATE_FILE 模板
+#     MESSAGE_TYPE / MM_IMAGE_LIMIT 多模态  THINK_BUDGET 思考预算（0=不限）
+#
+#   引擎用仓库内固定并打过补丁的 checkout（install.sh 准备），不碰仓库外的 fork。
 # ============================================================================
-set -uo pipefail
+set -euo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 : "${MODEL:?MODEL 未设置：指向权重目录，例如 MODEL=\$HOME/models/<your-model>}"
 
-# --- 0.3.0 验收时的配置（改了就重跑 docs/DELIVERY.md 第六节的验收）----------
-export GPU_UTIL=${GPU_UTIL:-0.65}
-export B=${B:-36864}
-export R=${R:-48000}
-export N=${N:-1}
+# ---- kvmem 预算（主口径） ----
+export BUDGET=${BUDGET:-36864}          # B：选中历史
+export RESERVE=${RESERVE:-48000}        # R：追加工作区，输出上限
+export SINK=${SINK:-8192}               # sink：头部固定
+export RECENT=${RECENT:-2048}           # recent：尾部固定
+export CTX=${CTX:-524288}               # 逻辑上下文上限（与引擎窗口无关）
+export HOST_MIB=${HOST_MIB:-49152}      # H 层主机预算 48 GiB
+export SESSIONS=${SESSIONS:-4}          # H 池按活请求平分
+export BLOCK=${BLOCK:-32}               # 选片网格（16 的整数倍；32 = 两条 needle 全中）
+export CAPTURE=${CAPTURE:-512}          # query 捕获窗口（kvmem query_max_tokens）
+export DRAFT=${DRAFT:-4}                # MTP4
+export CONCURRENCY=${CONCURRENCY:-1}    # 并发请求数 N
 export PORT=${PORT:-18200}
 
-# 常驻模式：入口不裁剪 + 池内装不下时在 prefill 期间压缩
-export INREQUEST_COMPACTION=${INREQUEST_COMPACTION:-1}
-export KVMEM_ENTRY_RESIDENT_PREFILL=${KVMEM_ENTRY_RESIDENT_PREFILL:-1}
-export KVMEM_RESIDENT_PREFILL_COMPACT=${KVMEM_RESIDENT_PREFILL_COMPACT:-1}
+# ---- 超池（0.3.0 实验路径，默认开：这是本版本验收过的能力） ----
+export OVER_POOL=${OVER_POOL:-1}
+# ---- KV 工作区实现细节（一般不用改） ----
+export WORKSPACE=${WORKSPACE:-16}       # KVMem 页 / 请求引擎的块大小
+export SCORE_AGG=${SCORE_AGG:-mean}     # page-softmax + mean（LRFU 关闭：已验证路径）
 
-# 块与池：engine block 16、允许逻辑 prompt 超过物理池
-export KVMEM_BLOCK_SIZE=${KVMEM_BLOCK_SIZE:-16}
-export KVMEM_SKIP_KV_CHECK=${KVMEM_SKIP_KV_CHECK:-1}
-export KVMEM_MAX_MODEL_LEN=${KVMEM_MAX_MODEL_LEN:-200000}
+# ---- vLLM 侧（辅） ----
+export GPU_UTIL=${GPU_UTIL:-0.65}
+export MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-4096}
+export MAX_MODEL_LEN=${MAX_MODEL_LEN:-200000}
+export SERVED_NAME=${SERVED_NAME:-Qwen3.8-27B-FP8-MTP}
+export MESSAGE_TYPE=${MESSAGE_TYPE:-text+image}
+export MM_IMAGE_LIMIT=${MM_IMAGE_LIMIT:-64}
+export SERVICE_SCOPE=${SERVICE_SCOPE:-lan}
+export TOOL_CALL_PARSER=${TOOL_CALL_PARSER:-qwen3_xml}
+export THINK_BUDGET=${THINK_BUDGET:-0}  # 0 = 不限制
 
-# prompt 结束时用两张卡的平均评分选片，并把工作集整体重算（实验路径）
-export KVMEM_COMPACT_REBUILD=${KVMEM_COMPACT_REBUILD:-1}
-export KVMEM_PROMPT_END_RESELECT=${KVMEM_PROMPT_END_RESELECT:-1}
-
-# 打分与执行：page-softmax + mean，V2 runner，eager（检索需要每步的 Python 钩子）
-export KVMEM_STATS=${KVMEM_STATS:-core}
-export KVMEM_FORCE_EAGER=${KVMEM_FORCE_EAGER:-1}
-export VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-1}
-
-# 引擎取仓库内固定并打过补丁的 checkout（install.sh 准备）
+# ---- 引擎与入口（仓库内固定 checkout） ----
 export ADAPTER=${ADAPTER:-$HERE}
 export VLLM_DIR=${VLLM_DIR:-$HERE/engines/vllm}
 export VLLM_ROOT=${VLLM_ROOT:-$VLLM_DIR}
 export VLLM_PY=${VLLM_PY:-$VLLM_DIR/.venv/bin/python}
 export LOG=${LOG:-$HERE/run-logs/kvmem-vllm.log}
 export KV_PIDFILE=${KV_PIDFILE:-$HERE/run-logs/kvmem-vllm.pid}
-mkdir -p "$(dirname "$LOG")"
+
+[ -d "$VLLM_DIR/vllm" ] || { echo "未找到引擎: $VLLM_DIR（先跑 install.sh / prepare-backends）" >&2; exit 1; }
+[ -x "$VLLM_PY" ]       || { echo "未找到引擎 venv: $VLLM_PY" >&2; exit 1; }
+[ -f "$MODEL" ] || [ -d "$MODEL" ] || { echo "未找到模型: $MODEL" >&2; exit 1; }
+
+# vLLM 侧 chunk：切成 1616（mamba align 块）的整数倍收益最好（如 6464=4 块）。
+# 本版验收用的是 4096，所以默认值不动；调大后请按 docs/DELIVERY.md 第六节重跑验收。
+if [ $((MAX_BATCHED_TOKENS % 1616)) -ne 0 ]; then
+  echo "note: MAX_BATCHED_TOKENS=$MAX_BATCHED_TOKENS 非 1616 整数倍（6464/8080 可减少切块）" >&2
+fi
+
+# ---- kvmem 主口径 -> 适配器环境变量 ----
+export B="$BUDGET" R="$RESERVE"
+export N="$CONCURRENCY"
+export SELECT_BLOCK_TOKENS="$BLOCK"
+export CAPTURE_TOKENS="$CAPTURE"
+export SPECULATIVE_TOKENS="$DRAFT"
+export KVMEM_CAPTURE_TOKENS="$CAPTURE"
+export THINKING_BUDGET="$THINK_BUDGET"
+[ "$THINK_BUDGET" = "0" ] && unset THINKING_BUDGET
+
+# 常驻工作区：入口不裁剪、池内装不下时在 prefill 期间压缩
+export INREQUEST_COMPACTION=${INREQUEST_COMPACTION:-1}
+export KVMEM_ENTRY_RESIDENT_PREFILL=${KVMEM_ENTRY_RESIDENT_PREFILL:-1}
+export KVMEM_BLOCK_SIZE=${KVMEM_BLOCK_SIZE:-$WORKSPACE}
+export KVMEM_STATS=${KVMEM_STATS:-core}
+export KVMEM_FORCE_EAGER=${KVMEM_FORCE_EAGER:-1}
+export VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-1}
+
+if [ "$OVER_POOL" = "1" ]; then
+  export KVMEM_RESIDENT_PREFILL_COMPACT=${KVMEM_RESIDENT_PREFILL_COMPACT:-1}
+  export KVMEM_SKIP_KV_CHECK=${KVMEM_SKIP_KV_CHECK:-1}
+  export KVMEM_MAX_MODEL_LEN=${KVMEM_MAX_MODEL_LEN:-$MAX_MODEL_LEN}
+  export KVMEM_COMPACT_REBUILD=${KVMEM_COMPACT_REBUILD:-1}
+  export KVMEM_PROMPT_END_RESELECT=${KVMEM_PROMPT_END_RESELECT:-1}
+fi
+[ -n "${CHAT_TEMPLATE_FILE:-}" ] && export CHAT_TEMPLATE_FILE
 
 # 前台模式：worker 起完引擎就退出，引擎自己 setsid 常驻（systemd 用 PIDFile 跟踪）。
 # 不能用默认的非前台模式：那段逻辑会先杀掉所有 VLLM 进程，systemd 下会连环重启。
-export FOREGROUND=1
+export FOREGROUND=${FOREGROUND:-1}
+
+echo "kvmem: B=$BUDGET R=$RESERVE sink=$SINK recent=$RECENT CTX=$CTX H=${HOST_MIB}MiB" \
+     "sessions=$SESSIONS block=$BLOCK capture=$CAPTURE draft=$DRAFT over_pool=$OVER_POOL"
+echo "vllm : util=$GPU_UTIL chunk=$MAX_BATCHED_TOKENS window=$MAX_MODEL_LEN port=$PORT served=$SERVED_NAME"
 
 "$HERE/deploy/run-kvmem-vllm.sh"
 rc=$?

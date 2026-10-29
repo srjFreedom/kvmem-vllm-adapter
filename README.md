@@ -147,9 +147,9 @@ USE_LOCAL_FORK=0 ./install.sh            # fetch engines → patch → plugin �
 ENGINE=$PWD/engines/vllm ./scripts/setup-venv.sh   # torch / CUDA (several GB; skip if you have a venv)
 
 # Run it in the foreground with the repository defaults (default profile included):
-MODEL=$HOME/models/<your-model> ./deploy/run-current.sh
+MODEL=$HOME/models/<your-model> ./start-kvmem-vllm.sh
 
-# Or as a service (the unit's ExecStart points at this repository's run-current.sh):
+# Or as a service (the unit's ExecStart points at start-kvmem-vllm.sh):
 sudo ./deploy/install-service.sh
 mkdir -p ~/.config && printf 'MODEL=%s\n' "$HOME/models/<your-model>" > ~/.config/kvmem-vllm.env
 sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
@@ -184,7 +184,8 @@ So: any vLLM-supported model runs, and FP8 + MTP is just the configuration measu
 Two layers, and the defaults are a working start — no site script required:
 
 ```
-run-current.sh      generic entry, no site parameters (systemd points here)
+start-kvmem-vllm.sh 0.3.0 configuration (kvmem budgets + vLLM window); systemd runs it
+run-current.sh      generic entry, no site parameters
    │ exec
 run-kvmem-vllm.sh   implementation (every knob is ${VAR:-default})
 ```
@@ -196,7 +197,7 @@ chat template. Override anything else with environment variables, or put
 `KEY=VALUE` lines in `~/.config/kvmem-vllm.env` (the unit loads it when present):
 
 ```bash
-N=2 B=53248 GPU_UTIL=0.98 ./deploy/run-current.sh
+CONCURRENCY=2 BUDGET=53248 GPU_UTIL=0.98 ./start-kvmem-vllm.sh
 ```
 
 Full parameter reference: **[docs/PARAMETERS.md](docs/PARAMETERS.md)** (Chinese).

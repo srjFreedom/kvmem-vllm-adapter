@@ -104,7 +104,7 @@ cat <<NEXT
 [install] 完成。启动方式（仓库默认参数即可跑，只差 MODEL；模型无内置模板时再加 CHAT_TEMPLATE_FILE）：
 
   前台：
-    MODEL=$HOME/models/<你的模型> $ROOT/deploy/run-current.sh
+    MODEL=$HOME/models/<你的模型> $ROOT/start-kvmem-vllm.sh
 
   服务：
     sudo $ROOT/deploy/install-service.sh
