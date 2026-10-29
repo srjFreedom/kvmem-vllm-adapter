@@ -22,7 +22,7 @@ Environment=KV_PIDFILE=/run/kvmem-vllm/kvmem-vllm.pid
 # Site parameters: /etc/default/kvmem-vllm (system) then the user file; both optional.
 EnvironmentFile=-/etc/default/kvmem-vllm
 EnvironmentFile=-@HOME@/.config/kvmem-vllm.env
-ExecStart=@REPO@/start-kvmem-vllm.sh
+ExecStart=@START_SCRIPT@
 TimeoutStartSec=900
 TimeoutStopSec=120
 Restart=on-failure

@@ -49,4 +49,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
 2. **日志由脚本写**：`run-kvmem-vllm.sh` 同时输出启动横幅、worker 与 launcher 的输出到 `kvmem.log`，
    再加上 launcher 自己的 `run-logs/vllm-*.log`，比单纯 `append:` 多一层信息；因此单元里
    `StandardOutput=null` 避免重复。
-3. **`DRYRUN=1`** 两层都支持（`run-current.sh` 打印真正的启动命令），和 llama.cpp/ninfer 脚本的习惯一致。
+3. **站点脚本**：`START_SCRIPT=~/start-kvmem-vllm-<site>.sh sudo -E ./deploy/install-service.sh`
+   让 unit 的 ExecStart 指向你自己的配置脚本（脚本内只需 `export` 参数后 exec 仓库的
+   `start-kvmem-vllm.sh`），改参数后 `sudo systemctl restart kvmem-vllm` 即可。
+4. **`DRYRUN=1`** 两层都支持（`run-current.sh` 打印真正的启动命令），和 llama.cpp/ninfer 脚本的习惯一致。

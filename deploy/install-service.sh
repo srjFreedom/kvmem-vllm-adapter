@@ -5,14 +5,17 @@ set -euo pipefail
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 RUN_USER=${RUN_USER:-${SUDO_USER:-$(id -un)}}
 RUN_HOME=$(getent passwd "$RUN_USER" | cut -d: -f6)
+# 站点启动脚本：默认用仓库里的，也可指到自己的配置（例如 ~/start-kvmem-vllm-<site>.sh）
+START_SCRIPT=${START_SCRIPT:-$REPO/start-kvmem-vllm.sh}
 TEMPLATE="$REPO/deploy/kvmem-vllm.service.in"
 UNIT=/etc/systemd/system/kvmem-vllm.service
 
 [ -f "$TEMPLATE" ] || { echo "missing $TEMPLATE" >&2; exit 1; }
 sed -e "s#@REPO@#$REPO#g" -e "s#@USER@#$RUN_USER#g" -e "s#@HOME@#$RUN_HOME#g" \
+    -e "s#@START_SCRIPT@#$START_SCRIPT#g" \
     "$TEMPLATE" > /tmp/kvmem-vllm.service.$$
 install -m 0644 /tmp/kvmem-vllm.service.$$ "$UNIT"
 rm -f /tmp/kvmem-vllm.service.$$
 systemctl daemon-reload
-echo "installed $UNIT (user=$RUN_USER repo=$REPO)"
+echo "installed $UNIT (user=$RUN_USER repo=$REPO exec=$START_SCRIPT)"
 echo "next: systemctl enable --now kvmem-vllm"
