@@ -527,3 +527,35 @@ Block table write for request 0, group 0 exceeds row capacity (10 > 5)
 
 **对超池的含义**：窗口 > 池在这套架构里不可行，除非把 Mamba 状态改成"与窗口无关的每序列一份、
 块尺寸恒为 1"的布局（fork 级重构：`MambaManager` 的分配数学 + 块表宽度）。
+
+## 第 53 轮：超池配置的两个必要开关 + 新的停点
+
+### 关键发现：`KVMEM_ENTRY_RESIDENT_PREFILL=1` 是必需的
+
+前几轮所有"请求不进调度"的实验里，我都没设这个变量。**不设它，入口会按文本启发式把 prompt 裁到 B**
+（在 API server 里做 token 估算，1.3M 字符的 prompt 会长时间占 CPU，GPU 0%），引擎根本看不到完整
+prompt。设上之后：
+
+```
+warm http=200
+196,673-token prompt → compact_applied = 1 → row_synced = 6 → 然后 GPU 掉到 0%（停住）
+```
+
+即：**请求这次真的进了引擎，并且发生了 1 次压缩**，然后停住。
+
+### 剩下的停点
+
+停在第 1 次压缩之后。下一步用断点（把 hits 设大，专门抓这个大请求）看：
+- 是调度器没再被调用（`waiting` 里卡着），还是
+- worker 在等 EngineCore 的 block channel 响应（同步调度 + 压缩的死锁）。
+
+### 已确认的环境组合（超池）
+
+```
+KVMEM_ENTRY_RESIDENT_PREFILL=1      # 必需：入口不裁，交给引擎压缩
+KVMEM_SKIP_KV_CHECK=1               # 必需：窗口可以大于池
+KVMEM_MAX_MODEL_LEN=200000          # 窗口 ≥ prompt
+GPU_UTIL=0.65                       # 池 ~122K < prompt（真正的超池）
+B=36864 INREQUEST_COMPACTION=1 KVMEM_RESIDENT_PREFILL_COMPACT=1
+# 不要设 KVMEM_MAMBA_BLOCK_TOKENS（第 52 轮已证否）
+```
