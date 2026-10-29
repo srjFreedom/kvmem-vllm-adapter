@@ -1,6 +1,6 @@
 # kvmem-vllm 适配器交付说明（v0.19 对齐）
 
-更新：2026-10-29（第 38 轮）
+更新：2026-10-29（第 41 轮，回归完成）
 
 ## 一、这一版是什么
 
@@ -143,3 +143,15 @@ ValueError: To serve at least one request with the model's max seq len (203000),
 因此 **超池的正确性需要 compacted-sequence 接口**（`DESIGN-compacted-sequence.md` 的第三块拼图：
 `prepare_inputs` 的 logits 行口径），这不是参数或补丁能解决的。当前能保证正确性的是"prompt ≤ 池"
 （第 7 节第一行，88K 实测 `ZX-4417`）。
+
+
+## 十、第 41 轮回归结果（全部改动之后）
+
+| 场景 | 配置 | 结果 |
+|---|---|---|
+| A 长上下文基线 | `B=131072`、不压缩 | 88,256 token → **`ZX-4417`** ✅ |
+| B 单次压缩 | `B=36864` + prefill 期压缩 | 46,993 token → `ZXZXZX-4417-QJ7`（可读）✅ |
+| C 超池通道 | `B=36864` + `KVMEM_BLOCK_SIZE=16` | 147,367 token / 23 次压缩 → HTTP 200（答案错，见第九节）|
+| D 会话复用 | `KVMEM_SESSION_REUSE=1` + catalog 接管 | 两轮均 200，`session_reuse_on` 正常 ✅ |
+
+**结论**：本次迁移的可交付部分全部通过回归；超池的"通道"通过、"正确性"受架构限制。
