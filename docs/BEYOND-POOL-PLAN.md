@@ -571,3 +571,21 @@ B=36864 INREQUEST_COMPACTION=1 KVMEM_RESIDENT_PREFILL_COMPACT=1
 
 **经验**：以后所有 prompt 的 token 数必须用引擎报的 `prompt_tokens` 为准（字符数不可靠，
 同一份文本在不同 tokenizer 下可以差 2 倍），并且测试前先确认 `prompt_tokens < max_model_len`。
+
+## 第 55 轮：把"分不到块"精确到 allocate_slots 的拒绝
+
+断点（`scheduler.py:1371`，等待队列里的分配点）一次命中给出全部数字：
+
+```
+num_new_tokens = 4096            # 请求的 chunk 计算正确
+new_blocks     = None            # 分配失败
+free_blocks    = 75              # 池里还有 75 块
+每组需要的块   = Mamba 5 + 5 + 5 + FullAttention 3 = 18   << 75
+```
+
+**需要 18 块、池里有 75 块，但 `allocate_slots` 仍然返回 None** → 拒绝来自 `kvcache_manager` 内部的
+预留/水位检查，而不是块不够。`kv_cache_manager.py` 里有 6 处 `return None`，本轮只验证到 521/574/580
+三处都不触发，下一轮把其余几处全部挂上断点（一次命中即可定位是哪个条件）。
+
+结论：超池请求停在等待队列的**根因是分配器的预留检查**，与压缩、Mamba 块、窗口都不再是同一个层面
+的问题——这是一个很小、很具体的检查条件。
