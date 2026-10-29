@@ -7,10 +7,10 @@
 #       BUDGET=65536 RESERVE=32768 GPU_UTIL=0.9 DRYRUN=1 ./start-kvmem-vllm.sh
 #
 #   kvmem 侧（主）
-#     BUDGET   选中历史预算 B            RESERVE  追加工作区 R（输出上限 <= R）
-#     SINK     头部固定                 RECENT   尾部固定
-#     CTX      逻辑上下文上限           HOST_MIB H 层主机内存预算
-#     SESSIONS H 池会话份数             BLOCK    选片网格
+#     BUDGET   选中历史预算 B (36K)      RESERVE  追加工作区 R (16K，输出上限)
+#     SINK     头部固定 (12K)           RECENT   尾部固定 (1K)
+#     CTX      逻辑上下文上限 (256K)     HOST_MIB H 层主机内存预算 (16G)
+#     SESSIONS H 池会话份数 (1)          BLOCK    选片网格
 #     CAPTURE  每步 query 捕获窗口       DRAFT    MTP 投机 token 数
 #     OVER_POOL=1 允许 prompt 超出物理池：prefill 期压缩 + prompt 末整体重算
 #   vLLM 侧（辅）
@@ -25,14 +25,14 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 : "${MODEL:?MODEL 未设置：指向权重目录，例如 MODEL=\$HOME/models/<your-model>}"
 
-# ---- kvmem 预算（主口径） ----
-export BUDGET=${BUDGET:-36864}          # B：选中历史
-export RESERVE=${RESERVE:-48000}        # R：追加工作区，输出上限
-export SINK=${SINK:-8192}               # sink：头部固定
-export RECENT=${RECENT:-2048}           # recent：尾部固定
-export CTX=${CTX:-524288}               # 逻辑上下文上限（与引擎窗口无关）
-export HOST_MIB=${HOST_MIB:-49152}      # H 层主机预算 48 GiB
-export SESSIONS=${SESSIONS:-4}          # H 池按活请求平分
+# ---- kvmem 预算（主口径；下面是站点默认值） ----
+export BUDGET=${BUDGET:-36864}          # B：选中历史 36K
+export RESERVE=${RESERVE:-16384}        # R：追加工作区 16K（输出上限）
+export SINK=${SINK:-12288}              # sink：头部固定 12K
+export RECENT=${RECENT:-1024}           # recent：尾部固定 1K
+export CTX=${CTX:-262144}               # 逻辑上下文上限 256K（与引擎窗口无关）
+export HOST_MIB=${HOST_MIB:-16384}      # H 层主机预算 16 GiB
+export SESSIONS=${SESSIONS:-1}          # H 池会话份数
 export BLOCK=${BLOCK:-32}               # 选片网格（16 的整数倍；32 = 两条 needle 全中）
 export CAPTURE=${CAPTURE:-512}          # query 捕获窗口（kvmem query_max_tokens）
 export DRAFT=${DRAFT:-4}                # MTP4
@@ -46,9 +46,9 @@ export WORKSPACE=${WORKSPACE:-16}       # KVMem 页 / 请求引擎的块大小
 export SCORE_AGG=${SCORE_AGG:-mean}     # page-softmax + mean（LRFU 关闭：已验证路径）
 
 # ---- vLLM 侧（辅） ----
-export GPU_UTIL=${GPU_UTIL:-0.65}
+export GPU_UTIL=${GPU_UTIL:-0.97}
 export MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-4096}
-export MAX_MODEL_LEN=${MAX_MODEL_LEN:-200000}
+export MAX_MODEL_LEN=${MAX_MODEL_LEN:--1}   # -1 = 按 KV 池自动适配窗口
 export SERVED_NAME=${SERVED_NAME:-Qwen3.8-27B-FP8-MTP}
 export MESSAGE_TYPE=${MESSAGE_TYPE:-text+image}
 export MM_IMAGE_LIMIT=${MM_IMAGE_LIMIT:-64}
@@ -101,6 +101,10 @@ if [ "$OVER_POOL" = "1" ]; then
 fi
 [ -n "${CHAT_TEMPLATE_FILE:-}" ] && export CHAT_TEMPLATE_FILE
 
+# 启动器的内置短 smoke 在 -1 自动窗口 + 大 sink 的站点配置下会返回空内容并自清理；
+# 这里跳过它，改为本脚本在就绪后自己探 /health。
+export SKIP_STARTUP_SMOKE=${SKIP_STARTUP_SMOKE:-1}
+
 # 前台模式：worker 起完引擎就退出，引擎自己 setsid 常驻（systemd 用 PIDFile 跟踪）。
 # 不能用默认的非前台模式：那段逻辑会先杀掉所有 VLLM 进程，systemd 下会连环重启。
 export FOREGROUND=${FOREGROUND:-1}
@@ -117,6 +121,17 @@ rc=$?
 api_pid=$(pgrep -f "vllm.entrypoints.openai.api_server.*--port $PORT" | head -1)
 if [ -z "${api_pid:-}" ]; then
   echo "[start-kvmem-vllm] 引擎未就绪：端口 $PORT 上没有 api_server 进程" >&2
+  exit 1
+fi
+# 就绪确认：/health 200 才写 PIDFile，避免 systemd 把半启动的引擎当成可用。
+code=""
+for _ in $(seq 1 30); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$PORT/health" || true)
+  [ "$code" = "200" ] && break
+  sleep 5
+done
+if [ "$code" != "200" ]; then
+  echo "[start-kvmem-vllm] /health=$code（端口 $PORT）；不写 PIDFile" >&2
   exit 1
 fi
 printf '%s\n' "$api_pid" > "$KV_PIDFILE"
