@@ -107,7 +107,7 @@ cat <<NEXT
     MODEL=$HOME/models/<你的模型> $ROOT/deploy/run-current.sh
 
   服务：
-    cp $ROOT/deploy/kvmem-vllm.service /etc/systemd/system/
+    sudo $ROOT/deploy/install-service.sh
     mkdir -p ~/.config && printf 'MODEL=%s\n' "$HOME/models/<你的模型>" > ~/.config/kvmem-vllm.env
     sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
 

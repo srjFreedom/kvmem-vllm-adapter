@@ -1,0 +1,32 @@
+[Unit]
+Description=KVMem vLLM backend (SM75, resident mode, port 18200)
+Documentation=file://@REPO@/README.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+# vLLM's launcher detaches the api_server into its own session, so the unit is
+# Type=forking and tracks that PID. start-kvmem-vllm.sh writes it for us.
+Type=forking
+PIDFile=/run/kvmem-vllm/kvmem-vllm.pid
+RuntimeDirectory=kvmem-vllm
+RuntimeDirectoryMode=0755
+User=@USER@
+Group=@USER@
+WorkingDirectory=@REPO@
+Environment=HOME=@HOME@
+Environment=MALLOC_ARENA_MAX=2
+Environment=KV_PIDFILE=/run/kvmem-vllm/kvmem-vllm.pid
+# Site parameters: /etc/default/kvmem-vllm (system) then the user file; both optional.
+EnvironmentFile=-/etc/default/kvmem-vllm
+EnvironmentFile=-@HOME@/.config/kvmem-vllm.env
+ExecStart=@REPO@/start-kvmem-vllm.sh
+TimeoutStartSec=900
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

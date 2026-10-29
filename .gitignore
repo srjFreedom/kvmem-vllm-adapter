@@ -10,6 +10,7 @@ __pycache__/
 run-gpu-tests.sh
 
 # runtime scratch
+run-logs/
 *.jsonl
 *.log
 smoke_live_engine.json

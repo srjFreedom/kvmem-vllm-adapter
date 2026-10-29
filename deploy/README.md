@@ -23,7 +23,7 @@ MODEL=$HOME/models/<你的模型> ./deploy/run-current.sh
    文件存在就加载，不存在就忽略。内容就是 `KEY=VALUE` 一行一个。
 
 ```bash
-cp deploy/kvmem-vllm.service /etc/systemd/system/
+sudo ./deploy/install-service.sh
 mkdir -p ~/.config && printf 'MODEL=%s\n' "$HOME/models/<你的模型>" > ~/.config/kvmem-vllm.env
 sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
 ```
@@ -39,7 +39,7 @@ sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
 | `kvmem.service`（llama.cpp）| `simple` | `start-kvmem-coder390-q6.sh`：`export VAR=${VAR:-默认}` + `exec "$BIN"`（前台）| `StandardOutput=append:~/kvmem.log` |
 | `kvmem-ninfer.service` | `simple` | `start-kvmem-ninfer-22g.sh`，同套路 | `append:~/kvmem-ninfer.log` |
 | `vllm.service`（旧）| `oneshot` | `start-vllm.sh`：先清理残留进程，再调 `run-current.sh` | — |
-| **`kvmem-vllm.service`（本仓库）** | **`forking` + `PIDFile`** | `run-current.sh` → `run-kvmem-vllm.sh` | 脚本内追加 `~/kvmem.log` |
+| **`kvmem-vllm.service.in`（本仓库）** | **`forking` + `PIDFile`** | `start-kvmem-vllm.sh`（0.3.0 配置） | 仓库内 `run-logs/kvmem-vllm.log` |
 
 三处刻意的差异：
 

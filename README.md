@@ -150,7 +150,7 @@ ENGINE=$PWD/engines/vllm ./scripts/setup-venv.sh   # torch / CUDA (several GB; s
 MODEL=$HOME/models/<your-model> ./deploy/run-current.sh
 
 # Or as a service (the unit's ExecStart points at this repository's run-current.sh):
-cp deploy/kvmem-vllm.service /etc/systemd/system/
+sudo ./deploy/install-service.sh
 mkdir -p ~/.config && printf 'MODEL=%s\n' "$HOME/models/<your-model>" > ~/.config/kvmem-vllm.env
 sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
 scripts/wait_ready.sh 18200 900 --smoke

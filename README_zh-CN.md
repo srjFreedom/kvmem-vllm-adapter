@@ -106,7 +106,7 @@ cd kvmem-vllm-adapter
 USE_LOCAL_FORK=0 ./install.sh            # 拉引擎 → 打补丁 → 装插件 → 编扩展 → 自检
 ENGINE=$PWD/engines/vllm ./scripts/setup-venv.sh   # torch / CUDA（几个 GB，已有 venv 可跳过）
 
-cp deploy/kvmem-vllm.service /etc/systemd/system/
+sudo ./deploy/install-service.sh
 sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
 scripts/wait_ready.sh 18200 900 --smoke
 ```
