@@ -205,6 +205,16 @@ def _install_middleware_class():
             return "application/json" in ctype or ctype == ""
 
         async def dispatch(self, request, call_next):
+            # Same live-debugger wiring as the engine plugin: dropping /tmp/kvmem_dbg.bp turns any
+            # line of this (API-server-side) middleware into a breakpoint. The console facility is
+            # worker-only, so without this the entry layer had no no-restart debugging path.
+            try:
+                import os as _os
+                if _os.path.exists("/tmp/kvmem_dbg.bp"):
+                    import kvmem_dbg
+                    kvmem_dbg.install()
+            except Exception:
+                pass
             if not self._matches(request):
                 return await call_next(request)
             body = await request.body()  # consumed once, and cached on this Request
