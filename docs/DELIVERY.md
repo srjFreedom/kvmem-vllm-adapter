@@ -1,6 +1,34 @@
 # kvmem-vllm 适配器交付说明（v0.19 对齐）
 
-更新：2026-10-29（第 41 轮，回归完成）
+## 摘要（先看这一节）
+
+**已完成并回归通过**
+
+1. `KVMEM_STATS` 开启后 88K 崩溃（pinned allocator）——已修；88,256 token prompt 稳定答对 `ZX-4417`。
+2. v0.19 打分栈接入：`RawKvStore` 统计（64-token 桶、mean-K）、`PageQueryView`（pre-RoPE）、
+   `QueryScoreFrame`、page-softmax（sm75 CUDA）——排名确实是选择器的输入，且 needle 块能排到第一。
+3. 压缩路径：纯拷贝、位置拆分（RoPE 用真实位置、写地址用压缩位置）、三本账一致；
+   47,000 token 单次压缩后仍可读（`ZXZXZX-4417-QJ7`）。
+4. decode 期统计：按"已接受"时间线推进（bridge 保留解码行、按上一接受数折叠），frontier 精确。
+5. `CheckpointCatalog` 落地并接管 session store 的状态镜像（一个所有者、容量与淘汰统一）。
+6. 超池**通道**：201,915 / 236,827 token 的 prompt 都能前缀到结尾并返回 200；
+   块/页统一（`KVMEM_BLOCK_SIZE=16`）解决池回收；压缩请求不再因 MTP 崩溃。
+
+**因架构限制未完成**
+
+- 超池（prompt > 池 ≈179K）的**答案正确性**。三条实测：needle 能入选（排名第一）；尾部
+  QueryReplay 能重算最后 8K；但保留页的 KV 与循环状态都带着"中段被淘汰"的近似，
+  表现为压缩次数与可读性相关（1 次≈可读，2~6 次≈退化，20+ 次≈全错）。唯一出路是"按压缩顺序整体
+  重算"，卡在重建后调度器把 decode 步排成 4096 token（`no sampled token` 停摆）。
+- graph recall / AttentionFeedback（`graph_recall.hpp`）未接入：需要先有注意力质量采样。
+
+**建议下一步**
+
+1. 修 `schedule()` 对"刚完成重建"请求的 `num_new_tokens` 判断（第 42 轮已给出停摆现场）；
+2. 或按上游 `prefix_checkpoint` 做多检查点 + 尾部重算（本适配器的 catalog 已具备容器）；
+3. 之后再把 `reselect_at_prompt_end` / `KVMEM_COMPACT_REBUILD` 从实验开关转正。
+
+更新：2026-10-29（第 42 轮，摘要与回归完成）
 
 ## 一、这一版是什么
 
