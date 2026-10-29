@@ -473,3 +473,32 @@ free_blocks = 59
 
 这也解释了为什么之前所有"窗口>池"的尝试都停在调度：不是注意力 KV 不够，而是 **Mamba 状态块按窗口
 放大把池吃掉了**。
+
+## 下一步工程项：解耦 Mamba 状态块与 max_model_len（第 52 轮方案）
+
+### 现状（源码已核对）
+
+- `MambaSpec.block_size` 来自 `vllm_config.cache_config.mamba_block_size`；
+- 该字段**未设置时等于 `max_model_len`**（`vllm/config/vllm.py:3167` 用 `!= max_model_len` 判断"是否显式设置"）；
+- `--mamba-block-size` 存在（`arg_utils.py:1309`），但 `validate_mamba_block_size()` 规定
+  **只有开启 `--enable-prefix-caching` 才能设置**；而本适配器做请求内压缩时前缀缓存必须关闭 →
+  于是窗口抬高到 200K 时，Mamba 块也按 200K 计。
+- 后果（断点实测，第 51 节）：每个请求每组持 5 个块，`block_size=max_model_len`；
+  再加上 `need_mamba_block_aligned_split` 会按 `mamba_block_size` 对齐 chunk，
+  窗口 > 池时请求要么分不到块、要么 `num_new_tokens` 被对齐成 0，永久停在 `waiting`。
+
+### 要做的两处改动
+
+1. **放开校验**：`vllm/config/vllm.py::validate_mamba_block_size` 在
+   `KVMEM_MAMBA_BLOCK_TOKENS` 显式存在时跳过该 ValueError（附注释说明这是 KVMem 的用法）；
+2. **显式给值**：适配器侧（`backends/vllm/worker.py`）在 KVMem 模式下传
+   `--mamba-block-size <KVMEM_MAMBA_BLOCK_TOKENS>`（建议与注意力块对齐，如 1616 或 4096），
+   让 Mamba 块尺寸不再随 `max_model_len` 变化。
+
+### 验收
+
+- 启动：`GPU_UTIL=0.65`（池 ~122K）、`KVMEM_SKIP_KV_CHECK=1`、`KVMEM_MAX_MODEL_LEN=200000`、
+  `KVMEM_MAMBA_BLOCK_TOKENS=1616`；
+- 断点 `scheduler.py:899` 应看到 `MambaManager(block_size=1616)`，且 245K prompt 能进入
+  `allocate_slots`（而不是停在 waiting）；
+- 再跑 200K/245K prompt 看是否正常进入压缩与解码。
