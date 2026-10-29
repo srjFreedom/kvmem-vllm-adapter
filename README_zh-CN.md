@@ -95,7 +95,7 @@ vLLM 用逻辑位置索引 KV 块，且假定序列长度单调增长：中途�
 
 | 外部件 | 固定版本 | 获取方式 |
 |---|---|---|
-| vLLM SM75 fork | `93c9013e375b` + 集成补丁 | `install.sh` 拉取并打补丁（校验 `patched_tree`）|
+| vLLM SM75 fork | `93c9013e375b` + 集成补丁 | `install.sh` 把 `base_commit` 拉到 `engines/vllm`，再用 `backends/patches/vllm-kvmem.patch` 整体替换（校验 `patched_tree`）；默认不改动任何已有 fork，除非显式 `USE_LOCAL_FORK=1` |
 | kvmem 源码 | tag `v0.18.0` | 同上（编译原生扩展要头文件与库）|
 | 模型权重 | **vLLM 能跑的任何模型**（本部署用的是 FP8 + MTP 导出）| 自己放，改 `MODEL` |
 

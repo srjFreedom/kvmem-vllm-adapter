@@ -1,6 +1,10 @@
 # kvmem-vllm 适配器交付说明（v0.19 对齐）
 
-更新：2026-10-29。**实验性整体重算验收**：TP2 / MTP4 / 同步 V2、单文本请求，
+更新：2026-10-29（**0.3.0**）。第三方引擎只以补丁形式发布：`install.sh` 默认把
+`backends/versions.json` 的 `base_commit` 拉到 `engines/vllm`，再应用
+`backends/patches/vllm-kvmem.patch` 并校验 `patched_tree`；不会写入用户已有的 fork。
+
+**实验性整体重算验收**：TP2 / MTP4 / 同步 V2、单文本请求，
 `GPU_UTIL=0.65` 的物理池 122,816 token，居中 needle 的真实 prompt 196,598 token：
 27 次 `compact_applied` + 1 次 `compact_rebuild_queued` + 两 rank 各 1 次 `reconstruction_started`，
 API `usage.prompt_tokens=196598`、HTTP 200、回答 **`ZX-4417-QJ7`**（耗时 320.24s）。

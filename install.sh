@@ -6,9 +6,13 @@
 #   VLLM_ROOT=... KVMA_SRC=... ./install.sh
 #
 # 需要的外部件（不在本仓库里）：
-#   1. vLLM SM75 fork（会被打一个小补丁 + 放入 kvmem_bridge.py）
+#   1. vLLM SM75 fork：按 backends/versions.json 拉固定 base_commit，再整体打
+#      backends/patches/vllm-kvmem.patch（第三方引擎只用补丁替换，不 vendored）
 #   2. kvmem 源码（编译扩展要它的头文件和 kvmem 库）
 #   3. 模型权重
+#
+# 默认不碰任何已有的 vLLM 目录（尤其 ~/vLLM-2080Ti-Definitive 这类日常实例）。
+# 只有显式 USE_LOCAL_FORK=1 VLLM_ROOT=<自备 fork> 才会改写那个 fork。
 # ============================================================================
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
@@ -20,7 +24,7 @@ TARGET="$VLLM_ROOT/vllm/model_executor/models/qwen3_next.py"
 
 say() { printf '\n[install] %s\n' "$*"; }
 
-FETCH_LOCAL=${USE_LOCAL_FORK:-1}
+FETCH_LOCAL=${USE_LOCAL_FORK:-0}
 say "1/5 检查外部件"
 if [ "$FETCH_LOCAL" = "1" ]; then
   [ -d "$VLLM_ROOT/vllm" ] || { echo "缺 vLLM fork: $VLLM_ROOT（或用 USE_LOCAL_FORK=0 自动拉取）"; exit 1; }
@@ -41,7 +45,11 @@ echo "  python : $PY"
 
 say "2/5 固定引擎版本 + 应用 KVMem 集成补丁（kvmem 同款：子模块 + 补丁）"
 # 已经在这台机器上装好的 fork 直接打补丁；否则由 prepare-backends 拉取固定 commit 再打。
-if [ "${USE_LOCAL_FORK:-1}" = "1" ] && [ -d "$VLLM_ROOT/.git" ]; then
+if [ "${USE_LOCAL_FORK:-0}" = "1" ] && [ -d "$VLLM_ROOT/.git" ]; then
+  if [ "$VLLM_ROOT" = "$HOME/vLLM-2080Ti-Definitive" ] && [ "${ALLOW_DAILY_FORK:-0}" != "1" ]; then
+    echo "拒绝改写日常实例 $VLLM_ROOT；确需如此请显式 ALLOW_DAILY_FORK=1" >&2
+    exit 1
+  fi
   if (cd "$VLLM_ROOT" && git diff --quiet -- vllm/model_executor/models/qwen3_next.py) \
      || ! grep -q kvmem_bridge "$TARGET"; then
     cp "$ROOT/vendor/vllm/kvmem_bridge.py" "$VLLM_ROOT/vllm/kvmem_bridge.py"
@@ -52,7 +60,7 @@ if [ "${USE_LOCAL_FORK:-1}" = "1" ] && [ -d "$VLLM_ROOT/.git" ]; then
   cp "$ROOT/vendor/vllm/kvmem_bridge.py" "$VLLM_ROOT/vllm/kvmem_bridge.py"
   echo "  本地 fork 已就绪: $VLLM_ROOT"
 else
-  python3 "$ROOT/scripts/prepare-backends.py" --engine vllm --check-tree
+  python3 "$ROOT/scripts/prepare-backends.py" --engine vllm
   VLLM_ROOT="$ROOT/engines/vllm"
   PY="$VLLM_ROOT/.venv/bin/python"
   [ -x "$PY" ] || {

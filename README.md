@@ -135,7 +135,7 @@ Three external pieces are required and are not vendored (`backends/versions.json
 
 | Piece | Pinned version | How it is obtained |
 |---|---|---|
-| vLLM SM75 fork | `93c9013e375b` + integration patch | `install.sh` fetches it and applies the patch (verifies `patched_tree`) |
+| vLLM SM75 fork | `93c9013e375b` + integration patch | `install.sh` fetches `base_commit` into `engines/vllm` and replaces it with `backends/patches/vllm-kvmem.patch` (verifies `patched_tree`); existing forks are never modified unless you pass `USE_LOCAL_FORK=1` |
 | kvmem sources | tag `v0.18.0` | same (the native extension needs its headers and library) |
 | Model weights | **any model vLLM can serve** (this deployment runs an FP8 + MTP export) | you provide them; point `MODEL` at the directory |
 

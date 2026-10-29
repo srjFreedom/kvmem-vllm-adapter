@@ -1352,8 +1352,12 @@ class VllmSparseRuntime:
         except Exception:
             return []
         pages = [v for v in values if v > 0]
-        # Pad to the engine's allocation quantum so its next block append is contiguous with the
-        # row (the append index is len(blocks) * pages_per_block).
+        # The quantum trim below is about the ENGINE's allocation: it appends a whole block
+        # (pages_per_block pages) at a time, so a partially filled block must not be treated as
+        # owned. A COMPACTED row is our own packed layout, where the tail page may sit at any
+        # rank - trimming it there throws away the newest page (the one the next token needs).
+        if st.row:
+            return pages
         quantum = int(self.pages_per_block)
         if quantum > 1 and pages:
             rem = len(pages) % quantum
@@ -1432,12 +1436,16 @@ class VllmSparseRuntime:
             # no-op there); gating it on the prefill flag broke streaming after a pressure
             # reselect made the row non-empty.
             last_rank = (start + n_new_tokens - 1) // self.page_tokens
+            shift = int(getattr(st, "page_shift", 0) or 0)
             if len(st.row) <= last_rank:
                 self._absorb_engine_row(req)
                 page_map = self._page_map[req]
                 grown = list(st.row)
                 while len(grown) <= last_rank:
-                    logical = len(grown)
+                    # The row is PACKED after a compaction: rank r holds logical page
+                    # `r + page_shift`. Growing from `len(grown)` was only right while the shift
+                    # was zero (before the first compaction).
+                    logical = len(grown) + shift
                     page = page_map.get(logical)
                     if page is None:
                         break
@@ -1453,7 +1461,7 @@ class VllmSparseRuntime:
                     # extended). Only if even that fails is the row genuinely out of space.
                     grown = list(st.row)
                     while len(grown) <= rank:
-                        logical = len(grown)
+                        logical = len(grown) + shift
                         page = self._page_map[req].get(logical)
                         if page is None:
                             self._grow_from_engine(req, grown, logical)
@@ -1716,6 +1724,19 @@ class VllmSparseRuntime:
 
     def _reselect(self, req, prefill_pressure=False, probe=False, rebuild=False):
         st = self._state[req]
+        # ALIGNMENT INVARIANT: a compaction may only run on a page boundary of the LOGICAL stream.
+        # The engine writes the next tokens at compacted positions starting at `visible`. If
+        # `logical - visible` is not a whole page, the tail logical page would be split across two
+        # ranks (part of it written under the old layout, part under the new one) and no single
+        # RoPE phase can describe it. Measured on 0.2.2: 207 of 238 compactions ran unaligned, the
+        # needle check compared against the same wrong delta so it passed, and the answers rotted.
+        # Defer instead: decode crosses a page boundary within <= page_tokens steps.
+        if int(st.tokens) % int(self.page_tokens):
+            if self.log is not None:
+                self.log({"kind": "compact_deferred_align", "req": req,
+                          "tokens": int(st.tokens), "seq_len": int(st.seq_len),
+                          "page": int(self.page_tokens)})
+            return st
         cap = getattr(self, "capture", None)
         if cap is not None and getattr(self, "retrieval_enabled", False):
             try:
@@ -1922,8 +1943,22 @@ class VllmSparseRuntime:
         else:
             sample = sorted(orch.resident)[:2] + sorted(orch.resident)[-2:]
         checks = {page: orch.needle(page) for page in sample}
+        # The needle alone is NOT enough: it compares the device copy against the STORED delta, so
+        # a wrong delta agrees with itself. Also check the delta the attention actually depends on:
+        # the page at rank r must be baked for (r - page) * page_tokens, and the physical slot the
+        # orchestrator holds must be the one the row points at.
+        rank_of_all = {int(pg): r for r, pg in enumerate(selected)}
+        rank_bad = []
+        for page in selected:
+            want = (rank_of_all[int(page)] - int(page)) * self.page_tokens
+            rank = rank_of_all[int(page)]
+            row_slot = int(st.row[rank]) if rank < len(st.row) else -1
+            if int(orch.baked_delta.get(int(page), 0)) != want or \
+                    int(orch.slot_of.get(int(page), -1)) != row_slot:
+                rank_bad.append(int(page))
         self.log({"kind": "needle", "req": req, "pages": len(checks),
                   "ok": all(v is True for v in checks.values()),
+                  "rot_ok": not rank_bad, "rot_bad": rank_bad[:4],
                   "detail": {str(k): bool(v) for k, v in checks.items()}})
         # Rotation reconciliation: the query tokens live at compacted positions
         # [st.seq_len, st.seq_len+n) and a page placed at rank r must be baked for

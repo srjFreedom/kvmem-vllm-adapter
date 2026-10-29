@@ -1515,3 +1515,241 @@ draft 砍掉；下一步 `num_new_tokens = num_tokens_with_spec - num_logical` �
 | 自由生成 1856 token | ✅ 无重复、正常收尾 |
 | 离线套件 | 43/43 ✅ |
 | 补丁 / 树哈希 | `prepare-backends --check-tree` ✅ |
+
+### 常驻模型（第 10 轮）：后端默认温度固定 0.3，请求自带温度照样覆盖
+
+**需求**：本机 DSH 客户端**不传** `temperature`，vLLM 上游默认 1.0 → 改代码时采样太散。
+要求后端默认固定 0.3，且请求里带的温度必须能覆盖默认值。
+
+**实现**（补丁内 4 个文件）：
+
+| 层 | 改动 | 为什么不够/必要 |
+|---|---|---|
+| `SamplingParams` 数据类默认值、`from_optional` 兜底（`None` → 0.3）| 1.0 → 0.3 | 离线 `LLM.generate`、未走协议层的调用兜底 |
+| chat / completion / responses 三个协议的 `_DEFAULT_SAMPLING_PARAMS["temperature"]` | 1.0 → 0.3 | **真正生效的那层**：请求没带温度时 `to_sampling_params` 先填这个值再进 `SamplingParams` |
+| `model.py::get_diff_sampling_param` | 丢弃模型 `generation_config.json` 的 `temperature` | 否则模型的 1.0 会盖掉上面两处（本部署 `generation_config.json` 写的是 1.0）。`top_k`/`top_p` 仍沿用（20 / 0.95）；`--override-generation-config` 显式给的 temperature 仍生效 |
+
+**验证**：
+
+| 用例 | 结果 |
+|---|---|
+| 解析（补丁树的 `ChatCompletionRequest.to_sampling_params`，default_sampling_params=`{top_k:20,top_p:0.95}`）| 不带 → **0.3**；`0` → **0.0**（贪心）；`0.9` → **0.9**；显式 `null` → **0.3** |
+| 启动日志 | 模型覆盖告警从 `{'temperature': 1.0, 'top_k': 20, 'top_p': 0.95}` 变为 `{'top_k': 20, 'top_p': 0.95}` |
+| 解码质量闸门（`temperature: 0` 显式）| 4/4 ✅ |
+| 4K / 8K needle（修正后的 `needle.py`）| ✅ 4.2s / 8.1s，两把 key |
+| 20K needle | ✅ 两把 key，23.2s |
+| 不带温度连续 3 次（DSH 路径）| 输出略有差异（0.3 随机采样）、无重复、语义正确 |
+| 补丁 / 树哈希 | `prepare-backends --check-tree` ✅（`patch_sha256` `6a123e8…`，`patched_tree` `76e57b9…`）|
+
+**顺带修正测试脚本（此前会误报）**：`routeA-tests/needle.py` 与 `needle2.py` 把 key 插在
+`i == TOKENS//12`（或 `TOKENS//10`）行，但干草堆只有约 `TOKENS/15` 行 → **key 从未插进去**，
+模型只能瞎猜（曾误判成「引擎在 90% 位置丢 KV」）。现在按行占比（10%/90%）插入；`needle.py`
+同时显式 `enable_thinking: false`，避免思维链吃满 `max_tokens` 导致 `content` 为空。
+
+### 常驻模型（第 11 轮）：前缀缓存命中挂死 —— prefill barrier 用错了计数
+
+**现象**：同一 prompt 第 2 次请求挂死（`Prefill progress: 100%` 之后不再出 token，`running=1/waiting=0`）；
+两个请求挂住后引擎两个槽位都被占死，后续请求全部超时。这正是用户说的「都要全量 prefill / 前缀命中有问题」。
+
+**隔离**（每次重启约 100s，均为经典模式、窗口 172032）：
+
+| 配置 | 结果 |
+|---|---|
+| 经典模式 + 前缀缓存开 | 第 1 次 `created 6464`，第 2 次挂死 |
+| 关掉视图安装（`KVMEM_NO_ROW/SEQ/POS=1`） | 仍挂死 |
+| **纯 vLLM**（`--no-kvmem`） | 仍挂死 → 与 kvmem 插件无关 |
+| 纯 vLLM + `mamba-cache-mode none` | 仍挂死 |
+| 纯 vLLM + 关投机解码（`SPECULATIVE_METHOD=none`） | 仍挂死 |
+
+**根因**：补丁为常驻模式把 6 处 prefill-barrier 判定从 `num_computed_tokens` 换成了
+`num_logical_tokens`，但**没有按 `kvmem_resident` 门控**。前缀缓存命中时 `num_computed_tokens`
+从缓存长度起算（例如 6464），而 `num_logical_tokens` 从 0 起、只累加本次调度的 token，
+于是 `num_logical < num_prompt` 永远成立：
+
+- 请求被永久当成「还在 prefill」→ `barrier_has_running_prefill=True`；
+- `defer_decode_for_prefill_batch` 每步把这个「prefill 同伙」的 decode 延后 → 一步都不跑。
+
+**修复**：新增 `Scheduler._kvmem_prompt_progress(request)`——常驻模式取 `num_logical_tokens`，
+否则取 `num_computed_tokens`（它才是包含前缀命中的那个计数）；6 处判定统一改用它。
+
+**验证**（经典模式、前缀缓存开、N=2、窗口 172032）：
+
+| 用例 | 结果 |
+|---|---|
+| 8.6K prompt ×3 | 6.60s（created 6464）→ **2.33s / 2.30s**（cached 6464） |
+| 57K prompt 冷/热 | 46.7s → **4.5s**（cached 50,096，≈10×） |
+| 并发两条相同 prompt | 3.55s / 3.19s，两条都命中 6464 |
+| 8K needle | ✅ 两把 key，8.1s |
+| 解码质量闸门 | 4/4 ✅ |
+| 补丁 / 树哈希 | `--check-tree` ✅（`patch_sha256 58a987c0…`，`tree a59c7ce2…`） |
+
+常驻模式（压缩开）仍保持强制关闭前缀缓存：块哈希按逻辑 token、KV 布局是压缩后的，两者不兼容。
+
+### 常驻模式重做（第 12 轮）：不变量落地，prefill 压缩仍被调度器握手挡住
+
+**本轮修掉的真问题（P1，已进补丁 `89cdaf01`→`95047358`）**：
+
+| 缺陷 | 位置 | 修法 |
+|---|---|---|
+| 压缩后「可见长度」不是整页，尾页被拆到两个 rank，任何单值 RoPE 相位都描述不了 | `_reselect` 的 `seq_len` | 压缩只允许发生在逻辑前沿按页对齐时（`compact_deferred_align`），`seq_len = n*page`，并新增 `page_shift` |
+| 行增长用 `logical = len(grown)`，只在 shift 为 0 时成立 | `after_step` | 按 `rank + page_shift` 取页 |
+| 写入页的旋转记为 `(物理 slot - page)`，而真实烘焙的是 `(rank - page)`；`needle()` 用同一个错值自校验，所以「检查全绿、答案腐烂」 | `commit_written_page` / `restore_page` | delta 改为按 RANK；`needle` 增加 `rot_ok`：逐页核对 `baked_delta == (rank-page)*page` 且 `slot_of == row[rank]` |
+| `_own_pages` 把行按 101 页量化截断，压缩后的 packed 行会丢掉尾页 | `_own_pages` | 只有引擎原始行才按量子截断，packed 行原样返回 |
+
+**新增测试**：`tests/resident_invariants_test.py`（I1 对齐、I2 尾页/下一 rank、I3 shift、I4 写入 delta、未对齐压缩被延后），离线套件 **43/43 ✅**。
+
+**实机验证**（常驻模式，`KVMEM_RESIDENT_PREFILL_COMPACT=0`）：
+83,448-token prompt，两把 key 都答对（80.8s）——说明 P1 没有退化 0.2.2 的能力。
+
+**被挡住的部分（P3 prefill 期压缩）**：打开后第一次压缩就崩：
+`FULL CUDA graph metadata topology mismatch … num_prefills: runtime=1, captured=0`。
+定位：压缩把 `num_computed` 回退后，调度器排出的下一步是一个「无 draft 的 5-token 批」
+（`num_scheduled_tokens=5`、`scheduled_spec_decode_tokens={}`），
+attention 元数据按「computed < prompt」判成 prefill，而图分发器按「5 == 1+4 draft」的均匀解码
+选了 FULL 图 → 拓扑不匹配。根因是两个「prefill 进度」口径在回退后不再一致
+（`num_computed_prefill_tokens` / `prefill_len` 与 `num_computed`），
+不是 P1 的相位/映射问题。
+
+**下一阶段要做的事**：把压缩决策从 worker 的 `after_step` 移到 EngineCore 的步边界——
+调度器在「本轮 drafts 已结算、下一步未排」时下发压缩指令，worker 在下一步的 `prepare_inputs`
+执行块表改写并回执；这样既不会被 draft 撞上，也不会产生那 5-token 的畸形批。
+在此之前 `KVMEM_RESIDENT_PREFILL_COMPACT` 保持 opt-in（默认关）。
+
+### 常驻模式重做（第 13 轮）：调度器侧「重算间隙」语义 —— 崩溃变卡住，还差自旋回滚
+
+**改了什么**（进补丁 `5be8bfbc`）：`_update_after_schedule` 里把 `num_logical` 的推进改成
+「间隙收缩」模型，而不是自由累加：
+
+```
+offset  <- offset - min(offset, scheduled)      # 压缩回退留下的重算量
+logical <- computed + offset                    # 每步重新推导，顺带自愈漂移
+```
+
+理由：压缩回退 `num_computed` 之后，引擎要把这段 token **重算**；它们早就服务过了，
+所以重算只能推进常驻计数，不能推进服务计数。之前的写法（`logical = computed + offset` 但 offset 不变）
+会在追赶阶段把服务计数抬高整整一个回退量。
+
+**实测（常驻 + `KVMEM_RESIDENT_PREFILL_COMPACT=1`，83K prompt）**：
+
+| 版本 | 结果 |
+|---|---|
+| 自由累加（0.2.2 原式） | 崩溃：`FULL CUDA graph ... num_prefills: runtime=1, captured=0` |
+| 只加 debt（不回写 offset） | 不崩，但请求永久卡住：`logical=83454 > tokens=83450` → `num_new_tokens < 0` |
+| 间隙收缩（本轮） | 不崩，仍卡住：`computed=83451 > tokens=83447`（**超出 4 = MTP draft 数**），`num_new_tokens < 0` |
+
+**根因（已定位到数字）**：压缩回退时，本步已经排进去的 draft 槽位（`1+4`）仍记在
+`num_computed` 里；回退/重算之后这些槽位没有对应的真实 token，于是 `computed` 最终比
+`num_tokens` 多 4，`num_new_tokens = tokens + placeholders - logical` 变负，请求再也排不上。
+
+**下一步（下一轮做）**：压缩必须由 EngineCore 在**步边界**发起，并在同一处把在途 draft 一起回滚：
+调度器先 cancels `spec_token_ids` + `num_output_placeholders`、清 `in_flight`，再下发
+`compact(visible)`；worker 在下一步 `prepare_inputs` 执行块表改写并回执。这样
+`computed`、`tokens`、`logical` 三者不会出现「重算超出书」的窗口。
+
+现状：`KVMEM_RESIDENT_PREFILL_COMPACT` 保持 opt-in，站点跑经典模式（压缩关、前缀缓存开），
+8.6K 第二次命中 6464（5.94s → 2.06s）✅。
+
+### 常驻模式重做（第 14 轮）：调试日志把卡死点定位到「压缩后的第一个 decode 步没有采样 token」
+
+打开 `KVMEM_DEBUG_SCHED=1` 后，调度器每步打印六个计数。83K prompt、压缩开，最后的序列是：
+
+```
+computed=81920 logical=81920 tokens=83440 sched=4096   # 倒数第二个 prefill chunk
+computed=83440 logical=83440 tokens=83440 sched=1520   # 最后一个 chunk，prompt=83440
+computed=83445 logical=83445 tokens=83441 sched=5      # 第一个 decode 步：1 + 4 draft 槽
+kvmem: prompt served but no sampled token … scheduled=5 placeholders=0
+kvmem: no new tokens … logical=83445 computed=83445 tokens=83441
+```
+
+结论：
+1. **间隙收缩是对的**：压缩发生在 65536（下一步 `computed=57344 logical=65536`），随后
+   `57344→61440→65536` 追赶期间 `logical` 纹丝不动，追平后恢复正常 —— 之前“服务计数被抬高”的问题消失了。
+2. 卡死的真正位置是**压缩之后第一个 decode 步**：调度器排了 5 个 KV 槽，模型跑完后
+   **没有产出采样 token**（`prompt served but no sampled token`），于是书只从 83440 长到 83441，
+   而 `computed` 按 5 个槽记到 83445 → `num_new_tokens = tokens + ph - logical = -4`，请求永久排不上。
+3. 没有采样 token 说明压缩后的**注意力元数据/位置窗口**在 prefill→decode 交界处不满足采样器要求
+   （sampler 按 `[query_end-(drafts+bonus), query_end)` 取 logits 行），也就是 P1 的
+   `_install`/`seq_len` 在“追赶完成后的第一步”仍有偏差——不是调度器计数问题。
+
+**下一步**：抓这一笔的 `prepare_inputs` 侧的 `seq_len/positions/row`（`KVMEM_DEBUG_POS=1` 已有），
+对齐 sampler 期望的 logits 行区间；修好后再看是否需要调度器回滚在途 draft。
+
+现状：站点经典模式运行中（压缩关、前缀缓存开），`KVMEM_RESIDENT_PREFILL_COMPACT` 仍 opt-in。
+
+### 常驻模式重做（第 15 轮）：宽口径 debug 对比出「运行时 seq_len 落后引擎 computed 一个 chunk」
+
+`KVMEM_DEBUG_POS` 现在每步同时打印：`positions`、`seq_len_buf`、`npc`（引擎 computed）、
+`nlg`（服务计数）、`plen`、`st_tokens/st_seq/st_shift`、`row_len/row_pages/spare`、`inflight`、`spec`。
+这样相邻两步可以直接对照。压缩前后的关键对比：
+
+| 步 | n | positions[0] | seq_len_buf | npc | nlg | plen | st_tokens | st_seq | row_len |
+|---|---|---|---|---|---|---|---|---|---|
+| prefill | 4096 | 69632 | 73728 | 73728 | 73728 | 83440 | 69632 | 69632 | 4352 |
+| prefill | 1520 | 77824 | 79344 | 81920 | 81920 | 83440 | 77824 | 77824 | 4864 |
+| **首个 decode** | 5 | 81920 | **81925** | **83440** | 83440 | 83440 | 81920 | **81920** | 5120 |
+
+结论：首个 decode 步里运行时认为「可见 81,920 token」，而引擎与 prompt 都是 **83,440**
+（差 1,520 = 最后一个 prefill chunk）。运行时用 `81925` 覆盖了 `seq_lens`、把 query 放在
+`81920..81924`，模型只看到 81,920 token，采样器按 `query_end` 取不到有效的 logits 行 →
+`prompt served but no sampled token` → 调度器 `num_new_tokens` 变负 → 永久卡住。
+
+**根因**：`after_step` 用 `_engine_computed`（上一步的值）回推 `seq_len`，而 `note_engine_computed`
+是在本步的 `prepare_inputs` 里才更新的 → `seq_len` 永远落后一个 chunk；平时被 `+= n_new_tokens`
+掩盖，但压缩后那一步的 `n` 与 chunk 长度不一致时就暴露成 1,520 的缺口。
+
+**下一步修法（下一轮）**：在 `before_step`/install 之前用**本步**的 `npc` 对一次账：
+`st.seq_len = npc - inflight`（对齐后再 install），并让 `page_shift` 随 `(tokens-seq_len)` 动态更新
+（现在它停在压缩时的 256，已过期）。
+
+### 常驻模式重做（第 16 轮）：seq_len 对账修好单请求长 prompt；N=2 与页对齐分块各有新问题
+
+**修好的一处（保留）**：`before_step` 在 install 之前用**本步**引擎计数对账
+（`book = nlg - n`、`resident = npc - n`、`page_shift` 随之重算），消除了「运行时 seq_len 落后
+一个 chunk」。实测（常驻 + prefill 压缩，84K prompt，单请求）连续 3 次都答对两把 key：
+
+| 次 | 墙钟 | 结果 |
+|---|---|---|
+| 1 | 95.9s | `J J J J7ND4X, GDW2LN`（前缀有噪声，两 key 正确） |
+| 2 | 80.0s | `BF5FCE, GTTPXD` ✅ |
+| 3 | 79.6s | `M85FR3, QX5ZLS` ✅ |
+
+**试了但回退的两处**：
+
+1. **页对齐分块**（让 chunk 边界落在 16 的整数倍，好让 prefill 压缩总能对齐）：
+   N=2 时压缩能触发（4 次），但两个请求都 500：
+   `FULL CUDA graph metadata topology mismatch … num_prefills: runtime=1, captured=0`；
+   N=1 时答案退化成 `S`（错误）。→ 已回退。
+
+2. **N=2 无页对齐**：两个 84K 并发都答对（157s），但 `compact_deferred_align` 14 次、
+   `compact_applied` 0 次——模板前缀把边界推到 `14 mod 16`，对齐门把所有 prefill 压缩挡掉。
+
+**结论**：单请求的常驻长 prompt 已经能压缩且正确；并发下的压缩仍会撞 CUDA graph 批分类
+（压缩后的追赶批被当成 5-token 均匀解码），需要改图分发器对「追赶批」的判定，而不是继续在
+运行时的位置/相位上打补丁。解码期压缩仍被 MTP draft 挡住（本轮两次 `reselect_deferred`）。
+
+现状：站点经典模式运行中；常驻 prefill 压缩 `opt-in`；补丁固定回 `4207168f…`（含 seq_len 对账
+与宽口径 debug）。
+
+### 仓库默认改回经典模式（第 17 轮）：别人拉下去就能命中前缀缓存
+
+**背景**：仓库默认脚本 `deploy/run-kvmem-vllm.sh` 之前默认
+`INREQUEST_COMPACTION=1` + `KVMEM_ENTRY_RESIDENT_PREFILL=1`（常驻压缩开），worker 据此
+**强制关闭前缀缓存**（`backends/vllm/worker.py`：压缩布局与逻辑 token 哈希不兼容）。
+也就是说别人拉仓库跑默认脚本，前缀缓存**命中不了**；只有站点脚本显式设 0 才走经典。
+而本周实测：常驻压缩在并发下压缩被对齐门挡住（`compact_applied` 0 次）、MTP 解码期
+压缩不触发（draft 槽位未回滚）——省显存的收益只在单请求长 prompt 上兑现，前缀缓存却
+整条丢了。
+
+**改动**（用户拍板选 A）：
+
+| 文件 | 改动 |
+|---|---|
+| `deploy/run-kvmem-vllm.sh` | `INREQUEST_COMPACTION` / `KVMEM_ENTRY_RESIDENT_PREFILL` 默认 `1` → `0`（经典），注释说明常驻为 opt-in |
+| `docs/PARAMETERS.md` | `--kvmem-inrequest-compaction` 默认 **开** → **关**；`KVMEM_ENTRY_RESIDENT_PREFILL` 默认 `1` → `0`（随内压缩自动打开） |
+
+**验证**：`bash -n` 通过；`DRYRUN=1` 输出确认默认不带 `--kvmem-inrequest-compaction`
+（第 110 行仅 `=1` 时追加）；worker 仅在该 flag 存在时强制关前缀缓存 → 默认启动 =
+经典模式 + 前缀缓存开，与站点生产同款（8.6K 热启动 2.3s、cached 6464 已验证）。
+
+**现状**：仓库默认 = 经典（有缓存、稳定）；常驻压缩仍是 opt-in（`INREQUEST_COMPACTION=1`），
+并发/解码期压缩的修复（图分发器对追赶批的判定 + MTP draft 回滚）仍未完成。

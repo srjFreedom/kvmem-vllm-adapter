@@ -1,5 +1,5 @@
 diff --git a/launcher.sh b/launcher.sh
-index 293891285b..4c2f9e5b45 100755
+index 2938912..4c2f9e5 100755
 --- a/launcher.sh
 +++ b/launcher.sh
 @@ -183,6 +183,13 @@ validate_configured_kv_concurrency() {
@@ -36,7 +36,7 @@ index 293891285b..4c2f9e5b45 100755
    if [[ -n "${REASONING_PARSER:-}" ]] && ! reasoning_parser_is_disabled; then
      VLLM_ARGS+=(--reasoning-parser "$REASONING_PARSER")
 diff --git a/profiles/2x2080Ti/README.md b/profiles/2x2080Ti/README.md
-index ffdddf99f1..89f1c6d717 100644
+index ffdddf9..89f1c6d 100644
 --- a/profiles/2x2080Ti/README.md
 +++ b/profiles/2x2080Ti/README.md
 @@ -10,7 +10,7 @@ Tested weight: [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP
@@ -49,7 +49,7 @@ index ffdddf99f1..89f1c6d717 100644
  
  ## Qwen3.8-27B-NVFP4
 diff --git a/profiles/2x2080Ti/README.zh-CN.md b/profiles/2x2080Ti/README.zh-CN.md
-index a42427102e..77ed9409af 100644
+index a424271..77ed940 100644
 --- a/profiles/2x2080Ti/README.zh-CN.md
 +++ b/profiles/2x2080Ti/README.zh-CN.md
 @@ -10,7 +10,7 @@
@@ -63,7 +63,7 @@ index a42427102e..77ed9409af 100644
  ## Qwen3.8-27B-NVFP4
 diff --git a/profiles/2x2080Ti/qwen27b/w4a16/mtp4-fp8kv-1x262K-text-image.env b/profiles/2x2080Ti/qwen27b/w4a16/mtp4-fp8kv-1x262K-text-image.env
 new file mode 100644
-index 0000000000..4214f1a3e4
+index 0000000..4214f1a
 --- /dev/null
 +++ b/profiles/2x2080Ti/qwen27b/w4a16/mtp4-fp8kv-1x262K-text-image.env
 @@ -0,0 +1,10 @@
@@ -79,7 +79,7 @@ index 0000000000..4214f1a3e4
 +MESSAGE_TYPE=text+image
 diff --git a/profiles/2x2080Ti/qwen27b/w4a16/mtp4-fp8kv-2x184K-text-image.env b/profiles/2x2080Ti/qwen27b/w4a16/mtp4-fp8kv-2x184K-text-image.env
 new file mode 100644
-index 0000000000..b0003ab595
+index 0000000..b0003ab
 --- /dev/null
 +++ b/profiles/2x2080Ti/qwen27b/w4a16/mtp4-fp8kv-2x184K-text-image.env
 @@ -0,0 +1,10 @@
@@ -97,7 +97,7 @@ diff --git a/profiles/2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x186K-text-image.env b/
 similarity index 81%
 rename from profiles/2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x186K-text-image.env
 rename to profiles/2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env
-index d1e12f7ddc..a790b9e7b2 100644
+index d1e12f7..a790b9e 100644
 --- a/profiles/2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x186K-text-image.env
 +++ b/profiles/2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env
 @@ -2,8 +2,8 @@ MODEL_FAMILY=qwen35
@@ -111,8 +111,279 @@ index d1e12f7ddc..a790b9e7b2 100644
  MAX_NUM_SEQS=1
  SPECULATIVE_METHOD=mtp
  SPECULATIVE_TOKENS=4
+diff --git a/tests/v1/core/test_kvmem_reconstruction.py b/tests/v1/core/test_kvmem_reconstruction.py
+new file mode 100644
+index 0000000..1ea97ff
+--- /dev/null
++++ b/tests/v1/core/test_kvmem_reconstruction.py
+@@ -0,0 +1,265 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""CPU-only reconstruction contract tests (also runnable with unittest directly).
++
++No weights, requests, model forward, CUDA allocation, or GPU inference is used.
++"""
++import threading
++import unittest
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import numpy as np
++import torch
++
++from vllm.sampling_params import SamplingParams
++from vllm.v1.core.sched.output import NewRequestData
++from vllm.v1.core.sched.request_queue import FCFSRequestQueue
++from vllm.v1.core.sched.scheduler import Scheduler
++from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, MambaSpec
++from vllm.v1.outputs import ModelRunnerOutput
++from vllm.v1.request import Request, RequestStatus
++from vllm.v1.worker.gpu.model_runner import GPUModelRunner
++from vllm.v1.worker.gpu.states import RequestState
++
++
++def make_scheduler(request):
++    # Exercise real scheduler methods without ModelConfig/weights/platform init.
++    scheduler = object.__new__(Scheduler)
++    scheduler.kvmem_resident = True
++    scheduler.kvmem_reconstruction_enabled = True
++    scheduler.use_v2_model_runner = True
++    scheduler.scheduler_config = SimpleNamespace(async_scheduling=False)
++    scheduler.cache_config = SimpleNamespace(enable_prefix_caching=False)
++    scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[])
++    scheduler.use_pp = False
++    scheduler.max_model_len = 128
++    scheduler.connector = scheduler.ec_connector = None
++    scheduler._kvmem_reconstruction_lock = threading.Lock()
++    scheduler._kvmem_pending_reconstructions = {}
++    scheduler.requests = {request.request_id: request}
++    scheduler.running = [request]
++    scheduler.waiting = FCFSRequestQueue()
++    scheduler.encoder_cache_manager = Mock()
++    scheduler.kv_cache_manager = Mock()
++    scheduler.kv_cache_manager.take_events.return_value = None
++    scheduler._inflight_prefills = {request}
++    scheduler._prefill_barrier_admission_blocked = set()
++    scheduler.reset_preempted_req_ids = set()
++    scheduler.finished_req_ids = set()
++    scheduler.finished_req_ids_dict = None
++    scheduler.grammar_compile_error_reqs = set()
++    scheduler.defer_block_free = False
++    scheduler.log_stats = False
++    scheduler.perf_metrics = None
++    scheduler.enable_return_routed_experts = False
++    scheduler.make_stats = Mock(return_value=None)
++    return scheduler
++
++
++def make_request():
++    request = Request("r", list(range(16)), SamplingParams(max_tokens=8), None)
++    request.status = RequestStatus.RUNNING
++    request.num_computed_tokens = 8  # Earlier compaction shrank resident KV.
++    request.num_logical_tokens = 16
++    request.num_kvmem_offset = 8
++    request.num_in_flight_tokens = 4  # Final original prefill is executing.
++    return request
++
++
++def finish_prefill(scheduler, request, sample=99):
++    return scheduler.update_from_output(
++        SimpleNamespace(
++            num_scheduled_tokens={request.request_id: 4},
++            total_num_scheduled_tokens=4,
++        ),
++        ModelRunnerOutput(
++            req_ids=[request.request_id], req_id_to_index={request.request_id: 0},
++            sampled_token_ids=[[sample]],
++        ),
++    )
++
++
++class ReconstructionSchedulerTest(unittest.TestCase):
++    def test_queue_is_immutable_and_commit_drops_original_sample(self):
++        request = make_request()
++        original_prompt_reference = request.prompt_token_ids
++        scheduler = make_scheduler(request)
++        selected = [0, 1, 12, 13, 14, 15]
++        reply = scheduler.queue_kvmem_reconstruction("r", selected)
++        selected[0] = 999  # Sender cannot alter queued payload after acknowledgement.
++        self.assertTrue(reply["queued"])
++        self.assertEqual(request.num_logical_tokens, 16)
++        self.assertEqual(request.num_in_flight_tokens, 4)
++        self.assertEqual(list(request.all_token_ids), list(range(16)))
++        scheduler.kv_cache_manager.free.assert_not_called()
++        request.spec_token_ids = [97, 98]
++        request.num_output_placeholders = 3
++        request.block_hashes[:] = [b"old hash"]
++        result = finish_prefill(scheduler, request)
++        self.assertEqual(result, {})  # No token 99 can reach output processor.
++        self.assertEqual(list(request.output_token_ids), [])
++        self.assertEqual(list(request.all_token_ids), [0, 1, 12, 13, 14, 15])
++        self.assertEqual(request.prompt_token_ids, list(request.all_token_ids))
++        self.assertEqual(original_prompt_reference, list(range(16)))
++        self.assertEqual(request.kvmem_original_num_prompt_tokens, 16)
++        self.assertEqual(request.num_prompt_tokens, 6)
++        for field in ("num_in_flight_tokens", "num_logical_tokens", "num_computed_tokens",
++                      "num_kvmem_offset", "num_output_placeholders", "num_stale_output_tokens"):
++            self.assertEqual(getattr(request, field), 0, field)
++        self.assertEqual(request.spec_token_ids, [])
++        self.assertEqual(request.block_hashes, [])
++        self.assertEqual(scheduler.running, [])
++        self.assertIs(scheduler.waiting.peek_request(), request)
++        self.assertEqual(request.status, RequestStatus.PREEMPTED)
++        scheduler.kv_cache_manager.free.assert_called_once_with(request)
++        self.assertEqual(scheduler.reset_preempted_req_ids, {"r"})
++        # V2's resumed branch sends this exact NewRequestData form.
++        fresh = NewRequestData.from_request(request, ([2, 3],), request._all_token_ids)
++        self.assertTrue(fresh.kvmem_rebuilt)
++        self.assertEqual(fresh.prompt_len, 6)
++        self.assertEqual(fresh.prefill_token_ids, [0, 1, 12, 13, 14, 15])
++        self.assertEqual((fresh.num_computed_tokens, fresh.num_logical_tokens), (0, 0))
++
++    def test_tp_duplicates_and_conflicts_before_and_after_commit(self):
++        request = make_request()
++        scheduler = make_scheduler(request)
++        ids = [0, 1, 15]
++        first = scheduler.queue_kvmem_reconstruction("r", ids)
++        self.assertEqual(scheduler.queue_kvmem_reconstruction("r", ids), first)
++        with self.assertRaisesRegex(ValueError, "different reconstruction"):
++            scheduler.queue_kvmem_reconstruction("r", [0, 1, 14])
++        finish_prefill(scheduler, request)
++        reply = scheduler.queue_kvmem_reconstruction("r", ids)
++        self.assertEqual(reply["skipped"], "already rebuilt")
++        scheduler.kv_cache_manager.free.assert_called_once()
++        with self.assertRaisesRegex(ValueError, "conflicting reconstruction"):
++            scheduler.queue_kvmem_reconstruction("r", [0, 1, 14])
++
++    def test_rejects_unsupported_and_late_transitions_without_mutation(self):
++        for mutation in (
++            lambda s, r: setattr(s, "kvmem_reconstruction_enabled", False),
++            lambda s, r: setattr(s.scheduler_config, "async_scheduling", True),
++            lambda s, r: setattr(s, "use_pp", True),
++            lambda s, r: setattr(s, "use_v2_model_runner", False),
++            lambda s, r: setattr(s.cache_config, "enable_prefix_caching", True),
++            lambda s, r: setattr(r, "num_logical_tokens", 12),
++            lambda s, r: setattr(r, "num_in_flight_tokens", 0),
++            lambda s, r: r.append_output_token_ids(7),
++            lambda s, r: setattr(r, "mm_features", [object()]),
++            lambda s, r: setattr(r, "resumable", True),
++        ):
++            request = make_request()
++            scheduler = make_scheduler(request)
++            mutation(scheduler, request)
++            with self.assertRaises(ValueError):
++                scheduler.queue_kvmem_reconstruction("r", [0, 1, 15])
++            self.assertEqual(scheduler._kvmem_pending_reconstructions, {})
++            self.assertEqual(request.prompt_token_ids, list(range(16)))
++            scheduler.kv_cache_manager.free.assert_not_called()
++
++    def test_non_rebuilt_request_has_no_state_change(self):
++        request = make_request()
++        scheduler = make_scheduler(request)
++        self.assertFalse(scheduler._apply_kvmem_reconstruction(request))
++        self.assertFalse(request.kvmem_rebuilt)
++        self.assertEqual(request.num_computed_tokens, 8)
++        scheduler.kv_cache_manager.free.assert_not_called()
++
++
++class CpuStagedBuffer:
++    def __init__(self, shape):
++        self.np = np.full(shape, -7, dtype=np.int32)
++        self.gpu = torch.from_numpy(self.np)
++        self.pending = []
++
++    def stage_write_elem(self, index, value):
++        self.pending.append((index, value))
++
++    def stage_write(self, index, start, values):
++        self.pending.append(((index, slice(start, start + len(values))), list(values)))
++
++    def apply_write(self):
++        for index, value in self.pending:
++            self.np[index] = value
++        self.pending.clear()
++
++    def copy_to_uva(self):
++        pass
++
++
++def cpu_request_state():
++    state = object.__new__(RequestState)
++    state.req_id_to_index = {"r": 0}
++    state.index_to_req_id = {0: "r"}
++    state.free_indices = []
++    state.max_seq_len = np.array([99], dtype=np.int32)
++    state.prompt_len = CpuStagedBuffer(1)
++    state.prefill_len = CpuStagedBuffer(1)
++    state.total_len = CpuStagedBuffer(1)
++    state.all_token_ids = CpuStagedBuffer((1, 32))
++    state.num_computed_prefill_tokens = np.array([99], dtype=np.int32)
++    state.num_computed_tokens_np = np.array([99], dtype=np.int32)
++    state.num_computed_tokens = CpuStagedBuffer(1)
++    state.num_cached_tokens = CpuStagedBuffer(1)
++    state.num_logical_tokens_np = np.array([99], dtype=np.int32)
++    state.draft_tokens = torch.full((1, 4), 99, dtype=torch.int64)
++    state.last_sampled_tokens = torch.full((1, 1), 99, dtype=torch.int64)
++    state.next_prefill_tokens = torch.full((2, 1), 99, dtype=torch.int32)
++    return state
++
++
++class ReconstructionWorkerTest(unittest.TestCase):
++    def test_fresh_admission_replaces_state_on_each_tp_rank(self):
++        groups = [
++            KVCacheGroupSpec(["mamba"], MambaSpec(
++                block_size=128, shapes=((1,),), dtypes=(torch.float32,),
++                num_speculative_blocks=2)),
++            KVCacheGroupSpec(["attention"], FullAttentionSpec(
++                block_size=16, num_kv_heads=1, head_size=1, dtype=torch.float32)),
++        ]
++        for rank in (0, 1):
++            with self.subTest(rank=rank):
++                runner = object.__new__(GPUModelRunner)
++                runner.req_states = cpu_request_state()
++                runner.model_state = Mock()
++                runner.pooling_runner = runner.pp_handler = runner.encoder_cache = None
++                runner.prompt_logprobs_worker = Mock()
++                runner.lora_state = Mock()
++                runner.adaptive_verification = None
++                runner.is_last_pp_rank = True
++                runner.sampler = Mock()
++                runner.block_tables = Mock()
++                runner.kv_cache_config = SimpleNamespace(kv_cache_groups=groups)
++                runner.kv_cache_group_ids = [0, 1]
++                runner.kv_caches = [torch.ones((8, 1, 1, 16)) for _ in groups]
++                fresh = NewRequestData(
++                    req_id="r", prompt_token_ids=[2, 7, 13], prefill_token_ids=[2, 7, 13],
++                    mm_features=[], sampling_params=SamplingParams(max_tokens=8),
++                    pooling_params=None, lora_request=None, block_ids=([2, 4, 6], [3]),
++                    num_computed_tokens=0, num_logical_tokens=0, kvmem_rebuilt=True,
++                )
++                runner.add_requests(SimpleNamespace(scheduled_new_reqs=[fresh]))
++                states = runner.req_states
++                self.assertEqual(states.all_token_ids.np[0, :3].tolist(), [2, 7, 13])
++                self.assertEqual(int(states.prompt_len.np[0]), 3)
++                self.assertEqual(int(states.prefill_len.np[0]), 3)
++                self.assertEqual(int(states.total_len.np[0]), 3)
++                self.assertEqual(int(states.num_computed_tokens.np[0]), 0)
++                self.assertEqual(int(states.num_logical_tokens_np[0]), 0)
++                self.assertEqual(int(states.num_computed_tokens_np[0]), 0)
++                self.assertEqual(int(states.max_seq_len[0]), 11)
++                self.assertFalse(states.last_sampled_tokens.any())
++                self.assertFalse(states.next_prefill_tokens.any())
++                self.assertFalse(states.draft_tokens.any())
++                runner.model_state.remove_request.assert_called_once_with("r")
++                runner.model_state.add_request.assert_called_once_with(0, fresh)
++                runner.block_tables.append_block_ids.assert_called_once_with(
++                    0, ([2, 4, 6], [3]), overwrite=True)
++                self.assertFalse(runner.kv_caches[0][[2, 4, 6]].any())
++                self.assertTrue(runner.kv_caches[0][[0, 1, 3, 5, 7]].all())
++                self.assertTrue(runner.kv_caches[1].all())
++
++
++if __name__ == "__main__":
++    unittest.main()
 diff --git a/vllm/config/observability.py b/vllm/config/observability.py
-index 0394245f3c..7ec782f45b 100644
+index 0394245..7ec782f 100644
 --- a/vllm/config/observability.py
 +++ b/vllm/config/observability.py
 @@ -82,11 +82,16 @@ class ObservabilityConfig:
@@ -135,7 +406,7 @@ index 0394245f3c..7ec782f45b 100644
      jit_monitor_mode: Literal["warn", "error"] = "warn"
      """How to handle post-warmup JIT compilation events."""
 diff --git a/vllm/entrypoints/launchers/api_server/routers.py b/vllm/entrypoints/launchers/api_server/routers.py
-index 39d670c019..36cd9bac61 100644
+index 39d670c..36cd9ba 100644
 --- a/vllm/entrypoints/launchers/api_server/routers.py
 +++ b/vllm/entrypoints/launchers/api_server/routers.py
 @@ -25,6 +25,12 @@ def register_api_routers(
@@ -152,7 +423,7 @@ index 39d670c019..36cd9bac61 100644
          attach_router as register_sagemaker_api_router,
      )
 diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
-index b7b292e835..0adceeb720 100644
+index b7b292e..0adceeb 100644
 --- a/vllm/entrypoints/openai/chat_completion/protocol.py
 +++ b/vllm/entrypoints/openai/chat_completion/protocol.py
 @@ -51,6 +51,7 @@ from vllm.sampling_params import (
@@ -173,7 +444,7 @@ index b7b292e835..0adceeb720 100644
              truncate_prompt_tokens=self.truncate_prompt_tokens,
              truncation_side=self.truncation_side,
 diff --git a/vllm/entrypoints/openai/chat_completion/serving.py b/vllm/entrypoints/openai/chat_completion/serving.py
-index 54da5329fd..ddbdd01553 100644
+index 54da532..ddbdd01 100644
 --- a/vllm/entrypoints/openai/chat_completion/serving.py
 +++ b/vllm/entrypoints/openai/chat_completion/serving.py
 @@ -69,6 +69,7 @@ from vllm.tokenizers import TokenizerLike
@@ -194,7 +465,7 @@ index 54da5329fd..ddbdd01553 100644
          mm_token_counts: dict[str, int] | None = None
          for i, engine_input in enumerate(engine_inputs):
 diff --git a/vllm/entrypoints/openai/completion/protocol.py b/vllm/entrypoints/openai/completion/protocol.py
-index 6d7a49bacd..678364a31f 100644
+index 6d7a49b..678364a 100644
 --- a/vllm/entrypoints/openai/completion/protocol.py
 +++ b/vllm/entrypoints/openai/completion/protocol.py
 @@ -35,6 +35,7 @@ from vllm.sampling_params import (
@@ -215,7 +486,7 @@ index 6d7a49bacd..678364a31f 100644
              truncate_prompt_tokens=self.truncate_prompt_tokens,
              truncation_side=self.truncation_side,
 diff --git a/vllm/entrypoints/openai/completion/serving.py b/vllm/entrypoints/openai/completion/serving.py
-index 2fa01478ce..c857a47708 100644
+index 2fa0147..c857a47 100644
 --- a/vllm/entrypoints/openai/completion/serving.py
 +++ b/vllm/entrypoints/openai/completion/serving.py
 @@ -48,6 +48,7 @@ from vllm.tokenizers import TokenizerLike
@@ -236,7 +507,7 @@ index 2fa01478ce..c857a47708 100644
          for i, engine_input in enumerate(engine_inputs):
              max_tokens = get_max_tokens(
 diff --git a/vllm/entrypoints/openai/responses/protocol.py b/vllm/entrypoints/openai/responses/protocol.py
-index 27c60967e5..6984872154 100644
+index 27c6096..6984872 100644
 --- a/vllm/entrypoints/openai/responses/protocol.py
 +++ b/vllm/entrypoints/openai/responses/protocol.py
 @@ -71,6 +71,7 @@ from vllm.sampling_params import (
@@ -257,7 +528,7 @@ index 27c60967e5..6984872154 100644
              truncate_prompt_tokens=-1 if self.truncation != "disabled" else None,
              max_total_tokens_param="max_model_len",
 diff --git a/vllm/entrypoints/openai/responses/serving.py b/vllm/entrypoints/openai/responses/serving.py
-index 2c61205e22..e4de8c73a0 100644
+index 2c61205..e4de8c7 100644
 --- a/vllm/entrypoints/openai/responses/serving.py
 +++ b/vllm/entrypoints/openai/responses/serving.py
 @@ -88,6 +88,7 @@ from vllm.sampling_params import SamplingParams, StructuredOutputsParams
@@ -297,10 +568,10 @@ index 2c61205e22..e4de8c73a0 100644
          orig_priority = priority
 diff --git a/vllm/entrypoints/serve/speedmeter/__init__.py b/vllm/entrypoints/serve/speedmeter/__init__.py
 new file mode 100644
-index 0000000000..e69de29bb2
+index 0000000..e69de29
 diff --git a/vllm/entrypoints/serve/speedmeter/api_router.py b/vllm/entrypoints/serve/speedmeter/api_router.py
 new file mode 100644
-index 0000000000..298977f3d8
+index 0000000..298977f
 --- /dev/null
 +++ b/vllm/entrypoints/serve/speedmeter/api_router.py
 @@ -0,0 +1,38 @@
@@ -344,10 +615,10 @@ index 0000000000..298977f3d8
 +    app.include_router(router)
 diff --git a/vllm/kvmem_bridge.py b/vllm/kvmem_bridge.py
 new file mode 100644
-index 0000000000..a2990acd60
+index 0000000..324c872
 --- /dev/null
 +++ b/vllm/kvmem_bridge.py
-@@ -0,0 +1,120 @@
+@@ -0,0 +1,541 @@
 +"""KVMem bridge: expose the current step's query to an out-of-tree policy layer.
 +
 +The hard constraint: under `torch.compile` (fullgraph) + CUDA Graph replay **no Python runs per
@@ -359,8 +630,13 @@ index 0000000000..a2990acd60
 +call into the graph, and the copies it performs are ordinary kernels that replay with the live
 +buffers. Buffers are allocated once, from outside the graph (`ensure()`), by the adapter.
 +
-+Keys do not need this bridge: they are already in the KV cache in post-RoPE form, and the policy
-+layer can read them and un-rotate using the original positions.
++Keys take the same route now: KVMem's design keeps its own mean-K statistics (`RawKvStore` with
++`n_layer = full-attention layers`, `n_embd_k = kv_heads*head_dim`, `block_tokens = 64`) and fills
++them from **device-side bucket sums of the pre-RoPE K**, exactly like the reference product
++program (`backends/ninfer/.../storage/memory_statistics.cpp: commit_memory_statistics`). The
++statistics store therefore needs no page bytes and no host-side dequantisation: the engine reduces
++per 64-token bucket while it already owns K, and the adapter only receives the small host copy of
++that step's bucket sums.
 +"""
 +from __future__ import annotations
 +
@@ -368,8 +644,19 @@ index 0000000000..a2990acd60
 +
 +import torch
 +
-+ARMED = os.environ.get("KVMEM_CAPTURE", "0") == "1"
++# Arming is OWNED BY THE ADAPTER, not the environment: vLLM spawns EngineCore/workers with a
++# filtered env (measured: `KVMEM_CAPTURE` absent in Worker_TP* while `KVMEM_CAPTURE_TOKENS` in the
++# same prefix survived), so an env-gated op was a silent no-op in every engine process. `ensure()`
++# is only called by the adapter when it actually wants the capture, so its success IS the arm.
++ARMED_ENV = os.environ.get("KVMEM_CAPTURE", "0") == "1"
++_ARMED = False
++ARMED = False
 +MAX_TOKENS = int(os.environ.get("KVMEM_CAPTURE_TOKENS", "64") or "64")
++# One vLLM step can hand the model up to `max_num_batched_tokens` rows (prefill chunk). The key
++# statistics only need one bucket row set per step, so this is a per-step capacity, not a context
++# buffer: the context-sized sums live in the adapter's RawKvStore.
++STEP_TOKENS = int(os.environ.get("KVMEM_CAPTURE_STEP_TOKENS", "8192") or "8192")
++BUCKET = 64
 +
 +_query: dict[int, torch.Tensor] = {}
 +_count: dict[int, torch.Tensor] = {}
@@ -377,42 +664,159 @@ index 0000000000..a2990acd60
 +_pos_count: torch.Tensor | None = None
 +_ready = False
 +_op_calls = 0        # how many times the custom op body actually ran (diagnostic)
-+_op_calls = 0        # how many times the custom op body actually ran (diagnostic)
++# Per-layer capture instrumentation. `_bad[layer]` is a DEVICE flag OR-ed on every capture (no host
++# sync in the hot path), so a harvest can say WHICH layers ever received a non-finite query and how
++# many times each layer was called at all - a zero query and a NaN query look identical otherwise.
++_bad: dict[int, torch.Tensor] = {}
++_calls: dict[int, int] = {}          # host counter, cheap (pure Python)
++_shapes: dict[int, tuple] = {}       # layer -> last (rows, heads, dim) written
++_probe: dict[int, list] = {}         # layer -> first few payload magnitudes (n, rows, absmax, pos)
++_nan: dict[int, torch.Tensor] = {}   # layer -> accumulated count of NaN elements ever seen
++_inf: dict[int, torch.Tensor] = {}   # layer -> accumulated count of inf elements ever seen
++# --- key statistics (mean-K) -------------------------------------------------------------
++# One FP32 sum row set per layer per step, indexed by `position // 64 - base` where base is the
++# step's first bucket. The adapter drains it every step (D2H) and writes it into kvmem's
++# RawKvStore, which is the only owner of the context-sized statistics.
++_KACC: dict[int, torch.Tensor] = {}   # layer -> (buckets, width) FP32 bucket sums
++_KROWS: dict[int, torch.Tensor] = {}  # layer -> (STEP_TOKENS, width) FP32 pre-RoPE K scratch
++_KIDX: dict[int, torch.Tensor] = {}   # layer -> (STEP_TOKENS,) int64 bucket index
++_KFLAG: dict[int, torch.Tensor] = {}  # layer -> (1,) int32 "a non-finite key was seen"
++# Geometry mismatches and refusals, counted so a silent drop can never masquerade as "no keys yet".
++# One reusable PAGEABLE host buffer per layer for the bucket drain. The drain runs once per step per
++# layer; allocating a fresh host tensor each time (`.to("cpu")`) put sustained pressure on the CUDA
++# pinned allocator and killed the engine at 88K ("Exception in pinned allocator free()"). Pageable,
++# not pinned: the copy is already a sync and pinning buys nothing here.
++_KHOST: dict[int, torch.Tensor] = {}
++# How many leading rows of a step may enter the bucket sums. 0 = all of them. On a decode step the
++# model writes 1 target + K draft rows, and only the target is guaranteed accepted; limiting the
++# accumulation to that first row keeps the statistics on the ACCEPTED timeline instead of letting
++# rejected drafts bias every bucket's mean key.
++KEY_ROWS_LIMIT = 0
++# Decode steps keep their (few) pre-RoPE rows instead of folding them into bucket sums: how many of
++# them were ACCEPTED is only known after the step, and a rejected draft must not enter the mean key.
++# Prefill chunks (thousands of rows) keep the bucket-sum path.
++ROWS_KEEP_MAX = 8
++_KEEP: dict[int, torch.Tensor] = {}
++_KEEP_N: dict[int, int] = {}
++_K_MISMATCH = [0]
++_K_MISMATCH_INFO: dict = {}
++_KV_HEADS = 0
++_KEY_WIDTH = 0
++_K_BUCKETS = 0
++# The model sees the COMPACTED position of a token; KVMem's statistics are keyed by the token's
++# TRUE (original) position, exactly like upstream, whose native execution keeps original RoPE
++# positions. The offset is a device tensor, not a Python constant, so a compiled graph keeps
++# reading the live value instead of a value baked in at trace time.
++_pos_offset: torch.Tensor | None = None
 +
 +
 +def ensure(layers: int, heads: int, head_dim: int, device="cuda", max_tokens: int | None = None,
-+           dtype: torch.dtype = torch.bfloat16) -> bool:
++           dtype: torch.dtype = torch.bfloat16, kv_heads: int | None = None,
++           force: bool = False) -> bool:
 +    """Allocate the buffers. Must be called outside any compiled region (adapter does this)."""
-+    global _positions, _pos_count, _ready
++    global _positions, _pos_count, _ready, _KV_HEADS, _KEY_WIDTH, _K_BUCKETS, _pos_offset
++    global _ARMED, ARMED
 +    take = int(max_tokens or MAX_TOKENS)
 +    # Allocate ONCE per process. The compiled graph and its CUDA-graph replay capture the buffer
 +    # pointers, so re-allocating later would leave the kernels writing into the old (freed) tensors
 +    # while `read()` looks at the new ones - which is exactly how the query silently vanished.
-+    if _ready:
++    if _ready and not force:
 +        return True
++    if force:
++        # AT A REQUEST BOUNDARY ONLY (no capture in flight): the geometry was wrong, so drop every
++        # buffer and rebuild at the right width. Swapping buffers mid-step killed EngineCore
++        # (EngineDeadError), which is why this is never done from the post-step hook.
++        for table in (_query, _count, _bad, _nan, _inf, _KACC, _KROWS, _KIDX, _KFLAG):
++            table.clear()
++    # Build into locals and publish only on success: a half-built bridge (some layers allocated,
++    # `_KV_HEADS` still 0) crashed the engine during warmup with `width // 0` after a CUDA OOM
++    # swallowed the allocation loop.
++    rows: dict[int, torch.Tensor] = {}
++    acc: dict[int, torch.Tensor] = {}
++    idx: dict[int, torch.Tensor] = {}
++    flag: dict[int, torch.Tensor] = {}
++    query: dict[int, torch.Tensor] = {}
++    count: dict[int, torch.Tensor] = {}
++    bad: dict[int, torch.Tensor] = {}
++    nan: dict[int, torch.Tensor] = {}
++    inf: dict[int, torch.Tensor] = {}
++    calls: dict[int, int] = {}
++    slab = None
++    ibuf = None
++    positions = None
++    pos_count = None
++    pos_offset = None
 +    try:
++        kvh = int(kv_heads or heads)
++        width = kvh * int(head_dim)
++        buckets = STEP_TOKENS // BUCKET + 2
++        # ONE scratch row set for all layers: layers run sequentially inside a step and the bucket
++        # sums are what must persist per layer, so 16 private (tokens x width) FP32 scratches would
++        # cost 16x the memory for nothing (measured: 536 MiB, which OOMed the KV pool fit).
++        slab = torch.zeros(STEP_TOKENS, width, dtype=torch.float32, device=device)
++        ibuf = torch.zeros(STEP_TOKENS, dtype=torch.int64, device=device)
 +        for layer in range(int(layers)):
-+            _query[layer] = torch.zeros(take, int(heads), int(head_dim), dtype=dtype,
-+                                        device=device)
-+            _count[layer] = torch.zeros(1, dtype=torch.int32, device=device)
-+        _positions = torch.zeros(take, dtype=torch.int64, device=device)
-+        _pos_count = torch.zeros(1, dtype=torch.int32, device=device)
-+        _ready = True
-+        return True
++            query[layer] = torch.zeros(take, int(heads), int(head_dim), dtype=dtype,
++                                       device=device)
++            count[layer] = torch.zeros(1, dtype=torch.int32, device=device)
++            bad[layer] = torch.zeros(1, dtype=torch.int32, device=device)
++            nan[layer] = torch.zeros(1, dtype=torch.int64, device=device)
++            inf[layer] = torch.zeros(1, dtype=torch.int64, device=device)
++            calls[layer] = 0
++            acc[layer] = torch.zeros(buckets, width, dtype=torch.float32, device=device)
++            rows[layer] = slab
++            idx[layer] = ibuf
++            flag[layer] = torch.zeros(1, dtype=torch.int32, device=device)
++        positions = torch.zeros(take, dtype=torch.int64, device=device)
++        pos_count = torch.zeros(1, dtype=torch.int32, device=device)
++        pos_offset = torch.zeros(1, dtype=torch.int64, device=device)
 +    except Exception:
 +        _ready = False
 +        return False
++    _query.update(query)
++    _count.update(count)
++    _bad.update(bad)
++    _nan.update(nan)
++    _inf.update(inf)
++    _KACC.update(acc)
++    _KROWS.update(rows)
++    _KIDX.update(idx)
++    _KFLAG.update(flag)
++    _calls.update(calls)
++    _ARMED = True
++    ARMED = True
++    _positions = positions
++    _pos_count = pos_count
++    _pos_offset = pos_offset
++    _KV_HEADS = int(kv_heads or heads)
++    _KEY_WIDTH = _KV_HEADS * int(head_dim)
++    _K_BUCKETS = STEP_TOKENS // BUCKET + 2
++    _ready = True
++    return True
 +
 +
 +# `mutates_args=("query",)` is what keeps inductor from deleting this node: an op with no declared
 +# mutation and a None result looks pure, and the graph compiler drops it (measured: the op body ran
 +# zero times after a clean compile). The op does not actually modify the query.
++# The buffer holds PRE-RoPE query rows, which is what kvmem's PageQueryView means by a query row
++# ("Post-normalization, pre-RoPE Q"). This fork fuses norm+rope, so the op inverts the rotation with
++# the token's own position - exact, because RoPE is an orthogonal rotation per position pair. Doing
++# it here removes the host-side un-rotate the adapter used to apply to every captured page.
++PRE_ROPE = True
++
++
++def pre_rope() -> bool:
++    """True when `read()` hands out pre-RoPE rows (the adapter must not rotate them again)."""
++    return PRE_ROPE
++
++
 +@torch.library.custom_op("kvmem::capture_q", mutates_args=("query",))
-+def capture_q(query: torch.Tensor, positions: torch.Tensor, layer: int) -> None:
++def capture_q(query: torch.Tensor, positions: torch.Tensor,
++              cos_sin_cache: torch.Tensor | None, rotary_dim: int, layer: int) -> None:
 +    """Opaque to dynamo; the body below is plain tensor work executed at capture/replay time."""
 +    global _op_calls
 +    _op_calls += 1
-+    if not ARMED:
++    if not _ARMED:
 +        return None
 +    layer = int(layer)
 +    buf = _query.get(layer)
@@ -424,10 +828,34 @@ index 0000000000..a2990acd60
 +        query = query.view(query.shape[0], buf.shape[1], buf.shape[2])
 +    n = query.shape[0]
 +    take = MAX_TOKENS if n > MAX_TOKENS else n
-+    if n > MAX_TOKENS:
-+        buf.copy_(query[n - MAX_TOKENS:])
-+    else:
-+        buf[:n].copy_(query)
++    # Keep a FINITE payload only. A non-finite query poisons the whole retrieval ranking (the layer
++    # mean becomes NaN, every cosine NaN, and the compacted view then keeps arbitrary blocks instead
++    # of the ones matching the question), so a bad step must leave the previous good payload in
++    # place instead of overwriting it. `torch.where` needs only the device-side predicate, so this
++    # still performs no host synchronisation in the hot path.
++    src = query[n - MAX_TOKENS:] if n > MAX_TOKENS else query
++    dst = buf if n > MAX_TOKENS else buf[:n]
++    take = dst.shape[0]
++    rows = src.to(torch.float32)
++    rd = int(rotary_dim)
++    if rd > 0 and rd % 2 == 0 and rows.shape[-1] >= rd and cos_sin_cache is not None:
++        half = rd // 2
++        pos = positions if positions.ndim == 1 else positions[0]
++        pos = pos[n - MAX_TOKENS:] if n > MAX_TOKENS else pos
++        table = cos_sin_cache.index_select(0, pos)          # (rows, rd) = [cos | sin]
++        cos = table[:, :half].unsqueeze(-2)                  # (rows, 1, half)
++        sin = table[:, half:rd].unsqueeze(-2)
++        x1 = rows[..., :half]
++        x2 = rows[..., half:rd]
++        rows = rows.clone()
++        rows[..., :half] = x1 * cos + x2 * sin               # inverse rotation
++        rows[..., half:rd] = x2 * cos - x1 * sin
++    try:
++        ok_all = torch.isfinite(rows).all()
++        torch.where(torch.isfinite(rows), rows.to(dst.dtype), dst, out=dst)
++    except Exception:
++        ok_all = None
++        dst.copy_(rows.to(dst.dtype))
 +    # M-RoPE hands in [3, tokens] (one row per spatial axis); text is the identity, so the first
 +    # row is the token position. Flattening it instead made 3*tokens values for n tokens.
 +    pos = positions if positions.ndim == 1 else positions[0]
@@ -435,8 +863,42 @@ index 0000000000..a2990acd60
 +        pos_buf.copy_(pos[n - MAX_TOKENS:])
 +    else:
 +        pos_buf[:n].copy_(pos)
-+    _count[layer].fill_(take)
-+    _pos_count.fill_(take)
++    # The published length may only advance when the WHOLE payload was finite: `read()` returns
++    # `buf[:count]`, so advancing `count` after keeping the previous payload would hand out a mix of
++    # old rows and whatever the bad step left behind. Device-side select, so no host sync.
++    try:
++        cnt_val = torch.full_like(_count[layer], take)
++        if ok_all is not None:
++            cnt_val = torch.where(ok_all, cnt_val, _count[layer])
++        _count[layer].copy_(cnt_val)
++        _pos_count.copy_(torch.where(cnt_val > 0, cnt_val, _pos_count))
++    except Exception:
++        _count[layer].fill_(take)
++        _pos_count.fill_(take)
++    # Evidence counters, all DEVICE side (no `.item()`), so the harvest can report exactly how much
++    # of the query was non-finite without disturbing the hot path.
++    try:
++        _calls[layer] = int(_calls.get(layer, 0)) + 1
++        _shapes[layer] = tuple(int(d) for d in query.shape)
++        flag = _bad.get(layer)
++        if flag is not None:
++            flag[0] += (~torch.isfinite(query)).any().to(torch.int32)
++        nanc = _nan.get(layer)
++        if nanc is not None:
++            nanc[0] += torch.isnan(query).sum()
++        infc = _inf.get(layer)
++        if infc is not None:
++            infc[0] += torch.isinf(query).sum()
++        # Probe the FIRST few payloads of every layer with a host sync. That is the window that
++        # answers "was the query already broken during prefill, or only for the step that happened to
++        # write last?" - and it costs nothing in steady state because it stops after PROBE_CALLS.
++        if int(_calls[layer]) <= 5:
++            rec = _probe.setdefault(int(layer), [])
++            rec.append({"n": int(n), "rows": int(query.shape[0]),
++                        "absmax": float(query.abs().max()),
++                        "pos": [int(v) for v in pos[:3].tolist()] if pos is not None else None})
++    except Exception:
++        pass
 +    # NOTE: no `.item()` / host sync here. This body also runs while CUDA graphs are being captured,
 +    # where a device->host synchronisation aborts the capture ("operation failed due to a previous
 +    # error during capture").
@@ -444,8 +906,238 @@ index 0000000000..a2990acd60
 +
 +
 +@capture_q.register_fake
-+def _(query, positions, layer):
++def _(query, positions, cos_sin_cache, rotary_dim, layer):
 +    return None
++
++
++# `mutates_args` again only to keep the node: the op writes module-owned buffers, never `key`.
++@torch.library.custom_op("kvmem::capture_k", mutates_args=("key",))
++def capture_k(key: torch.Tensor, positions: torch.Tensor, cos_sin_cache: torch.Tensor | None,
++              rotary_dim: int, layer: int) -> None:
++    """Accumulate this step's pre-RoPE K into per-64-token bucket sums (FP32).
++
++    Upstream fills the same statistic inside its own kernel, where K is still pre-RoPE
++    (`memory_statistics.cpp: commit_memory_statistics -> RawKvStore::write_layer_mean_sum`).
++    This fork fuses norm+rope into one Triton kernel, so pre-RoPE K never materialises; rotating
++    back with the token's own position is exact (RoPE is an orthogonal rotation per position
++    pair) and reproduces precisely what upstream sums: the bucket's token sum of the pre-RoPE key.
++    """
++    if not _ARMED or not _ready or _KV_HEADS <= 0:
++        return None
++    layer = int(layer)
++    acc = _KACC.get(layer)
++    rows = _KROWS.get(layer)
++    idx = _KIDX.get(layer)
++    if acc is None or rows is None or idx is None:
++        return None
++    # M-RoPE hands in [3, tokens] (one row per spatial axis); the text identity is the first row.
++    # Indexing a 2-D tensor here raised "Index is supposed to be an empty tensor or a vector" during
++    # the warmup pass (which is the one place this fork feeds 3-row positions).
++    if positions.dim() != 1:
++        positions = positions[0] if positions.dim() == 2 else positions.reshape(-1)
++    width = int(acc.shape[1])
++    if int(key.shape[-1]) != width or width % _KV_HEADS:
++        # A configured width that disagrees with the model's own KV width is a real geometry error.
++        # It used to `return None` silently, and that is exactly how EVERY key was dropped while the
++        # statistics store kept filling with zeros (measured: mean_k absmax = 0 on every block,
++        # core scores all 0.0 while the legacy index ranked normally). Record it, loudly.
++        _K_MISMATCH[0] = int(_K_MISMATCH[0]) + 1
++        if _K_MISMATCH[0] == 1:
++            _K_MISMATCH_INFO.update({"key_cols": int(key.shape[-1]), "width": width,
++                                     "kv_heads": int(_KV_HEADS)})
++        return None
++    n = int(min(int(key.shape[0]), int(rows.shape[0])))
++    if KEY_ROWS_LIMIT:
++        n = min(n, int(KEY_ROWS_LIMIT))
++    if n <= 0:
++        return None
++    x = key[:n].to(torch.float32)
++    if x.dim() == 2:
++        x = x.view(n, _KV_HEADS, width // _KV_HEADS)
++    out = rows[:n].view(n, _KV_HEADS, width // _KV_HEADS)
++    out.copy_(x)
++    rd = int(rotary_dim)
++    if rd > 0 and rd % 2 == 0 and x.shape[-1] >= rd and cos_sin_cache is not None:
++        half = rd // 2
++        table = cos_sin_cache.index_select(0, positions[:n])   # (n, rd) = [cos | sin]
++        cos = table[:, :half].unsqueeze(1)                     # (n, 1, half)
++        sin = table[:, half:rd].unsqueeze(1)
++        x1 = x[..., :half]
++        x2 = x[..., half:rd]
++        out[..., :half].copy_(x1 * cos + x2 * sin)             # inverse rotation
++        out[..., half:rd].copy_(x2 * cos - x1 * sin)
++    # A non-finite key row must never enter the statistics: one NaN poisons that bucket's mean key
++    # and every cosine that reads it. Scrub in place and record the layer (device side, no sync).
++    finite = torch.isfinite(out)
++    try:
++        flag = _KFLAG.get(layer)
++        if flag is not None:
++            flag[0] += (~finite.all()).to(torch.int32)
++    except Exception:
++        pass
++    out.nan_to_num_(0.0, 0.0, 0.0)
++    if n <= ROWS_KEEP_MAX:
++        # Decode: publish the rows themselves; the harvest folds the accepted ones.
++        keep = _KEEP.get(layer)
++        if keep is None or keep.shape[1] != width:
++            keep = torch.zeros(ROWS_KEEP_MAX, width, dtype=torch.float32, device=out.device)
++            _KEEP[layer] = keep
++        keep[:n].copy_(out.view(n, width))
++        _KEEP_N[layer] = n
++        return None
++    # Bucket index: absolute TRUE bucket minus this step's first TRUE bucket, so one row set per
++    # layer per step is enough no matter how far into the context the step sits.
++    try:
++        off = _pos_offset[0] if _pos_offset is not None else 0
++        true_pos = positions[:n] + off
++        base = true_pos[0] // BUCKET
++        bidx = (true_pos // BUCKET) - base
++        torch.clamp(bidx, 0, acc.shape[0] - 1, out=idx[:n])
++        acc.index_add_(0, idx[:n], out.view(n, width))
++    except Exception:
++        pass
++    return None
++
++
++@capture_k.register_fake
++def _(key, positions, cos_sin_cache, rotary_dim, layer):
++    return None
++
++
++def set_position_offset(offset: int) -> None:
++    """Publish the compacted->true position offset for the coming step (host side, outside the graph).
++
++    The model runs at compacted positions once the adapter has compacted a request, while KVMem's
++    statistics are keyed by the token's true position. The op reads this device tensor, so a CUDA
++    graph replays with the live value.
++    """
++    if _pos_offset is None:
++        return
++    try:
++        _pos_offset.fill_(int(offset))
++    except Exception:
++        pass
++
++
++def step_tokens() -> int:
++    """How many token rows the last captured step carried (host sync; step boundary only).
++
++    NOTE: the query window is the last `MAX_TOKENS` tokens, so this is the QUERY row count, not
++    necessarily the step's scheduled token count. Bucket boundaries are derived by the adapter from
++    the scheduler's own (start, count) pair, never from this buffer.
++    """
++    if _pos_count is None:
++        return 0
++    return int(_pos_count.item())
++
++
++def read_key_rows(layer: int, take: int):
++    """Host copy of the first `take` kept decode rows for `layer` (empty tensor when none)."""
++    keep = _KEEP.get(int(layer))
++    n = int(_KEEP_N.get(int(layer), 0) or 0)
++    if keep is None or n <= 0 or take <= 0:
++        return None
++    count = min(int(take), n)
++    host = _KHOST.get(int(layer))
++    if host is None or host.shape[1] != keep.shape[1]:
++        host = torch.empty((keep.shape[0], keep.shape[1]), dtype=torch.float32, device="cpu")
++        _KHOST[int(layer)] = host
++    host[:count].copy_(keep[:count], non_blocking=False)
++    _KEEP_N[int(layer)] = 0          # one-shot per step
++    return host[:count]
++
++
++def _host_copy(view: torch.Tensor) -> torch.Tensor:
++    """Host copy of a device slice, never aliasing the source.
++
++    Two traps met in order: `.to("cpu")` returns the SAME tensor when it is already on CPU (so
++    zeroing the source zeroed the "copy" - every bucket read back 0), and dropping the `.to("cpu")`
++    to fix that handed numpy a CUDA tensor (`can't convert cuda:1 device type tensor to numpy`).
++    """
++    out = view.detach().to("cpu", non_blocking=False)
++    if out.data_ptr() == view.data_ptr():      # same-device .to() returned a view
++        out = out.clone()
++    return out.contiguous()
++
++
++def read_key_buckets(layer: int, span: int):
++    """Drain `layer`'s bucket sums for the step: float32 [span, width] host copy, or None.
++
++    Draining here (a step-boundary call, outside the graph) is what keeps the buffer per step
++    instead of per context: the context-sized copy lives in the adapter's RawKvStore.
++    """
++    acc = _KACC.get(int(layer))
++    if acc is None:
++        return None
++    take = max(0, min(int(span), int(acc.shape[0])))
++    if take == 0:
++        return None
++    host = _KHOST.get(int(layer))
++    if host is None or host.shape[1] != acc.shape[1] or host.device.type != "cpu":
++        host = torch.empty((acc.shape[0], acc.shape[1]), dtype=torch.float32, device="cpu")
++        _KHOST[int(layer)] = host
++    host[:take].copy_(acc[:take], non_blocking=False)     # reuse: no allocation, no pinning
++    try:
++        acc.zero_()
++    except Exception:
++        pass
++    return host[:take]
++
++
++def peek_key_buckets(layer: int, span: int):
++    """Same as read_key_buckets without draining (diagnostics / aborted steps)."""
++    acc = _KACC.get(int(layer))
++    if acc is None:
++        return None
++    take = max(0, min(int(span), int(acc.shape[0])))
++    if take == 0:
++        return None
++    return _host_copy(acc[:take])
++
++
++def key_diag():
++    """Key-capture counters (host sync per layer)."""
++    out = {"layers": len(_KACC), "buckets": _K_BUCKETS, "width": _KEY_WIDTH, "bad": {},
++           "mismatch": int(_K_MISMATCH[0]), "mismatch_info": dict(_K_MISMATCH_INFO)}
++    try:
++        for layer in sorted(_KFLAG):
++            count = int(_KFLAG[layer].item())
++            if count:
++                out["bad"][int(layer)] = count
++    except Exception:
++        pass
++    return out
++
++
++def capture_diag():
++    """Which layers were ever called, how often, with what payload shape, and which ever received a
++    non-finite query. One host sync per reported layer, so this is meant for reselect-time logging."""
++    out = {"calls": {}, "last_rows": {}, "nonfinite_layers": [], "last_count": {}}
++    try:
++        for layer in sorted(_query):
++            c = int(_calls.get(layer, 0))
++            if c <= 0:
++                continue
++            out["calls"][int(layer)] = c
++            shp = _shapes.get(layer)
++            if shp:
++                out["last_rows"][int(layer)] = int(shp[0])
++            flag = _bad.get(layer)
++            if flag is not None and int(flag.item()) > 0:
++                out["nonfinite_layers"].append(int(layer))
++            cnt = _count.get(layer)
++            if cnt is not None:
++                out["last_count"][int(layer)] = int(cnt.item())
++            nz = _nan.get(layer)
++            if nz is not None and int(nz.item()) > 0:
++                out.setdefault("nan_elems", {})[int(layer)] = int(nz.item())
++            iz = _inf.get(layer)
++            if iz is not None and int(iz.item()) > 0:
++                out.setdefault("inf_elems", {})[int(layer)] = int(iz.item())
++        out["probe"] = {int(k): v for k, v in list(_probe.items())[:4]}
++    except Exception:
++        pass
++    return out
 +
 +
 +def read(layer: int):
@@ -470,7 +1162,7 @@ index 0000000000..a2990acd60
 +    return {layer: read(layer) for layer in list(_query)}
 diff --git a/vllm/kvmem_limits.py b/vllm/kvmem_limits.py
 new file mode 100644
-index 0000000000..913486700a
+index 0000000..9134867
 --- /dev/null
 +++ b/vllm/kvmem_limits.py
 @@ -0,0 +1,21 @@
@@ -496,7 +1188,7 @@ index 0000000000..913486700a
 +        return int(max_model_len)
 +    return ctx if ctx > 0 else int(max_model_len)
 diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
-index e3e8b37369..c7c84707a3 100644
+index e3e8b37..c7c8470 100644
 --- a/vllm/model_executor/layers/quantization/modelopt.py
 +++ b/vllm/model_executor/layers/quantization/modelopt.py
 @@ -2502,6 +2502,11 @@ class ModelOptLinearMethod(LinearMethodBase):
@@ -512,7 +1204,7 @@ index e3e8b37369..c7c84707a3 100644
          layer.input_size_per_partition = input_size_per_partition
          layer.output_size_per_partition = sum(output_partition_sizes)
 diff --git a/vllm/model_executor/models/qwen3_next.py b/vllm/model_executor/models/qwen3_next.py
-index 495650eb19..70711540d2 100644
+index 495650e..74cc73e 100644
 --- a/vllm/model_executor/models/qwen3_next.py
 +++ b/vllm/model_executor/models/qwen3_next.py
 @@ -6,6 +6,8 @@ from collections.abc import Iterable
@@ -524,28 +1216,87 @@ index 495650eb19..70711540d2 100644
  from torch import nn
  
  from vllm.compilation.decorators import support_torch_compile
-@@ -421,6 +423,9 @@ class Qwen3NextAttention(nn.Module):
+@@ -280,6 +282,29 @@ class Qwen3NextAttention(nn.Module):
+         prefix: str = "",
+     ) -> None:
+         super().__init__()
++        # KVMem retrieval needs a STABLE per-layer slot id, and it must be the FULL-ATTENTION
++        # ORDINAL, not the model layer index:
++        #   * the key side fills the index with `for layer, page_bytes in enumerate(kvs)`, where
++        #     `kvs` is the list of paged full-attention KV tensors (`_paged_attn_tensors` keeps the
++        #     `kv_caches` order), so the key side is numbered 0..N_full-1;
++        #   * the query side (`capture_q`) must use the SAME numbering or the mean over layers
++        #     mixes different layers - and a raw model index is also out of range for the index
++        #     (`IndexError: index 19 is out of bounds for dimension 0 with size 17`).
++        # Without any id every layer reported 0, all 64 layers overwrote one buffer and the
++        # harvest saw a single layer (`counts={"0": 1}`, `layers_fed=0`) -> "no query captured".
++        self.layer_idx = extract_layer_index(prefix) if prefix else 0
++        _ltypes = list(getattr(config, "layer_types", None) or ())
++        if _ltypes and self.layer_idx < len(_ltypes):
++            self.kvmem_layer_slot = sum(
++                1 for _t in _ltypes[: self.layer_idx] if "full" in str(_t))
++        elif _ltypes:
++            # A layer OUTSIDE the declared stack (the MTP draft layer is one: the paged KV list has
++            # 17 tensors for 16 full-attention layers). It has no natural slot, and guessing one
++            # would overwrite a real layer's query, so mark it and let the bridge skip it
++            # (`_query.get(-1)` is None -> no capture).
++            self.kvmem_layer_slot = -1
++        else:
++            self.kvmem_layer_slot = self.layer_idx
+         self.config = config
+         self.hidden_size = config.hidden_size
+         tp_size = get_tensor_model_parallel_world_size()
+@@ -421,6 +446,25 @@ class Qwen3NextAttention(nn.Module):
                      else None
                  ),
              )
 +            # Unconditional so the op is always traced into the graph; it is a no-op until the
 +            # adapter has allocated its buffers (see kvmem_bridge.ARMED / ensure()).
-+            torch.ops.kvmem.capture_q(q, positions, int(getattr(self, "layer_idx", 0)))
++            torch.ops.kvmem.capture_q(
++            q,
++            positions,
++            self.rotary_emb.cos_sin_cache,
++            int(self.rotary_emb.rotary_dim),
++            int(getattr(self, "kvmem_layer_slot", 0)),
++        )
++            # KVMem mean-K statistics: upstream fills these from pre-RoPE K inside its own kernel
++            # (memory_statistics.cpp). The op inverts this fork's fused norm+rope per token, which
++            # reproduces exactly that quantity, and reduces it into 64-token FP32 bucket sums.
++            torch.ops.kvmem.capture_k(
++                k,
++                positions,
++                self.rotary_emb.cos_sin_cache,
++                int(self.rotary_emb.rotary_dim),
++                int(getattr(self, "kvmem_layer_slot", 0)),
++            )
              return q, k, v, gate
  
          if self.attn_output_gate:
-@@ -443,6 +448,9 @@ class Qwen3NextAttention(nn.Module):
+@@ -443,6 +487,22 @@ class Qwen3NextAttention(nn.Module):
              -1, self.num_kv_heads * self.head_dim
          )
          q, k = self.rotary_emb(positions, q, k)
 +        # KVMem bridge: unconditional call so the op is traced into the graph even if the env var
 +        # is evaluated differently in the engine process; the op itself is a no-op when not armed.
-+        torch.ops.kvmem.capture_q(q, positions, int(getattr(self, "layer_idx", 0)))
++        torch.ops.kvmem.capture_q(
++            q,
++            positions,
++            self.rotary_emb.cos_sin_cache,
++            int(self.rotary_emb.rotary_dim),
++            int(getattr(self, "kvmem_layer_slot", 0)),
++        )
++        torch.ops.kvmem.capture_k(
++            k,
++            positions,
++            self.rotary_emb.cos_sin_cache,
++            int(self.rotary_emb.rotary_dim),
++            int(getattr(self, "kvmem_layer_slot", 0)),
++        )
          return q, k, v, gate
  
      def forward(
 diff --git a/vllm/renderers/base.py b/vllm/renderers/base.py
-index 4aca17fa43..08d70fa4b6 100644
+index 4aca17f..08d70fa 100644
 --- a/vllm/renderers/base.py
 +++ b/vllm/renderers/base.py
 @@ -57,6 +57,7 @@ from .inputs import (
@@ -574,8 +1325,43 @@ index 4aca17fa43..08d70fa4b6 100644
              do_lower_case=encoder_config.get("do_lower_case", False),
              add_special_tokens=False,
          )
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 81bd6eb..891d194 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -881,6 +881,13 @@ def _check_enough_kv_cache_memory(
+     max_model_len: int,
+     estimate_max_model_len: Callable[[int], int],
+ ):
++    # KVMem: guard the INNER check so BOTH callers are covered (guarding only the outer one left the
++    # unified-memory path raising "To serve at least one request with the model's max seq len").
++    if os.environ.get("KVMEM_SKIP_KV_CHECK", "") == "1":
++        logger.warning_once(
++            "KVMEM_SKIP_KV_CHECK=1: skipping the KV cache capacity check "
++            "(max_model_len may exceed the pool; the adapter keeps residency bounded)")
++        return
+     if available_memory <= 0:
+         raise ValueError(
+             "No available memory for the cache blocks. "
+@@ -996,6 +1003,16 @@ def check_enough_kv_cache_memory(
+         ValueError: If there is not enough memory available for the KV cache.
+     """
+ 
++    # KVMem: the adapter serves prompts LONGER than the physical pool by keeping only a working set
++    # resident, so the stock invariant "the pool must hold one full max_model_len sequence" is exactly
++    # what it violates on purpose. KVMEM_SKIP_KV_CHECK=1 turns the check off (the window then exceeds
++    # what the pool can hold, and the adapter's compaction is responsible for residency).
++    if os.environ.get("KVMEM_SKIP_KV_CHECK", "") == "1":
++        logger.warning_once(
++            "KVMEM_SKIP_KV_CHECK=1: skipping the KV cache capacity check "
++            "(max_model_len may exceed the pool; the adapter must keep residency bounded)")
++        return
++
+     # No need to check for available memory if the kv_cache_spec is empty
+     if kv_cache_spec:
+         # Reserve the null block BlockPool permanently holds back, so the check
 diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
-index 87fdbfb164..374c481070 100644
+index 87fdbfb..0f73e6c 100644
 --- a/vllm/v1/core/sched/output.py
 +++ b/vllm/v1/core/sched/output.py
 @@ -2,7 +2,7 @@
@@ -587,7 +1373,7 @@ index 87fdbfb164..374c481070 100644
  from functools import cached_property
  from typing import TYPE_CHECKING
  
-@@ -43,6 +43,8 @@ class NewRequestData:
+@@ -43,11 +43,15 @@ class NewRequestData:
      block_ids: tuple[list[int], ...]
      num_computed_tokens: int
      lora_request: LoRARequest | None
@@ -596,7 +1382,14 @@ index 87fdbfb164..374c481070 100644
      prompt_embeds: "torch.Tensor | None" = None
      prompt_is_token_ids: list[bool] | None = None
  
-@@ -69,6 +71,7 @@ class NewRequestData:
+     # Only used for v2 model runner.
+     prefill_token_ids: list[int] | None = None
++    # Fresh admission following KVMem reconstruction, reset on every TP worker.
++    kvmem_rebuilt: bool = False
+ 
+     @classmethod
+     def from_request(
+@@ -69,10 +73,12 @@ class NewRequestData:
              pooling_params=request.pooling_params,
              block_ids=block_ids,
              num_computed_tokens=request.num_computed_tokens,
@@ -604,7 +1397,12 @@ index 87fdbfb164..374c481070 100644
              lora_request=request.lora_request,
              prompt_embeds=request.prompt_embeds,
              prompt_is_token_ids=request.prompt_is_token_ids,
-@@ -143,6 +146,8 @@ class CachedRequestData:
+             prefill_token_ids=prefill_token_ids,
++            kvmem_rebuilt=getattr(request, "kvmem_rebuilt", False),
+         )
+ 
+     @property
+@@ -143,6 +149,8 @@ class CachedRequestData:
      new_block_ids: list[tuple[list[int], ...] | None]
      num_computed_tokens: list[int]
      num_output_tokens: list[int]
@@ -614,10 +1412,18 @@ index 87fdbfb164..374c481070 100644
      # Version of dataclass repr with token IDs obfuscated.
      def anon_repr(self) -> str:
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 253ea9d3ea..66065a043e 100644
+index 253ea9d..bccd0fc 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
-@@ -129,6 +129,14 @@ class Scheduler(SchedulerInterface):
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import itertools
++import threading
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+@@ -129,6 +130,23 @@ class Scheduler(SchedulerInterface):
              else self.scheduler_config.max_num_batched_tokens
          )
          self.max_model_len = vllm_config.model_config.max_model_len
@@ -628,11 +1434,43 @@ index 253ea9d3ea..66065a043e 100644
 +                  if isinstance(getattr(vllm_config, "additional_config", None), dict) else None)
 +        _kvmem = _kvmem if isinstance(_kvmem, dict) else {}
 +        self.kvmem_resident = bool(_kvmem.get("inrequest_compaction"))
++        self.kvmem_reconstruction_enabled = bool(_kvmem.get("compact_rebuild"))
 +        self.kvmem_ctx = int(_kvmem.get("ctx") or 0) or None
++        if self.kvmem_resident:
++            # KVMem exists precisely so the FULL sequence does not have to fit the pool: the
++            # working set is bounded by B+R and the rest lives on the host tier. vLLM's
++            # `scheduler_reserve_full_isl` (default True) would otherwise refuse every waiting
++            # request whose whole prompt exceeds the pool - measured: 152,820-token prompt with
++            # 18 blocks required and 75 free, `allocate_slots` returning None forever
++            # (`full_sequence_must_fit` in kv_cache_manager).
++            self.scheduler_reserve_full_isl = False
          self.enable_kv_cache_events = (
              self.kv_events_config is not None
              and self.kv_events_config.enable_kv_cache_events
-@@ -650,7 +658,7 @@ class Scheduler(SchedulerInterface):
+@@ -213,6 +231,10 @@ class Scheduler(SchedulerInterface):
+ 
+         # IDs of requests preempted since the last call to schedule().
+         self.reset_preempted_req_ids: set[str] = set()
++        # The worker-side channel only queues immutable reconstruction inputs.
++        # Request mutation is serialized with completed GPU output below.
++        self._kvmem_reconstruction_lock = threading.Lock()
++        self._kvmem_pending_reconstructions: dict[str, tuple[int, ...]] = {}
+ 
+         # Counter for requests waiting for streaming input. Used to calculate
+         # number of unfinished requests
+@@ -332,6 +354,11 @@ class Scheduler(SchedulerInterface):
+         self.scheduler_reserve_full_isl = (
+             self.scheduler_config.scheduler_reserve_full_isl
+         )
++        if self.kvmem_resident:
++            # KVMem overrides the config AFTER the canonical assignment below: the working set is
++            # bounded by B+R, so the full prompt must not be required to fit the pool (the earlier
++            # attempt set it in __init__ before this line and was silently overwritten).
++            self.scheduler_reserve_full_isl = False
+         additional_config = vllm_config.additional_config
+         self.prefill_batch_barrier = bool(
+             isinstance(additional_config, dict)
+@@ -650,7 +677,7 @@ class Scheduler(SchedulerInterface):
              prefill_candidates = [
                  request
                  for request in self.running
@@ -641,7 +1479,7 @@ index 253ea9d3ea..66065a043e 100644
              ]
              # A newly arriving prefill must not pause an already decoding-only
              # batch. The barrier is for aligning an in-flight prefill cohort;
-@@ -668,7 +676,7 @@ class Scheduler(SchedulerInterface):
+@@ -668,7 +695,7 @@ class Scheduler(SchedulerInterface):
                  waiting_candidates = (
                      request
                      for request in self.waiting
@@ -650,7 +1488,7 @@ index 253ea9d3ea..66065a043e 100644
                      and request.request_id
                      not in self._prefill_barrier_admission_blocked
                  )
-@@ -677,7 +685,7 @@ class Scheduler(SchedulerInterface):
+@@ -677,7 +704,7 @@ class Scheduler(SchedulerInterface):
                  )
  
              remaining_prompts = [
@@ -659,7 +1497,7 @@ index 253ea9d3ea..66065a043e 100644
                  for request in prefill_candidates
              ]
              if remaining_prompts and barrier_has_running_prefill:
-@@ -740,7 +748,7 @@ class Scheduler(SchedulerInterface):
+@@ -740,7 +767,7 @@ class Scheduler(SchedulerInterface):
                  continue
  
              request_prefill_remaining = max(
@@ -668,7 +1506,7 @@ index 253ea9d3ea..66065a043e 100644
              )
              if (
                  prefill_frontier is not None
-@@ -789,10 +797,14 @@ class Scheduler(SchedulerInterface):
+@@ -789,10 +816,14 @@ class Scheduler(SchedulerInterface):
                  req_index += 1
                  continue
  
@@ -684,7 +1522,7 @@ index 253ea9d3ea..66065a043e 100644
              )
              if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                  num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-@@ -804,11 +816,16 @@ class Scheduler(SchedulerInterface):
+@@ -804,11 +835,16 @@ class Scheduler(SchedulerInterface):
  
              # Make sure the input position does not exceed the max model len.
              # This is necessary when using spec decoding.
@@ -704,7 +1542,7 @@ index 253ea9d3ea..66065a043e 100644
              )
  
              # Apply Mamba alignment before encoder caps.
-@@ -842,6 +859,21 @@ class Scheduler(SchedulerInterface):
+@@ -842,6 +878,21 @@ class Scheduler(SchedulerInterface):
              )
  
              if num_new_tokens == 0:
@@ -726,7 +1564,23 @@ index 253ea9d3ea..66065a043e 100644
                  # The request cannot be scheduled because one of the following
                  # reasons:
                  # 1. No new tokens to schedule. This may happen when
-@@ -1009,7 +1041,7 @@ class Scheduler(SchedulerInterface):
+@@ -881,6 +932,15 @@ class Scheduler(SchedulerInterface):
+                         break
+ 
+                     # The request cannot be scheduled.
++                    # KVMem: with `kvmem_no_preempt` the scheduler WAITS instead of preempting.
++                    # Preemption of a long (possibly compacted) request rewinds it to a recompute,
++                    # which this fork cannot do safely for a KVMem view - it faults in the attention
++                    # kernel. Waiting keeps the request alive so the pool can be reclaimed by the
++                    # adapter instead.
++                    if getattr(self, "kvmem_no_preempt", False):
++                        self._kvmem_preempt_blocked = int(
++                            getattr(self, "_kvmem_preempt_blocked", 0)) + 1
++                        break
+                     # Preempt the lowest-priority request.
+                     if self.policy == SchedulingPolicy.PRIORITY:
+                         preempted_req = max(
+@@ -1009,7 +1069,7 @@ class Scheduler(SchedulerInterface):
                  request_id = request.request_id
  
                  request_prefill_remaining = max(
@@ -735,7 +1589,7 @@ index 253ea9d3ea..66065a043e 100644
                  )
                  if (
                      prefill_frontier is not None
-@@ -1187,7 +1219,9 @@ class Scheduler(SchedulerInterface):
+@@ -1187,7 +1247,9 @@ class Scheduler(SchedulerInterface):
                      # We use `request.num_tokens` instead of
                      # `request.num_prompt_tokens` to consider the resumed
                      # requests, which have output tokens.
@@ -746,7 +1600,7 @@ index 253ea9d3ea..66065a043e 100644
  
                      # Pad new decode requests to uniform spec decoding size to
                      # preserve full cudagraph for this step.
-@@ -1217,7 +1251,7 @@ class Scheduler(SchedulerInterface):
+@@ -1217,7 +1279,7 @@ class Scheduler(SchedulerInterface):
                      if 0 < threshold < num_new_tokens:
                          num_new_tokens = threshold
                      if (
@@ -755,7 +1609,119 @@ index 253ea9d3ea..66065a043e 100644
                          and prefill_frontier_step is not None
                      ):
                          num_new_tokens = min(num_new_tokens, prefill_frontier_step)
-@@ -1700,6 +1734,10 @@ class Scheduler(SchedulerInterface):
+@@ -1679,6 +1741,111 @@ class Scheduler(SchedulerInterface):
+ 
+         return new_block_ids_to_zero or None
+ 
++    def queue_kvmem_reconstruction(
++        self, request_id: str, token_ids: list[int]
++    ) -> dict[str, Any]:
++        """Queue a selected prompt; never mutate an in-flight request here.
++
++        The channel calls this after the final original prefill forward. Its
++        sampled token is discarded at update_from_output, and the next V2
++        admission carries the replacement tokens to every TP worker.
++        """
++        ids = tuple(token_ids)
++        if not ids or any(type(token) is not int or token < 0 for token in ids):
++            raise ValueError("reconstruction needs non-empty, non-negative token IDs")
++        if not self.kvmem_reconstruction_enabled:
++            raise ValueError("reconstruction requires the explicit compact_rebuild switch")
++        if not self.kvmem_resident or not self.use_v2_model_runner:
++            raise ValueError("reconstruction requires KVMem resident mode and V2")
++        if self.scheduler_config.async_scheduling or self.use_pp:
++            raise ValueError("reconstruction currently requires synchronous PP=1")
++        if self.cache_config.enable_prefix_caching:
++            raise ValueError("reconstruction currently requires prefix caching off")
++        if self.connector is not None or self.ec_connector is not None:
++            raise ValueError("reconstruction does not support cache connectors")
++        if any(
++            isinstance(group.kv_cache_spec, MambaSpec)
++            and group.kv_cache_spec.mamba_cache_mode != "none"
++            for group in self.kv_cache_config.kv_cache_groups
++        ):
++            raise ValueError("reconstruction requires per-request Mamba state mode none")
++        with self._kvmem_reconstruction_lock:
++            request = self.requests.get(request_id)
++            if request is None or request.is_finished():
++                raise ValueError("reconstruction request no longer exists")
++            if getattr(request, "kvmem_rebuilt", False):
++                if ids != request._kvmem_reconstruction_token_ids:
++                    raise ValueError("conflicting reconstruction after commit")
++                return {
++                    "ok": True, "rebuild": True, "queued": False,
++                    "tokens": len(ids), "skipped": "already rebuilt",
++                }
++            if (
++                request.prompt_token_ids is None
++                or request.prompt_embeds is not None
++                or request.prompt_is_token_ids is not None
++                or request.mm_features
++                or request.resumable
++                or request.pooling_params is not None
++                or request.use_structured_output
++            ):
++                raise ValueError("reconstruction currently supports plain text generation")
++            if request.sampling_params.prompt_logprobs is not None:
++                raise ValueError("reconstruction cannot provide original prompt logprobs")
++            if request.num_output_tokens:
++                raise ValueError("reconstruction must precede the first published token")
++            if request.status != RequestStatus.RUNNING or request.num_in_flight_tokens <= 0:
++                raise ValueError("reconstruction must be queued during final prefill")
++            if request.num_logical_tokens < request.num_prompt_tokens:
++                raise ValueError("the original prompt has not finished prefill")
++            if len(ids) > min(request.num_prompt_tokens, self.max_model_len):
++                raise ValueError("reconstructed prompt exceeds the admitted window")
++            pending = self._kvmem_pending_reconstructions.get(request_id)
++            if pending is not None and pending != ids:
++                raise ValueError("TP ranks proposed different reconstruction tokens")
++            self._kvmem_pending_reconstructions[request_id] = ids
++        return {"ok": True, "rebuild": True, "queued": True, "tokens": len(ids)}
++
++    def _apply_kvmem_reconstruction(self, request: Request) -> bool:
++        """Commit only after the old GPU step has completed, before publishing it."""
++        with self._kvmem_reconstruction_lock:
++            ids = self._kvmem_pending_reconstructions.get(request.request_id)
++            if ids is None:
++                return False
++            if request.num_in_flight_tokens != 0 or request.num_output_tokens:
++                raise RuntimeError(
++                    "unsafe reconstruction boundary: output is still in flight"
++                )
++            if request.status != RequestStatus.RUNNING:
++                raise RuntimeError("reconstruction request is no longer running")
++            # Reuse vLLM's preemption/resumption lifecycle: all groups are freed
++            # together, and V2 emits NewRequestData rather than cached deltas.
++            self.running.remove(request)
++            self._preempt_request(request, time.monotonic(), drop_stale_output=True)
++            original_prompt_len = request.num_prompt_tokens
++            request.prompt_token_ids = list(ids)
++            request._all_token_ids[:] = ids
++            request._output_token_ids.clear()
++            request.num_prompt_tokens = len(ids)
++            request.num_computed_tokens = 0
++            request.num_logical_tokens = 0
++            request.num_kvmem_offset = 0
++            request.num_output_placeholders = 0
++            request.num_stale_output_tokens = 0
++            request.drop_stale_output = False
++            request.next_decode_eligible_step = 0
++            request.spec_token_ids.clear()
++            request.is_prefill_chunk = True
++            request.shared_prefix_boundary = 0
++            request.block_hashes.clear()
++            request.update_block_hashes()
++            request.num_nans_in_logits = 0
++            request.kvmem_rebuilt = True
++            request.kvmem_original_num_prompt_tokens = original_prompt_len
++            request._kvmem_reconstruction_token_ids = ids
++            self._kvmem_pending_reconstructions.pop(request.request_id)
++            return True
++
+     def _preempt_request(
+         self, request: Request, timestamp: float, drop_stale_output: bool = False
+     ) -> None:
+@@ -1700,6 +1867,10 @@ class Scheduler(SchedulerInterface):
          self._inflight_prefills.discard(request)
          request.status = RequestStatus.PREEMPTED
          request.num_computed_tokens = 0
@@ -766,7 +1732,7 @@ index 253ea9d3ea..66065a043e 100644
          if request.spec_token_ids:
              request.spec_token_ids = []
          # Async scheduling: mark all in-flight output as stale. Its tokens are
-@@ -1736,11 +1774,33 @@ class Scheduler(SchedulerInterface):
+@@ -1736,11 +1907,33 @@ class Scheduler(SchedulerInterface):
          for req_id, num_scheduled_token in num_scheduled_tokens.items():
              request = self.requests[req_id]
              request.num_computed_tokens += num_scheduled_token
@@ -801,7 +1767,7 @@ index 253ea9d3ea..66065a043e 100644
                  request.num_tokens + request.num_output_placeholders
              )
              scheduler_output.has_structured_output_requests |= (
-@@ -1828,6 +1888,7 @@ class Scheduler(SchedulerInterface):
+@@ -1828,6 +2021,7 @@ class Scheduler(SchedulerInterface):
          new_block_ids: list[tuple[list[int], ...] | None] = []
          all_token_ids: dict[str, list[int]] = {}
          num_computed_tokens: list[int] = []
@@ -809,7 +1775,7 @@ index 253ea9d3ea..66065a043e 100644
          num_output_tokens: list[int] = []
          resumed_req_ids = set()
  
-@@ -1860,6 +1921,7 @@ class Scheduler(SchedulerInterface):
+@@ -1860,6 +2054,7 @@ class Scheduler(SchedulerInterface):
                  req_to_new_blocks[req_id].get_block_ids(allow_none=True)
              )
              num_computed_tokens.append(req.num_computed_tokens)
@@ -817,7 +1783,7 @@ index 253ea9d3ea..66065a043e 100644
              num_output_tokens.append(
                  req.num_output_tokens + req.num_output_placeholders
              )
-@@ -1871,6 +1933,7 @@ class Scheduler(SchedulerInterface):
+@@ -1871,6 +2066,7 @@ class Scheduler(SchedulerInterface):
              all_token_ids=all_token_ids,
              new_block_ids=new_block_ids,
              num_computed_tokens=num_computed_tokens,
@@ -825,7 +1791,22 @@ index 253ea9d3ea..66065a043e 100644
              num_output_tokens=num_output_tokens,
          )
  
-@@ -2179,6 +2242,22 @@ class Scheduler(SchedulerInterface):
+@@ -2170,6 +2366,14 @@ class Scheduler(SchedulerInterface):
+                 # In this case, we use is_finished() to check.
+                 continue
+ 
++            # The final original-prefill token belongs to the old context. Never
++            # publish or feed it back after replacing the prompt. This is also
++            # the fence after which its KV/state allocations can be released.
++            if self._kvmem_pending_reconstructions and self._apply_kvmem_reconstruction(
++                request
++            ):
++                continue
++
+             # Drop-mode stale output (same-step resume) is discarded entirely.
+             if output_is_stale and request.drop_stale_output:
+                 continue
+@@ -2179,6 +2383,22 @@ class Scheduler(SchedulerInterface):
                  sampled_token_ids[req_index] if sampled_token_ids else []
              )
  
@@ -848,7 +1829,7 @@ index 253ea9d3ea..66065a043e 100644
              scheduled_spec_token_ids = (
                  scheduler_output.scheduled_spec_decode_tokens.get(req_id)
              )
-@@ -2196,6 +2275,11 @@ class Scheduler(SchedulerInterface):
+@@ -2196,6 +2416,11 @@ class Scheduler(SchedulerInterface):
                  if not output_is_stale:
                      if request.num_computed_tokens > 0:
                          request.num_computed_tokens -= num_rejected
@@ -860,7 +1841,7 @@ index 253ea9d3ea..66065a043e 100644
                      if request.num_output_placeholders > 0:
                          request.num_output_placeholders -= num_rejected
                  spec_decoding_stats = self.make_spec_decoding_stats(
-@@ -2246,7 +2330,7 @@ class Scheduler(SchedulerInterface):
+@@ -2246,7 +2471,7 @@ class Scheduler(SchedulerInterface):
                  stopped = True
              elif (
                  self.is_mm_encoder_only
@@ -869,7 +1850,7 @@ index 253ea9d3ea..66065a043e 100644
              ):
                  # An encoder instance runs the encoder and publishes the
                  # embeddings instead of sampling, so it stops as soon as the
-@@ -2577,7 +2661,13 @@ class Scheduler(SchedulerInterface):
+@@ -2577,7 +2802,13 @@ class Scheduler(SchedulerInterface):
  
              # Check for stop and update request state.
              # This must be called before we make the EngineCoreOutput.
@@ -884,7 +1865,34 @@ index 253ea9d3ea..66065a043e 100644
              if stopped:
                  del new_token_ids[num_new:]  # Trim new tokens if needed.
                  break
-@@ -3005,6 +3095,16 @@ class Scheduler(SchedulerInterface):
+@@ -2637,6 +2868,17 @@ class Scheduler(SchedulerInterface):
+                     request.spec_token_ids = []
+                 continue
+ 
++            # KVMem: a COMPACTED request must not speculate. The draft model would attend through
++            # the same compacted row with positions derived from the logical sequence, and that
++            # path faults in a Triton kernel at the first decode step (measured: a 201,915-token
++            # prompt prefills fine and then dies right here with MTP on, while it returns HTTP 200
++            # with speculation disabled).
++            if (int(getattr(request, "num_kvmem_offset", 0) or 0) > 0
++                    or bool(getattr(request, "kvmem_rebuilt", False))):
++                if request.spec_token_ids:
++                    request.spec_token_ids = []
++                continue
++
+             # Add newly generated spec token ids to the request.
+             if self.structured_output_manager.should_advance(request):
+                 metadata = request.structured_output_request
+@@ -2800,6 +3042,8 @@ class Scheduler(SchedulerInterface):
+ 
+         self.encoder_cache_manager.free(request)
+         request_id = request.request_id
++        with self._kvmem_reconstruction_lock:
++            self._kvmem_pending_reconstructions.pop(request_id, None)
+         self._prefill_barrier_admission_blocked.discard(request_id)
+         self.finished_req_ids.add(request_id)
+         if self.finished_req_ids_dict is not None:
+@@ -3005,6 +3249,16 @@ class Scheduler(SchedulerInterface):
          connector_stats_payload = (
              kv_connector_stats.to_dict() if kv_connector_stats else None
          )
@@ -901,7 +1909,7 @@ index 253ea9d3ea..66065a043e 100644
          return SchedulerStats(
              num_running_reqs=len(self.running),
              num_waiting_reqs=len(self.waiting),
-@@ -3017,6 +3117,8 @@ class Scheduler(SchedulerInterface):
+@@ -3017,6 +3271,8 @@ class Scheduler(SchedulerInterface):
              kv_connector_stats=connector_stats_payload,
              cudagraph_stats=cudagraph_stats,
              perf_stats=perf_stats,
@@ -910,7 +1918,7 @@ index 253ea9d3ea..66065a043e 100644
          )
  
      def make_spec_decoding_stats(
-@@ -3322,6 +3424,7 @@ class Scheduler(SchedulerInterface):
+@@ -3322,6 +3578,7 @@ class Scheduler(SchedulerInterface):
                      marked_invalid_block_ids |= request_invalid_block_ids
                      total_affected_tokens += req_num_computed_tokens
                      request.num_computed_tokens = 0
@@ -919,7 +1927,7 @@ index 253ea9d3ea..66065a043e 100644
                          for req_block_ids in req_block_ids_per_group:
                              blocks_to_evict.update(
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index ffc9a5de7e..82a5eff626 100644
+index ffc9a5d..82a5eff 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
 @@ -495,6 +495,25 @@ class EngineCore:
@@ -949,7 +1957,7 @@ index ffc9a5de7e..82a5eff626 100644
      def log_error_detail(self, scheduler_output: SchedulerOutput):
          """Execute the model and log detailed info on failure."""
 diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
-index 4cc433cbfe..28db4e3537 100644
+index 4cc433c..28db4e3 100644
 --- a/vllm/v1/engine/input_processor.py
 +++ b/vllm/v1/engine/input_processor.py
 @@ -31,6 +31,7 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
@@ -982,7 +1990,7 @@ index 4cc433cbfe..28db4e3537 100644
              else self.mm_encoder_cache_size
          )
 diff --git a/vllm/v1/engine/llm_engine.py b/vllm/v1/engine/llm_engine.py
-index 32096079e0..c2e8543ddd 100644
+index 3209607..c2e8543 100644
 --- a/vllm/v1/engine/llm_engine.py
 +++ b/vllm/v1/engine/llm_engine.py
 @@ -336,8 +336,12 @@ class LLMEngine:
@@ -1001,7 +2009,7 @@ index 32096079e0..c2e8543ddd 100644
          return processed_outputs.request_outputs
  
 diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
-index 9e3f9c63a6..869a59bb4f 100644
+index 9e3f9c6..869a59b 100644
 --- a/vllm/v1/metrics/loggers.py
 +++ b/vllm/v1/metrics/loggers.py
 @@ -126,6 +126,12 @@ class LoggingStatLogger(StatLoggerBase):
@@ -1160,7 +2168,7 @@ index 9e3f9c63a6..869a59bb4f 100644
  
          self.spec_decoding_logging.log(log_fn=log_fn)
 diff --git a/vllm/v1/metrics/stats.py b/vllm/v1/metrics/stats.py
-index 24e07e57cc..29e54838c7 100644
+index 24e07e5..29e5483 100644
 --- a/vllm/v1/metrics/stats.py
 +++ b/vllm/v1/metrics/stats.py
 @@ -198,6 +198,11 @@ class SchedulerStats:
@@ -1176,10 +2184,10 @@ index 24e07e57cc..29e54838c7 100644
      connector_prefix_cache_stats: PrefixCacheStats | None = None
  
 diff --git a/vllm/v1/request.py b/vllm/v1/request.py
-index 8b453a0906..0d0fdffee2 100644
+index 8b453a0..94e5621 100644
 --- a/vllm/v1/request.py
 +++ b/vllm/v1/request.py
-@@ -180,6 +180,18 @@ class Request:
+@@ -180,6 +180,23 @@ class Request:
  
          self.spec_token_ids: list[int] = []
          self.num_computed_tokens = 0
@@ -1195,11 +2203,16 @@ index 8b453a0906..0d0fdffee2 100644
 +        # `num_computed_tokens` by this many tokens, so `num_logical = num_computed + offset` holds
 +        # at every step. Set by the block-channel compactor, never inferred.
 +        self.num_kvmem_offset = 0
++        # Prompt reconstruction is a fresh internal prefill; frontend usage
++        # remains tied to the user-provided prompt, retained separately here.
++        self.kvmem_rebuilt = False
++        self.kvmem_original_num_prompt_tokens = self.num_prompt_tokens
++        self._kvmem_reconstruction_token_ids: tuple[int, ...] | None = None
          self.cache_salt: str | None = cache_salt
  
          # Multi-modal related
 diff --git a/vllm/v1/spec_decode/metrics.py b/vllm/v1/spec_decode/metrics.py
-index a3ccfb29e7..5f6c494890 100644
+index a3ccfb2..5f6c494 100644
 --- a/vllm/v1/spec_decode/metrics.py
 +++ b/vllm/v1/spec_decode/metrics.py
 @@ -104,35 +104,15 @@ class SpecDecodingLogging:
@@ -1242,8 +2255,44 @@ index a3ccfb29e7..5f6c494890 100644
          )
          self.reset()
  
+diff --git a/vllm/v1/worker/gpu/block_table.py b/vllm/v1/worker/gpu/block_table.py
+index c01895e..bf7474a 100644
+--- a/vllm/v1/worker/gpu/block_table.py
++++ b/vllm/v1/worker/gpu/block_table.py
+@@ -195,7 +195,22 @@ class BlockTables:
+         positions: torch.Tensor,
+         num_tokens_padded: int,
+         out: torch.Tensor | None = None,
++        slot_positions: torch.Tensor | None = None,
+     ) -> torch.Tensor:
++        """Map tokens to KV cache slots.
++
++        `slot_positions` (KVMem) separates the two things a position is used for:
++
++          * `positions`      -> RoPE, always the token's TRUE position (so a stored K keeps the
++                                phase it was written with, and a recurrent state stays on the same
++                                timeline as the attention view);
++          * `slot_positions` -> the WRITE address only, i.e. the token's position inside the
++                                COMPACTED block-table row.
++
++        Without the split a compacted row forces the model to be told compacted positions, which
++        re-bakes K and desynchronises every per-request recurrent state (measured: garbage output
++        once a request was compacted). With it, compaction only reorders physical pages.
++        """
+         if self.num_kv_cache_groups == 0:
+             return (self.slot_mappings if out is None else out)[:, :num_tokens_padded]
+         num_reqs = idx_mapping.shape[0]
+@@ -205,7 +220,7 @@ class BlockTables:
+             slot_mappings.shape[1],
+             idx_mapping,
+             query_start_loc,
+-            positions,
++            positions if slot_positions is None else slot_positions,
+             self.block_table_ptrs,
+             self.block_table_strides,
+             self.block_sizes_tensor,
 diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
-index 481da2016b..f12cc9426b 100644
+index 481da20..f12cc94 100644
 --- a/vllm/v1/worker/gpu/input_batch.py
 +++ b/vllm/v1/worker/gpu/input_batch.py
 @@ -271,14 +271,17 @@ def _prepare_prefill_inputs_kernel(
@@ -1285,10 +2334,18 @@ index 481da2016b..f12cc9426b 100644
          LOOKAHEAD_BLOCK=triton.next_power_of_2(num_lookahead),
      )
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 0422c9e885..9ab0b53d5d 100644
+index 0422c9e..80e1156 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -1157,6 +1157,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -181,6 +181,7 @@ from vllm.v1.worker.utils import (
+     clear_layer_kv_caches,
+     copy_kv_cache_blocks_inplace,
+     get_uniform_decode_token_count,
++    zero_kvmem_reconstruction_states,
+ )
+ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
+ 
+@@ -1157,6 +1158,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  all_token_ids=new_req_data.prefill_token_ids,
                  num_computed_tokens=new_req_data.num_computed_tokens,
                  max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
@@ -1296,7 +2353,26 @@ index 0422c9e885..9ab0b53d5d 100644
              )
              req_index = self.req_states.req_id_to_index[req_id]
              if self.adaptive_verification is not None:
-@@ -1204,11 +1205,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1178,6 +1180,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.block_tables.append_block_ids(
+                 req_index, new_req_data.block_ids, overwrite=True
+             )
++            if new_req_data.kvmem_rebuilt:
++                # Fresh token/length/counter writes above replace the complete
++                # V2 request state on each TP rank. Also discard sampled/draft
++                # lookahead and recurrent history from the original prompt.
++                self.req_states.last_sampled_tokens[req_index].zero_()
++                self.req_states.next_prefill_tokens[:, req_index].zero_()
++                zero_kvmem_reconstruction_states(
++                    self.kv_caches,
++                    self.kv_cache_group_ids,
++                    self.kv_cache_config.kv_cache_groups,
++                    new_req_data.block_ids,
++                )
+             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
+ 
+             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
+@@ -1204,11 +1218,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              if (idx := self.req_states.req_id_to_index.get(req_id)) is not None:
                  self.block_tables.append_block_ids(idx, block_ids, overwrite=True)
          num_computed_tokens_np = self.req_states.num_computed_tokens_np
@@ -1322,7 +2398,32 @@ index 0422c9e885..9ab0b53d5d 100644
              if req_new_block_ids is not None and req_id not in table_updates:
                  self.block_tables.append_block_ids(
                      req_index, req_new_block_ids, overwrite=False
-@@ -1399,7 +1411,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1345,6 +1370,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # combine_sampled_and_draft_tokens places a request's logits rows
+             # at [query_end - num_logits, query_end). Fewer query rows than
+             # that would silently select the preceding request's hidden states.
++            if not bool((num_scheduled_tokens_np >= num_logits).all()):
++                # Diagnostic for the KVMem compacted-book path: print the per-request numbers that
++                # make the invariant fail instead of only tripping the assert.
++                try:
++                    import json as _json
++                    _rows = []
++                    for _i, _rid in enumerate(req_ids):
++                        _rows.append({"req": str(_rid)[:10],
++                                      "scheduled": int(num_scheduled_tokens_np[_i]),
++                                      "logits": int(num_logits[_i]),
++                                      "computed": int(self.req_states.num_computed_tokens_np[_i]),
++                                      "logical": int(self.req_states.num_logical_tokens_np[_i]),
++                                      "num_tokens": int(self.req_states.num_tokens_np[_i])
++                                      if hasattr(self.req_states, "num_tokens_np") else None})
++                    with open("/tmp/kvmem_assert.jsonl", "a") as _f:
++                        _f.write(_json.dumps({"kind": "logits_assert", "rows": _rows}) + "\n")
++                except Exception:
++                    pass
+             assert (num_scheduled_tokens_np >= num_logits).all()
+             cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+             cu_num_logits_np[0] = 0
+@@ -1399,10 +1442,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  query_start_loc,
                  self.req_states.all_token_ids.gpu,
                  self.req_states.prefill_len.gpu,
@@ -1331,7 +2432,81 @@ index 0422c9e885..9ab0b53d5d 100644
              )
  
          # Prepare positions and seq_lens.
-@@ -1746,11 +1758,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
++        #
++        # KVMem position split, RoPE half: the engine books a COMPACTED length once a request has
++        # been compacted, so the raw positions are compacted ones. Rotary embeddings need the token's
++        # TRUE position (the stored K of a resident page still carries the phase it was written
++        # with), while the write address must stay compacted - which is why prepare_attn later
++        # subtracts the same offset again for the slot mapping. `kvmem_rope_offset` is a device
++        # scalar so a CUDA graph replays the live value; absent/zero = stock behaviour.
+         prepare_pos_seq_lens(
+             idx_mapping,
+             query_start_loc,
+@@ -1410,6 +1460,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.input_buffers.positions,
+             self.input_buffers.seq_lens,
+         )
++        _rope_offset = getattr(self, "kvmem_rope_offset", None)
++        if _rope_offset is not None:
++            try:
++                _n = int(self.input_buffers.positions.shape[0])
++                _padded = self.input_buffers.positions[:_n]
++                _padded.add_(_rope_offset.to(_padded.dtype))
++            except Exception:
++                pass
+         seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+ 
+         # Some input token ids are directly read from the last sampled tokens
+@@ -1510,11 +1568,48 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         )
+         # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
+         # Kernel pads beyond num_tokens with PAD_SLOT_ID.
++        #
++        # KVMem: when the adapter has compacted a request, the WRITE address lives in the compacted
++        # row while RoPE must keep the token's TRUE position. `kvmem_slot_offset` carries that
++        # difference (true - compacted) for the whole step; it is a tensor so a CUDA graph replays
++        # the live value instead of one baked in at capture time. None = stock behaviour.
++        slot_positions = None
++        offset = getattr(self, "kvmem_slot_offset", None)
++        if offset is not None:
++            session_hint = getattr(self, "kvmem_slot_offset_uses", None)
++            if session_hint is None or int(session_hint) > 0:
++                slot_positions = input_batch.positions - offset
++        # KVMem diagnostic: a write address past the row's coverage is an illegal access the length
++        # checks cannot see (the row is grown for `seq_len + n`, but the scheduler may schedule more
++        # than that, or the offset may be stale by one step). Record the worst case, once per step.
++        try:
++            _rt = getattr(self, "kvmem_runtime", None)
++            if _rt is not None and slot_positions is not None:
++                import json as _json
++                _bs = int(getattr(self.block_tables, "block_size", 0) or 0)
++                _mx = int(input_batch.positions.max()) - int(offset.item()) if _bs else None
++                if _bs and _mx is not None:
++                    from vllm.utils.torch_utils import current_stream  # noqa: F401
++                    _rows = {}
++                    for _rid in list(input_batch.req_ids)[:4]:
++                        _st = _rt._state.get(_rid)
++                        if _st is not None:
++                            _rows[str(_rid)[:8]] = len(getattr(_st, "row", ()))
++                    _need = (_mx // _bs) + 1
++                    if _rows and all(int(v) < _need for v in _rows.values()):
++                        with open("/tmp/kvmem_slot.jsonl", "a") as _f:
++                            _f.write(_json.dumps({"kind": "slot_past_row", "need": int(_need),
++                                                  "rows": _rows, "bs": _bs,
++                                                  "offset": int(offset.item()),
++                                                  "pos_max": int(input_batch.positions.max())}) + "\n")
++        except Exception:
++            pass
+         slot_mappings = self.block_tables.compute_slot_mappings(
+             input_batch.idx_mapping,
+             input_batch.query_start_loc,
+             input_batch.positions,
+             num_tokens_padded=input_batch.num_tokens_after_padding,
++            slot_positions=slot_positions,
+         )
+         return block_tables, slot_mappings
+ 
+@@ -1746,11 +1841,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # boundaries before the forward. Runs only on real batches, and
              # before model_state.prepare_attn gathers num_accepted_tokens so the
              # boundary reset is visible to the attention metadata.
@@ -1351,7 +2526,7 @@ index 0422c9e885..9ab0b53d5d 100644
  
              if self.lora_config:
 diff --git a/vllm/v1/worker/gpu/sample/sampler.py b/vllm/v1/worker/gpu/sample/sampler.py
-index b069604c29..3fa6e6baf3 100644
+index b069604..3fa6e6b 100644
 --- a/vllm/v1/worker/gpu/sample/sampler.py
 +++ b/vllm/v1/worker/gpu/sample/sampler.py
 @@ -176,9 +176,22 @@ class Sampler:
@@ -1379,7 +2554,7 @@ index b069604c29..3fa6e6baf3 100644
              input_batch.idx_mapping,
              self.req_states.prefill_len.gpu,
 diff --git a/vllm/v1/worker/gpu/states.py b/vllm/v1/worker/gpu/states.py
-index 434fb80582..e521ede0f6 100644
+index 434fb80..e521ede 100644
 --- a/vllm/v1/worker/gpu/states.py
 +++ b/vllm/v1/worker/gpu/states.py
 @@ -3,7 +3,7 @@
@@ -1447,3 +2622,36 @@ index 434fb80582..e521ede0f6 100644
  
          self.draft_tokens[req_idx].zero_()
  
+diff --git a/vllm/v1/worker/utils.py b/vllm/v1/worker/utils.py
+index 7e7ce67..6adb5f0 100644
+--- a/vllm/v1/worker/utils.py
++++ b/vllm/v1/worker/utils.py
+@@ -715,6 +715,28 @@ def clear_layer_kv_caches(layers: Iterable[Any]) -> None:
+                 layer.impl._v_scale_cache = None
+ 
+ 
++def zero_kvmem_reconstruction_states(
++    kv_caches: Sequence[torch.Tensor],
++    cache_group_ids: Sequence[int],
++    kv_cache_groups: Sequence[KVCacheGroupSpec],
++    block_ids: tuple[list[int], ...],
++) -> None:
++    """Clear only freshly owned Mamba pages, including speculative scratch.
++
++    KVBlockZeroer deliberately skips Mamba. Raw per-layer views have blocks
++    at dimension zero; clearing whole allocations here would also corrupt
++    attention/other requests because hybrid groups share backing memory.
++    Called identically on every TP rank after a reconstructed new admission.
++    """
++    for cache, group_id in zip(kv_caches, cache_group_ids):
++        if not isinstance(kv_cache_groups[group_id].kv_cache_spec, MambaSpec):
++            continue
++        for block_id in set(block_ids[group_id]):
++            if block_id <= 0 or block_id >= cache.shape[0]:
++                raise ValueError("invalid owned Mamba block for reconstruction")
++            cache[block_id].zero_()
++
++
+ def copy_kv_cache_blocks_inplace(
+     kv_caches: Iterable[torch.Tensor],
+     num_blocks: int | Sequence[int],

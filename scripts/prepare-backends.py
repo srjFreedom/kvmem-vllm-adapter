@@ -25,10 +25,23 @@ def run(*args, cwd=None, check=True):
 
 
 def ensure_checkout(path: Path, url: str, commit: str) -> None:
-    """Submodule first (as kvmem does), plain shallow clone as the fallback."""
+    """Fetch the pinned engine into `path`, never reset a checkout we did not create.
+
+    The release flow replaces the engine through the versioned patch only. A directory that
+    already holds a different commit is refused instead of being checked out: on a workstation
+    that path may be a user's own fork with uncommitted work.
+    """
     if (path / ".git").exists():
-        run("git", "-C", str(path), "fetch", "--depth", "1", "origin", commit, check=False)
-        run("git", "-C", str(path), "checkout", "-q", commit)
+        head = run("git", "-C", str(path), "rev-parse", "HEAD", check=False).stdout.strip()
+        dirt = run("git", "-C", str(path), "status", "--porcelain", check=False).stdout.strip()
+        if head != commit:
+            raise SystemExit(
+                f"{path} is at {head[:12]}, not the pinned {commit[:12]}; refusing to check it out. "
+                "Remove the directory (or point --engine at a fresh one) and re-run.")
+        if dirt:
+            # Tolerated only when the diff IS this released patch (a re-run of this script);
+            # main() still refuses anything else before touching the tree.
+            print(f"  note: {path} already carries local changes")
         return
     if path.exists() and any(path.iterdir()):
         raise SystemExit(f"{path} exists but is not a git checkout")
@@ -43,9 +56,10 @@ def ensure_checkout(path: Path, url: str, commit: str) -> None:
         run("git", "clone", "--depth", "1", "--branch", commit, url, str(path))
 
 
-def patch_applied(path: Path) -> bool:
-    diff = run("git", "-C", str(path), "diff", "--stat", check=False).stdout
-    return "kvmem_bridge" in diff or (path / "vllm" / "kvmem_bridge.py").exists()
+def patch_applied(path: Path, patch: Path) -> bool:
+    """True only when the patch is already applied verbatim (reverse-apply would succeed)."""
+    reverse = run("git", "-C", str(path), "apply", "--reverse", "--check", str(patch), check=False)
+    return reverse.returncode == 0
 
 
 def verify_tree(path: Path, expected: str) -> None:
@@ -91,15 +105,19 @@ def main() -> int:
     print(f"[prepare] {args.engine}: {entry['upstream']} @ {entry['base_commit'][:12]}")
     ensure_checkout(path, entry["upstream"], entry["base_commit"])
 
-    if patch_applied(path):
+    dirty = run("git", "-C", str(path), "status", "--porcelain", check=False).stdout.strip()
+    if patch_applied(path, patch):
         print("  patch already applied")
     else:
+        if dirty:
+            raise SystemExit(
+                f"{path} has local changes that are not this patch; refusing to patch over them: "
+                f"{dirty.splitlines()[:3]}")
         run("git", "-C", str(path), "apply", str(patch))
         print(f"  applied {entry['patch']}")
 
-    if args.check_tree:
-        verify_tree(path, entry["patched_tree"])
-        print("  patched tree matches versions.json")
+    verify_tree(path, entry["patched_tree"])
+    print("  patched tree matches versions.json")
     return 0
 
 

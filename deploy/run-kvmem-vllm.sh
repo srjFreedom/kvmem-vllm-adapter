@@ -36,13 +36,13 @@ SESSIONS=${SESSIONS:-4}
 HOST_MIB=${HOST_MIB:-49152}
 N=${N:-1}
 CTX=${CTX:-524288}
-# In-request compaction and resident prefill are ONE feature, not two switches: compaction alone
-# trims the entry to B and compacts WHILE the prompt is still being prefilled - that combination is
-# the one that answered with noise. Resident prefill keeps the whole prompt resident up to the
-# engine window and only compacts during decode, which is the verified path (80K/200K prompts answer
-# exactly at N=1 and N=2). Default them together; override with 0 only when debugging that path.
-INREQUEST_COMPACTION=${INREQUEST_COMPACTION:-1}
-KVMEM_ENTRY_RESIDENT_PREFILL=${KVMEM_ENTRY_RESIDENT_PREFILL:-1}
+# Default = CLASSIC mode: no in-request compaction, prefix caching stays ON (verified in production:
+# 8.6K prompt cold 6.6s -> warm 2.3s with cached 6464). Resident compaction is OPT-IN
+# (INREQUEST_COMPACTION=1 pairs KVMEM_ENTRY_RESIDENT_PREFILL=1 automatically): it saves memory on
+# long prompts (single-request 84K verified) but force-disables prefix caching and is not yet
+# verified under concurrency / MTP decode-time compaction.
+INREQUEST_COMPACTION=${INREQUEST_COMPACTION:-0}
+KVMEM_ENTRY_RESIDENT_PREFILL=${KVMEM_ENTRY_RESIDENT_PREFILL:-0}
 export KVMEM_ENTRY_RESIDENT_PREFILL
 # 检索用的 query 捕获窗口（KVMem query_max_tokens 的官方默认是 512）
 CAPTURE_TOKENS=${CAPTURE_TOKENS:-512}
