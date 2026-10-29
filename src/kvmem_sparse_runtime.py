@@ -1160,7 +1160,11 @@ class VllmSparseRuntime:
                 if self.log is not None:
                     self.log({"kind": "query_reselect", "req": req, "tokens": int(_stq.tokens),
                               "prompt": _plq, "n_new": int(n_new or 0), "why": "prompt_complete"})
-                self._reselect(req, probe=True, rebuild=False)
+                # `rebuild` (reconstruction) is opt-in: it rewrites the engine's token book so the
+                # selected sequence can be re-prefilled from scratch. `tail_replay` is the cheap
+                # alternative (QueryReplay) and runs whenever the checkpoint-replay switch is on.
+                self._reselect(req, probe=True,
+                               rebuild=bool(getattr(self, "compact_rebuild", False)))
                 if bool(getattr(self, "checkpoint_replay", False)):
                     self.tail_replay(req)
         except Exception:
