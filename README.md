@@ -277,7 +277,6 @@ deploy/                     systemd unit, generic entry, launch scripts
 backends/versions.json      pinned engine versions + patch sha256 + patched_tree
 backends/patches/           every vLLM-side change (17 files / 612 lines)
 docs/PARAMETERS.md          each knob, its constraint and its effect
-STATUS.md                   internal decision log with the measurements behind each choice
 INTEGRATION-SURFACE.md      touch-point list and source-change registry
 ```
 
@@ -286,10 +285,11 @@ INTEGRATION-SURFACE.md      touch-point list and source-change registry
 - **Entry-side text selection is a stopgap** (vLLM cannot truncate KV mid-request), not kvmem's own
   policy; when history and question share one message the trailing-paragraph heuristic is used, so a
   very long question whose topic sits in an earlier paragraph may lose blocks
-- **In-request compaction is opt-in** (`--kvmem-inrequest-compaction`) and, by design, more delicate
-  than the default path: the prompt must fit in B, retrieval has no score for freshly generated blocks
-  (the runtime keeps the recent tail mandatory), and compaction is not combined with speculative
-  drafts on the same step
+- **In-request compaction is the default path** and is more delicate than the plain one: it forces
+  prefix caching off, the working set must stay inside the pool (a beyond-pool prompt relies on
+  prefill-time compaction), retrieval has no score for freshly generated blocks (the runtime keeps
+  the recent tail mandatory), and a step that carries speculative drafts is not compacted. A single
+  long text request is validated; concurrency is not
 - `SESSIONS` splits the H pool across **live** requests; a finished request releases its share, which
   is not the reference backends' "retain N inactive histories"
 - No tiered disk / session cold store (`nvme-gb`, `session-cache-dir`) and no NVMe page tier

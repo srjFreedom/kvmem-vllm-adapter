@@ -8,9 +8,7 @@
 `GPU_UTIL=0.65` 的物理池 122,816 token，居中 needle 的真实 prompt 196,598 token：
 27 次 `compact_applied` + 1 次 `compact_rebuild_queued` + 两 rank 各 1 次 `reconstruction_started`，
 API `usage.prompt_tokens=196598`、HTTP 200、回答 **`ZX-4417-QJ7`**（耗时 320.24s）。
-完整复现命令见 `BEYOND-POOL-PLAN.md`。逐轮过程见
-[`archive/BEYOND-POOL-PLAN-log.md`](archive/BEYOND-POOL-PLAN-log.md)，超池机制图见
-[`BEYOND-POOL-PLAN.md`](BEYOND-POOL-PLAN.md)。
+复现命令与已知边界见本文第四节、第六节。
 
 ## 摘要
 

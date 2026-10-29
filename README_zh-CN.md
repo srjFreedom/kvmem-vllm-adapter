@@ -205,7 +205,6 @@ deploy/                     systemd 单元、通用入口、启动脚本
 backends/versions.json      引擎固定版本 + 补丁 sha256 + patched_tree
 backends/patches/           vLLM 侧全部改动（17 文件 / 612 行）
 docs/PARAMETERS.md          每个参数的含义、约束与影响
-STATUS.md                   每次决策背后的实测数据
 INTEGRATION-SURFACE.md      vLLM 接触点清单与源码改动登记
 ```
 
@@ -213,8 +212,9 @@ INTEGRATION-SURFACE.md      vLLM 接触点清单与源码改动登记
 
 - **入口文本选片是代偿路径**（vLLM 不能中途截断 KV），不是 kvmem 的策略本身；历史与问题挤在
   同一条消息时仍用"末尾段落"启发式，问题很长且主题在前段时可能丢块
-- **不支持 in-request compaction**（R 满后继续到 budget）：vLLM 单调长度假设，实测断言/挂起；
-  上游也是实验性默认关
+- **in-request compaction 是默认路径**，但比朴素路径更精细：会强制关闭前缀缓存；工作集必须留在池内
+  （超池 prompt 依赖 prefill 期压缩）；新生成块没有检索分数（运行时强制保留 recent 尾部）；
+  带投机 draft 的步不做压缩。目前只验证了单条长文本请求，并发未验证
 - `SESSIONS` 的语义是**把 H 平分给活请求**；请求结束即释放，不等同于参考后端的"保留 N 个非活跃历史"
 - 未实现参考后端的三级磁盘/会话冷存（`nvme-gb`、`session-cache-dir`）与 NVMe 页级存储
 - UI 的"停止生成"等用法依赖 llama.cpp/ninfer 的服务端扩展接口（`/v1/chat/completions/control`、
