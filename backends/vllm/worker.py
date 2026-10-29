@@ -113,6 +113,8 @@ def main(argv=None) -> int:
                       ("KVMEM_COMPACT_REBUILD", "compact_rebuild")):
         if os.environ.get(_k, "") in ("1", "true", "yes", "on"):
             cfg[_cfgk] = True
+    if os.environ.get("KVMEM_REPLAY_WINDOW", "").strip():
+        cfg["replay_window"] = int(os.environ["KVMEM_REPLAY_WINDOW"])
     payload = json.dumps({"kvmem": cfg}, separators=(",", ":"))
     if "--dry-run" in argv:
         json.dump({"additional_config": payload, "plugin_config": cfg}, sys.stdout,

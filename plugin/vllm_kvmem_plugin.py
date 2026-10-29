@@ -743,6 +743,8 @@ def _attach_sparse(runner, log_path):
             runtime.reselect_at_prompt_end = True
         if cfg.get("checkpoint_replay"):
             runtime.checkpoint_replay = True
+        if cfg.get("replay_window"):
+            runtime.replay_window = int(cfg.get("replay_window") or 2048)
         _append(log_path, {"kind": "checkpoint_flags", "pid": os.getpid(),
                            "prompt_end_reselect": bool(runtime.reselect_at_prompt_end),
                            "checkpoint_replay": bool(runtime.checkpoint_replay),

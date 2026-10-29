@@ -1095,6 +1095,35 @@ class VllmSparseRuntime:
                 self.log({"kind": "row_grow_error", "req": req, "error": _tb.format_exc()[-300:]})
             return 0
 
+    def tail_replay(self, req, window=None):
+        """Recompute the last `window` resident tokens against the CURRENT row.
+
+        Upstream's QueryReplay: the whole-history state keeps whatever approximation the compactions
+        left, but the tail - the tokens that shape sampling - is recomputed against the selection we
+        actually installed. It only rewinds the two token books (an operation the compaction path
+        already does every chunk), so the sampler is unaffected; rewriting the token book is what
+        stalled the request.
+        """
+        st = self._state.get(req)
+        if st is None:
+            return None
+        try:
+            visible = int(getattr(st, "seq_len", 0))
+            n = min(int(window or getattr(self, "replay_window", 2048) or 2048), visible)
+            if n <= 0 or self.compact_channel is None:
+                return None
+            res = self.compact_channel.replay(req, visible, n)
+            if self.log is not None:
+                self.log({"kind": "tail_replay", "req": req, "visible": visible,
+                          "n": int(n), "reply": res})
+            return res
+        except Exception:
+            if self.log is not None:
+                import traceback as _tb
+                self.log({"kind": "tail_replay_error", "req": req,
+                          "error": _tb.format_exc()[-300:]})
+            return None
+
     def advance_tokens(self, req, n_new):
         self._inflight[req] = int(n_new or 0)
         # Prompt-complete reselect: once the WHOLE prompt is in, the question is inside the captured
@@ -1131,7 +1160,9 @@ class VllmSparseRuntime:
                 if self.log is not None:
                     self.log({"kind": "query_reselect", "req": req, "tokens": int(_stq.tokens),
                               "prompt": _plq, "n_new": int(n_new or 0), "why": "prompt_complete"})
-                self._reselect(req, probe=True, rebuild=True)
+                self._reselect(req, probe=True, rebuild=False)
+                if bool(getattr(self, "checkpoint_replay", False)):
+                    self.tail_replay(req)
         except Exception:
             if self.log is not None:
                 import traceback as _tb
@@ -1914,8 +1945,15 @@ class VllmSparseRuntime:
                       "mid_block": mid_block, "end_block": end_block,
                       "top_blocks": list(getattr(orch, "last_top_blocks", []) or []),
                       "selected_blocks": sel_blk[:12] + (["..."] if len(sel_blk) > 12 else []),
-                      "mid_selected": mid_block in sel_blk,
-                      "end_selected": end_block in sel_blk,
+                      # +-2 blocks of slack: `mid_block` is an ESTIMATE (prompt//4//blk) and the
+                      # chat template's prefix shifts the real position by a block or two, which is
+                      # exactly how a "not selected" false negative was produced before.
+                      "mid_selected": any(b in sel_blk for b in
+                                          (mid_block - 2, mid_block - 1, mid_block,
+                                           mid_block + 1, mid_block + 2)),
+                      "end_selected": any(b in sel_blk for b in
+                                          (end_block - 2, end_block - 1, end_block,
+                                           end_block + 1, end_block + 2)),
                       "count": len(sel_blk)})
         st_keep = set(st.row) if st.row else old_owned
         self._release_slots(req, st_keep)
