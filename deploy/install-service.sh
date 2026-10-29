@@ -18,4 +18,11 @@ install -m 0644 /tmp/kvmem-vllm.service.$$ "$UNIT"
 rm -f /tmp/kvmem-vllm.service.$$
 systemctl daemon-reload
 echo "installed $UNIT (user=$RUN_USER repo=$REPO exec=$START_SCRIPT)"
+
+# 启动脚本里 ${VAR:-默认} 遇到 EnvironmentFile 已有的同名变量会保留文件值，
+# 这类"改了脚本不生效"最常见。装完顺手提醒一次。
+for f in /etc/default/kvmem-vllm "$RUN_HOME/.config/kvmem-vllm.env"; do
+  [ -f "$f" ] || continue
+  grep -nE '^(MODEL|SERVED_NAME|B|R|SINK|RECENT|CTX|GPU_UTIL|MAX_MODEL_LEN)=' "$f" 2>/dev/null |     sed "s#^#  warn: $f:#" || true
+done
 echo "next: systemctl enable --now kvmem-vllm"

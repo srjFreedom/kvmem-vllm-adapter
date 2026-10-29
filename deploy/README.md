@@ -23,6 +23,11 @@ MODEL=$HOME/models/<你的模型> ./start-kvmem-vllm.sh
 2. **`~/.config/kvmem-vllm.env`**（systemd 用法）：单元里有 `EnvironmentFile=-%h/.config/kvmem-vllm.env`，
    文件存在就加载，不存在就忽略。内容就是 `KEY=VALUE` 一行一个。
 
+**优先级（容易踩）**：`EnvironmentFile` 里的值在启动脚本运行前就已经在环境里，脚本里的
+`${VAR:-默认}` 会**保留文件值**、忽略自己的默认值——所以"改了脚本里的 MODEL 却不生效"多半是
+环境文件里也有同名的 `MODEL`。约定：**模型/预算这类站点参数写在启动脚本里**（脚本优先），
+环境文件只放机器级开关；`deploy/install-service.sh` 安装时会打印环境文件里的冲突键作为提醒。
+
 ```bash
 sudo ./deploy/install-service.sh
 mkdir -p ~/.config && printf 'MODEL=%s\n' "$HOME/models/<你的模型>" > ~/.config/kvmem-vllm.env

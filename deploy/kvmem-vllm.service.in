@@ -19,7 +19,10 @@ WorkingDirectory=@REPO@
 Environment=HOME=@HOME@
 Environment=MALLOC_ARENA_MAX=2
 Environment=KV_PIDFILE=/run/kvmem-vllm/kvmem-vllm.pid
-# Site parameters: /etc/default/kvmem-vllm (system) then the user file; both optional.
+# Site parameters, both optional. NOTE the precedence: values from these files are
+# already in the environment, so a startup script doing ${VAR:-default} keeps the FILE
+# value and silently ignores its own default. Put MODEL / SERVED_NAME / budgets in the
+# startup script (it then wins) and keep these files for machine-level knobs only.
 EnvironmentFile=-/etc/default/kvmem-vllm
 EnvironmentFile=-@HOME@/.config/kvmem-vllm.env
 ExecStart=@START_SCRIPT@
