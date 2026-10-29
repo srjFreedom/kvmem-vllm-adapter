@@ -29,8 +29,10 @@ class Checkpoint:
         self.state = state
         self.step = int(step or 0)
         self.bytes = 0
-        for _slot, tensors in (state or {}).items():
-            for t in tensors or ():
+        for _key, value in (state or {}).items():
+            # `_capture_state_snapshot` stores {group: (slot, [tensors])}; accept a bare list too.
+            tensors = value[1] if isinstance(value, tuple) and len(value) == 2 else value
+            for t in (tensors or ()):
                 try:
                     self.bytes += int(t.numel()) * int(t.element_size())
                 except Exception:

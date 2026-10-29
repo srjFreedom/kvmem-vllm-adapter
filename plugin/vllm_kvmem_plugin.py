@@ -697,7 +697,12 @@ def _attach_sparse(runner, log_path):
             from kvmem_session_store import get_session_store
             _bs = int(getattr(getattr(getattr(runner, "vllm_config", None), "cache_config", None),
                                "block_size", 0) or 0)
-            runtime.enable_session_reuse(get_session_store("worker"), _bs)
+            # Hand the catalog to the session store: state images get one owner (with size
+            # accounting and eviction) instead of the store keeping its own copy.
+            _store = get_session_store("worker")
+            if getattr(runtime, "checkpoints", None) is not None:
+                _store.catalog = runtime.checkpoints
+            runtime.enable_session_reuse(_store, _bs)
             runtime.capture_state = (
                 lambda req: _capture_state_snapshot(runner, runtime, req))
             runtime.restore_state = (

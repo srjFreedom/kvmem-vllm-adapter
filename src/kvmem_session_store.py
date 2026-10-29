@@ -27,20 +27,34 @@ from vllm.utils.hashing import get_hash_fn_by_name
 
 
 class SessionEntry:
-    """A parked session: its block-hash prefix plus everything needed to resume it."""
+    """A parked session: its block-hash prefix plus everything needed to resume it.
+
+    The recurrent state image is NOT owned here any more: it lives in the
+    `kvmem_checkpoints.CheckpointCatalog` (purpose="session") and this entry keeps the reference. That
+    is the v0.19 split - one catalog owns every state image, so session parking, query replay and
+    reconstruction share the same accounting and eviction instead of each keeping its own copy.
+    """
 
     __slots__ = ("block_hashes", "orchestrator", "covered_tokens", "page_tokens",
-                 "mamba_state", "session_id", "last_used")
+                 "checkpoint", "session_id", "last_used", "_mamba_state")
 
     def __init__(self, block_hashes, orchestrator, covered_tokens, page_tokens,
-                 mamba_state=None, session_id=None):
+                 mamba_state=None, session_id=None, checkpoint=None):
         self.block_hashes = tuple(block_hashes)
         self.orchestrator = orchestrator
         self.covered_tokens = int(covered_tokens)
         self.page_tokens = int(page_tokens)
-        self.mamba_state = mamba_state
+        self.checkpoint = checkpoint
+        self._mamba_state = None if checkpoint is not None else mamba_state
         self.session_id = session_id
         self.last_used = 0
+
+    @property
+    def mamba_state(self):
+        """The state image, wherever it currently lives (catalog first)."""
+        if self.checkpoint is not None:
+            return self.checkpoint.state
+        return self._mamba_state
 
 
 class SessionStore:
@@ -51,10 +65,14 @@ class SessionStore:
     slice of H forever).
     """
 
-    def __init__(self, max_sessions: int = 2, on_evict=None):
+    def __init__(self, max_sessions: int = 2, on_evict=None, catalog=None):
         self._entries: "OrderedDict[tuple, SessionEntry]" = OrderedDict()
         self._max_sessions = max(1, int(max_sessions))
         self._on_evict = on_evict
+        self.catalog = catalog          # CheckpointCatalog that owns the state images
+
+    def _key(self, block_hashes):
+        return "session:" + ":".join(str(h) for h in tuple(block_hashes)[-2:])
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -72,8 +90,12 @@ class SessionStore:
             # Same conversation re-parked with newer state: the new entry replaces the old one, and
             # the OLD orchestrator's share must be released (the caller owns that bookkeeping).
             self._drop(old)
+        ck = None
+        if self.catalog is not None and mamba_state:
+            ck = self.catalog.put(self._key(block_hashes), "session", int(covered_tokens),
+                                  int(covered_tokens), (), mamba_state, step=int(covered_tokens))
         self._entries[key] = SessionEntry(block_hashes, orchestrator, covered_tokens,
-                                          page_tokens, mamba_state, session_id)
+                                          page_tokens, mamba_state, session_id, checkpoint=ck)
         self._entries.move_to_end(key)
         while len(self._entries) > self._max_sessions:
             # Evict whole sessions only: a half session would leave a resume length that no longer
@@ -82,6 +104,8 @@ class SessionStore:
             self._drop(evicted)
 
     def _drop(self, entry) -> None:
+        if self.catalog is not None and getattr(entry, "checkpoint", None) is not None:
+            self.catalog.drop(self._key(entry.block_hashes))
         if self._on_evict is not None:
             try:
                 self._on_evict(entry)
