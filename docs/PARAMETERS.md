@@ -15,7 +15,7 @@ systemd 的 `ExecStart` 指向哪个 start 脚本就用哪套配置。改完 `su
 
 | 参数 | 默认 | 含义 | 改大会怎样 / 约束 |
 |---|---|---|---|
-| `B` | `36864`（36K）| 每次请求最多发给引擎的**历史** token 数（kvmem 的 budget）| 越大越吃上下文窗口和 prefill 时间；必须 ≥ `SINK+RECENT` 否则选片无处可裁（启动会告警）|
+| `B` | `36864`（36K）| 引擎工作集内选中的历史 token 预算；入口常驻模式下完整 prompt 仍会进入引擎 | 必须 ≥ `SINK+RECENT`，增大会抬高压缩后 KV 需求 |
 | `R` | `16384`（16K）| 生成上限，同时是**驻留预留**：`max_tokens` 会被夹到 `R`，缺省则写入 `R` | 越大显存/上下文占用越多；`N×(B+R)` 必须装进 KV 池 |
 | `CTX` | `524288` | kvmem 的**逻辑上下文上限**（512K），与引擎窗口无关 | 超限直接 `400`。它只约束"历史能有多长"，不影响显存 |
 | `SINK` | `8192` | 永远保留的开头 token 数 | 指令/角色设定放开头时调大 |
@@ -62,11 +62,16 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 |---|---|---|---|
 | `GPU_UTIL` | `0.97` | vLLM 请求的显存占用比例（`--gpu-memory-utilization`）| 22 GB 卡用 0.97；显存更小的卡降低（0.90~0.95），OOM 时**先降这个** |
 | `MAX_BATCHED_TOKENS` | `4096` | 单步 prefill 的 token 上限（chunk 大小）| 调大可减少 chunk 数、提升 prefill 并行度，但吃显存；调大后必须重跑启动 smoke |
-| `KVMEM_ENTRY_RESIDENT_PREFILL` | `1`（随内压缩自动打开）| 常驻工作区：入口不裁剪、整条 prompt 常驻到**引擎窗口 = 物理 KV 池**（`MAX_MODEL_LEN` 自动适配，没有单独旋钮），压缩只在 decode 发生；与 `--kvmem-inrequest-compaction` 成对使用 | 只有调试 prefill 期压缩时才设 `0`（那条路径会答错） |
+| `KVMEM_ENTRY_RESIDENT_PREFILL` | `1`（随内压缩自动打开）| 入口不裁剪，完整 prompt 进入引擎；池内可常驻，**超池时仍须在 prefill 中压缩**（`KVMEM_RESIDENT_PREFILL_COMPACT=1`） | 单独打开并不能让超池 prompt 装入物理池 |
 | `--kvmem-block-tokens` | `32` | 选片块大小（必须是最小 KV 页 16 的整数倍）| 32 是修复值：检索按块取 pre-RoPE key 的**均值**打分，128 会让一条关键行（key/id/罕见词）被同块另外 ~127 个 token 稀释 —— 实测 200K prompt 在 50%~73% 换出时，128 答非所问、32 两把 needle 全中。调回 128 只在上下文很短（<32K）且不需要精确召回时才有意义 |
 | `KVMEM_DEBUG_POS` | 空（关）| 诊断：每一步在 `/tmp/kvmem_sparse.jsonl` 落一条 `debug_pos`，记录引擎为该请求算出的 `positions` 前 8 个、`npc`（常驻计数镜像）、`nlg`（服务计数镜像）、`seq_len` | 只在查「解码位置不前进 / 输出重复」时打开；`n` 应恒为 1+drafts（MTP=4 时 5），位置窗口应逐 step 前进 |
 | `SPECULATIVE_TOKENS` | `4` | MTP 投机 token 数 | `0` = 关闭投机：省显存/更稳，但 decode 变慢 |
-| `NO_ASYNC_SCHEDULING` | `0` | `0` = 异步调度（默认），`1` = 强制同步 | 入口选片下引擎无块表改写，异步调度安全；两种模式实测**同速**。开 `inrequest-compaction` 时 worker **强制写回 `1`**（显式 `0` 会被覆盖并打印原因：异步预排下一步会与块表改写冲突） |
+| `NO_ASYNC_SCHEDULING` | `0` | `0` = 异步调度（默认），`1` = 强制同步 | 入口选片下引擎无块表改写，异步调度安全；开 `inrequest-compaction` 时 worker 强制写回 `1`。整体重算只支持同步。 |
+| `KVMEM_COMPACT_REBUILD` | `0` | 在超池 prompt 的最后一个 prefill forward 后用两张卡的平均评分选片，丢弃旧采样并把选中 token 重新 prefill；原始 prompt 的 API usage 不变。须与 `KVMEM_PROMPT_END_RESELECT=1`、`KVMEM_ENTRY_RESIDENT_PREFILL=1`、`KVMEM_RESIDENT_PREFILL_COMPACT=1`、`KVMEM_SKIP_KV_CHECK=1` 联用 | **实验**：仅同步 V2、TP2、PP1、无前缀缓存的单文本请求；不支持多模态/流式输入/输出 prompt logprobs/跨请求 session 重用。重建后该请求禁止 MTP 投机；全局 MTP4 的 1+4 状态槽仍保留。 |
+| `KVMEM_PROMPT_END_RESELECT` | `0` | 在完整 prompt 的 query 可用时重新检索 | 当前应与整体重算一起开；仅重排而不重算不能修正旧循环状态。 |
+| `KVMEM_SKIP_KV_CHECK` / `KVMEM_MAX_MODEL_LEN` | `0` / 引擎窗口 | 允许逻辑 prompt 超过物理池并提供足够的输入缓冲区 | 显式实验开关，默认不得跳过 KV 容量检查。 |
+| `KVMEM_RESIDENT_PREFILL_COMPACT` | `0` | 在物理池装不下原 prompt 时按高水位压缩常驻工作集 | 不开会在块池耗尽前停住。 |
+| `KVMEM_BLOCK_SIZE` | 未指定 | 请求引擎使用小块；混合模型实际 attention 块仍可能按 Mamba 对齐放大（实测为 1616 token=101 个 16-token 页） | 重算回收按实际 `blocks_per_kv_block`，不按环境变量猜块大小。 |
 | `--kvmem-inrequest-compaction` | **开** | **常驻工作区的唯一开关**：入口上限 `R`→`CTX`（自动导出给入口进程）+ 入口不再裁剪历史 + 引擎内压缩（prefill 与 decode 都做）+ block 通道 + 强制同步调度 + 关闭前缀缓存。默认开启时**同时**打开常驻工作区（`KVMEM_ENTRY_RESIDENT_PREFILL=1`）——两者是一个功能；只开压缩会退回「入口裁到 B + prefill 期压缩」那条会答错的路径。设 0 = 完全走 vLLM 原始路径（入口裁到 B、上限 R） | 加这一个参数，显存就是每请求 `B+R`（与上下文长度无关）；显式把 `KVMEM_ENTRY_INREQUEST_COMPACTION` 设成相反值会被它纠正并打印原因 |
 | `MESSAGE_TYPE` | `text+image` | 是否加载视觉塔 | 纯文本模型/只跑文本时设 `text`（省 ~0.9 GiB 权重）|
 | `MM_IMAGE_LIMIT` | `64` | 每 prompt 允许图片数 | 与 `MESSAGE_TYPE` 配套 |

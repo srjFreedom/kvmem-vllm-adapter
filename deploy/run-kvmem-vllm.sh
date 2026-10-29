@@ -11,12 +11,14 @@
 #   覆盖：B= R= SINK= RECENT= SESSIONS= HOST_MIB= N= CTX= PORT= ./本脚本
 #   超池相关（默认关闭/默认值，仅供实验）：
 #     SELECT_BLOCK_TOKENS=1616   选择网格 = 引擎块（默认 32 = 32 token）
-#     KVMEM_BLOCK_SIZE=16        引擎块 = KVMem 页（默认走模型的 1616-token 块）；
-#                                设为 16 后分散的页选择才能被池子回收（否则第二次压缩 assert block）
+#     KVMEM_BLOCK_SIZE=16        请求 16-token 引擎块；混合模型会按 Mamba 对齐，
+#                                本机实测 attention 原生块仍为 1616 tokens（101 页），
+#                                回收必须按原生块所有权处理
 #     KVMEM_PROMPT_END_RESELECT=1 prefill 结束用 query 重排工作集
 #     KVMEM_CHECKPOINT_REPLAY=1  重排后把尾部 N 个 token 按新视图重算（QueryReplay）
 #     KVMEM_REPLAY_WINDOW=2048   尾部长度的默认值
-#     KVMEM_COMPACT_REBUILD=1    改写 token 账本做整体重建（当前会停摆，仅实验用）
+#     KVMEM_COMPACT_REBUILD=1    prompt 结束时 TP 汇总评分并将最终工作集整体重算；
+#                                仅同步 V2 / TP2 / PP1 / 单文本请求，默认关闭。
 # ============================================================================
 set -uo pipefail
 LOG=${LOG:-$HOME/kvmem.log}

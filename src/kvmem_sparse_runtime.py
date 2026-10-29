@@ -228,6 +228,61 @@ class VllmSparseRuntime:
         self.kv_heads = 0
         self.statistics_layers = 0
 
+    def is_rebuilt(self, req):
+        return req in getattr(self, "_rebuilt_req", ())
+
+    def accept_reconstruction(self, req):
+        """Retire the old position space on EVERY TP rank before fresh worker admission.
+
+        The original host archive remains owned until request cleanup. Recomputed KV uses the
+        engine's native dense path; old logical-page statistics must never be overwritten by
+        compacted position IDs.
+        """
+        self._rebuilt_req = getattr(self, "_rebuilt_req", set())
+        self._rebuilt_req.add(req)
+        st = self._state.get(req)
+        if st is not None:
+            self._seq_override.pop(st.row_index, None)
+            self._release_slots(req, set())
+            st.row = st.logical = ()
+            st.tokens = st.seq_len = 0
+            st.spare = None
+            st.rebuilt = True
+            st.query_reselected = True
+        for mapping in (self._prev_n, self._pending_new, self._pending_frontier,
+                        self._inflight, self._engine_computed, self._engine_logical,
+                        self._page_map, self._absorb_upto):
+            mapping.pop(req, None)
+        self.log({"kind": "reconstruction_started", "req": req,
+                  "rank": int(getattr(self, "tp_rank", 0))})
+
+    def finish_prompt_for_reconstruction(self, req, n_new, logical_end, resident_end):
+        """Commit the final forward and queue its selected tokens before any sample escapes."""
+        if not self.compact_rebuild or self.is_rebuilt(req):
+            return False
+        st = self.state(req)
+        if st.rebuilt:
+            return False
+        runner = getattr(self.view, "runner", None)
+        if runner is not None:
+            batch = runner.execute_model_state.input_batch
+            resident_end = int(batch.seq_lens[batch.req_ids.index(req)].item())
+        self._engine_logical[req] = int(logical_end)
+        self._engine_computed[req] = int(resident_end)
+        self._pending_new[req] = int(n_new)
+        self._finishing_reconstruction = True
+        try:
+            self.after_step(req, int(n_new), prefill=True)
+        finally:
+            self._finishing_reconstruction = False
+        self._prev_n[req] = 0
+        self._inflight[req] = 0
+        st.query_reselected = True
+        self._reselect(req, probe=True, rebuild=True)
+        if not st.rebuilt:
+            raise RuntimeError("prompt reconstruction did not queue a fresh admission")
+        return True
+
     # --- state -------------------------------------------------------------------------
     def _absorb_engine_row(self, req):
         """Record which engine page holds each logical page (index = logical page)."""
@@ -865,7 +920,7 @@ class VllmSparseRuntime:
             except Exception:
                 pass
         parked = False
-        if self.session_reuse and st is not None:
+        if self.session_reuse and st is not None and not self.is_rebuilt(req):
             try:
                 parked = self._park_session(req)
             except Exception:
@@ -898,6 +953,7 @@ class VllmSparseRuntime:
         self._prev_n.pop(req, None)
         self._prompt_ids.pop(req, None)
         self._resume.pop(req, None)
+        getattr(self, "_rebuilt_req", set()).discard(req)
         if (orch is not None and not parked
                 and getattr(self, "budget_pool", None) is not None):
             session = getattr(orch, "session_id", None)
@@ -922,6 +978,8 @@ class VllmSparseRuntime:
         """Install the request's sparse view. `row_index` is the batch row of the request and
         `position_slots` the positions[] indices of its query tokens (live runner: derived from
         idx_mapping and query_start_loc)."""
+        if self.is_rebuilt(req):
+            return None
         self._ensure(req)
         st = self._state[req]
         if row_index is not None:
@@ -1158,9 +1216,10 @@ class VllmSparseRuntime:
             # at the top (score 5.32 vs 1.77) but the answer went from correct to "7", because the
             # state no longer matches the installed view. Off unless explicitly enabled; the
             # state-consistent re-rank needs a reconstruction pass.
-            _finished = (self.reselect_at_prompt_end
+            _finished = (not self.compact_rebuild and self.reselect_at_prompt_end
                          and _prev_n > 1 and int(n_new or 0) <= 1)
-            if (((_plq and int(getattr(_stq, "tokens", 0)) >= _plq) or _finished)
+            if (not self.compact_rebuild
+                    and ((_plq and int(getattr(_stq, "tokens", 0)) >= _plq) or _finished)
                     and not getattr(_stq, "query_reselected", False)
                     and getattr(_stq, "row", ())
                     and _orchq is not None
@@ -1420,6 +1479,8 @@ class VllmSparseRuntime:
 
         st.steps += 1
         orch.tick()
+        if getattr(self, "_finishing_reconstruction", False):
+            return st
         if not prefill and not st.prefill_done and st.tokens:
             # First decode step: anchor the R cadence at the prompt length. Without this the first
             # R check is already true (the logical total covers the prompt) and every request would
@@ -1427,7 +1488,7 @@ class VllmSparseRuntime:
             # tokens, exactly when the pool (B history + R output) is full.
             st.prefill_done = True
             orch._tokens_at_reselect = max(0, st.tokens - n_new_tokens)
-            if (st.row and not st.query_reselected
+            if (not self.compact_rebuild and st.row and not st.query_reselected
                     and getattr(orch, "retrieval_index", None) is not None):
                 # The prompt was compacted during prefill (no query existed then, so only
                 # sink+recent survived). Now the capture bridge holds the real query: reselect
@@ -1820,8 +1881,15 @@ class VllmSparseRuntime:
         # would make the view exceed B and the plan would be rejected anyway (the compact also
         # refuses to go below the prompt).
         forced = mandatory if _prompt_fits else []
+        score_reducer = None
+        if rebuild and self.compact_rebuild:
+            from kvmem_tp_scores import average_reconstruction_scores
+            device = self.view.paged_kv()[0].device
+            score_reducer = lambda scores, count: average_reconstruction_scores(
+                scores, count, req, st.tokens, device)
         stats = orch.reselect(slots=_take, mandatory_pages=mandatory,
-                              forced_pages=forced, prefill_pressure=prefill_pressure)
+                              forced_pages=forced, prefill_pressure=prefill_pressure,
+                              score_reducer=score_reducer)
         selected = list(orch.last_view.row_pages)
         used = list(orch.slots[:len(selected)])
         spare = taken["slots"][-1]
@@ -1837,7 +1905,14 @@ class VllmSparseRuntime:
             st.row = tuple(used) + (spare,)
             st.logical = tuple(selected) + (None,)
             st.spare = spare
-        st.seq_len = min(st.tokens, len(selected) * self.page_tokens)
+        st.seq_len = sum(min(self.page_tokens, max(0, st.tokens - p * self.page_tokens))
+                         for p in selected)
+        # Only allocated native blocks remain in the row after EngineCore frees its tail.
+        quantum = max(1, int(getattr(self, "block_pages", self.pages_per_block) or 1))
+        keep_pages = ((len(used) + quantum - 1) // quantum) * quantum
+        if getattr(self, "compact_channel", None) is not None:
+            st.row = st.row[:keep_pages]
+            st.logical = st.logical[:keep_pages]
         # V4 needle: sample a few resident pages and verify the device copy is exactly one
         # rotation of the stored bytes. Cheap (a handful of pages) and catches any drift.
         if int(getattr(self, "full_needle", 0)) > 0:
@@ -1886,59 +1961,32 @@ class VllmSparseRuntime:
         score_stats = getattr(orch, "last_score_stats", None)
         if score_stats:
             record["scores"] = score_stats          # proof that retrieval ranking was applied
-        # Three-book reconciliation (Route A): the worker has rewritten the block-table row to the
-        # compacted working set, but the engine still tracks the monotone sequence length. Tell
-        # EngineCore to truncate `_all_token_ids` to the visible tokens and rewind
-        # `num_computed_tokens`, so the scheduler sees no gap and does not recompute the spilled
-        # tokens. Synchronous: the worker blocks until the engine applies it, so the next schedule
-        # (step k+1) is already consistent.
+        # The worker installed a compacted row. EngineCore rewinds only resident KV
+        # while keeping the original logical tokens untouched; reconstruction alone
+        # queues a new prompt for a safe output boundary. The channel reply gates
+        # whether the worker may retain the selected view.
         ch = getattr(self, "compact_channel", None)
         if ch is not None and selected:
             try:
-                # Reconstruction: zero the recurrent state and rewrite the engine's token book to
-                # the compacted sequence, so the selected pages are prefilled from scratch. Only at
-                # the prefill boundary, where the sequence may legitimately change.
-                _st_r = self._state.get(req)
-                # A reconstruction rewrites the token book, so it may only happen where the sequence
-                # is allowed to change shape: at the prompt boundary, explicitly asked for. Firing it
-                # from the first pressure compaction broke a 147K prefill in 90 seconds.
-                _rebuild = (bool(rebuild)
-                            and bool(getattr(self, "compact_rebuild", True))
-                            and not bool(getattr(_st_r, "rebuilt", False))
-                            and int(getattr(self, "tp_rank", 0) or 0) == 0)
-                if _rebuild and self.reset_state is not None:
-                    try:
-                        self.reset_state(req)
-                    except Exception:
-                        _rebuild = False
-                # `block_pages`: how many native pages one ENGINE block owns (101 on this model).
-                # The engine needs it to adopt the compacted block list.
-                res = ch.compact(req, selected, self.page_tokens,
-                                 visible_tokens=int(st.seq_len), rebuild=_rebuild,
-                                 block_pages=int(getattr(self, "block_pages", 0) or 0))
-                if _rebuild and isinstance(res, dict) and res.get("rebuild"):
-                    try:
-                        self._rebuilt_req = getattr(self, "_rebuilt_req", set())
-                        self._rebuilt_req.add(req)      # once per request, ever
-                    except Exception:
-                        pass
-                    # One reconstruction per request: repeating it re-prefills the compacted
-                    # sequence again and again (measured: compact_rebuilt fired twice with
-                    # 36864 then 32768 tokens before the engine tripped an assert).
-                    _st_r.rebuilt = True
-                    # The ENGINE now re-prefills the compacted sequence from position 0, so the
-                    # runtime's two books have to go back to 0 as well - otherwise `sync_row` and
-                    # the published position offset keep describing the old (long) sequence and the
-                    # request stalls at the first post-rebuild decode step ("no sampled token").
-                    _st_r.tokens = 0
-                    _st_r.seq_len = 0
-                    _st_r.row = tuple(int(p) for p in selected)   # selected is position-sorted
-                    _st_r.prefill_done = False                    # the coming steps ARE a prefill
-                    _st_r.spare = None
-                    if self.log is not None:
-                        self.log({"kind": "reconstruction_started", "req": req,
-                                  "pages": len(selected), "tokens": len(selected) * self.page_tokens,
-                                  "reply": {k: res.get(k) for k in ("rebuild", "tokens", "ok")}})
+                # Queue reconstruction; the scheduler applies it AFTER this forward's output
+                # arrives. Both TP workers receive a fresh request event on the next schedule.
+                _rebuild = bool(rebuild and self.compact_rebuild and not st.rebuilt)
+                if _rebuild and int(getattr(self, "tp_rank", 0)) != 0:
+                    # The old KV on this rank is about to be discarded. The fresh V2
+                    # admission will deliver rank zero's consensus-scored prompt to
+                    # every worker, even if this rank lacks a canonical host page.
+                    res = {"ok": True, "truncated": True, "rebuild": True,
+                           "queued": False}
+                else:
+                    res = ch.compact(req, selected, self.page_tokens,
+                                     visible_tokens=int(st.seq_len), rebuild=_rebuild,
+                                     block_pages=int(getattr(self, "block_pages", 1) or 1),
+                                     physical_pages=used)
+                if _rebuild:
+                    if not isinstance(res, dict) or not res.get("ok"):
+                        raise RuntimeError(f"reconstruction refused: {res}")
+                    st.rebuilt = True
+                    record["rebuild_pending"] = True
                 if isinstance(res, dict):
                     record["compact_applied"] = bool(res.get("ok"))
                     record["compact_truncated"] = bool(res.get("truncated"))
@@ -1949,7 +1997,7 @@ class VllmSparseRuntime:
                 # The worker's block-table append cursor (`num_blocks.np[group, req]`) counts the
                 # page slots written so far; installing a shorter row must move it, or the next
                 # engine block is written at the old slot ('row capacity (11514 > 11312)').
-                if self.set_block_cursor is not None and st.row:
+                if not _rebuild and self.set_block_cursor is not None and st.row:
                     try:
                         self.set_block_cursor(req, len(st.row))
                     except Exception:
@@ -1965,6 +2013,8 @@ class VllmSparseRuntime:
                     st.spare = None
             except Exception as exc:
                 record["compact_error"] = str(exc)[:160]
+                if rebuild:
+                    raise
         # Slots this request no longer references go back to the pool. On a refusal only the slots
         # taken in this round are dropped; the old sources stay because the orchestrator still
         # points at them (the engine's own row was not touched).

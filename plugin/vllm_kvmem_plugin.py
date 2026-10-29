@@ -784,15 +784,10 @@ def _attach_sparse(runner, log_path):
     runtime.compact_rebuild = (bool(cfg.get("compact_rebuild", False))
                                or os.environ.get("KVMEM_COMPACT_REBUILD", "") in
                                ("1", "true", "yes", "on"))
-    # The rebuild rewrites ONE engine-side token book, so only rank 0 may ask for it. Both ranks
-    # still send their ordinary compact message (each owns its KV), but a second rebuild would
-    # re-derive the token list from an already-rewritten book (measured: 7 rebuild records and
-    # garbage output).
-    try:
-        runtime.tp_rank = int(getattr(getattr(runner.vllm_config, "parallel_config", None),
-                                      "rank", 0) or 0)
-    except Exception:
-        runtime.tp_rank = 0
+    # Reconstruction writes a single EngineCore token book. Score consensus runs on every
+    # rank, but only rank zero in the TP group publishes the selected token sequence.
+    from vllm.distributed.parallel_state import get_tp_group
+    runtime.tp_rank = int(get_tp_group().rank_in_group)
     # Experimental switches arrive through the plugin config (env does not reach the workers).
     try:
         if cfg.get("prompt_end_reselect"):
@@ -804,6 +799,7 @@ def _attach_sparse(runner, log_path):
         _append(log_path, {"kind": "checkpoint_flags", "pid": os.getpid(),
                            "prompt_end_reselect": bool(runtime.reselect_at_prompt_end),
                            "checkpoint_replay": bool(runtime.checkpoint_replay),
+                            "compact_rebuild": bool(runtime.compact_rebuild),
                            "catalog": runtime.checkpoints is not None,
                            "cfg_keys": [k for k in cfg if "replay" in k or "reselect" in k
                                         or "rebuild" in k]})
@@ -1415,7 +1411,7 @@ def register():
             return {"ok": True, "replay": int(n), "computed": int(req.num_computed_tokens)}
 
         def _compact(request_id, pages, page_tokens, visible_tokens=0, rebuild=False,
-                     block_pages=0):
+                     block_pages=0, physical_pages=None):
             """Resident-book reconciliation (Route A / resident model).
 
             The worker selected a working set and has ALREADY installed it into the block table row
@@ -1438,208 +1434,31 @@ def register():
                 req = (getattr(scheduler, "requests", None) or {}).get(request_id)
             if req is None:
                 return False
-            # The worker's own visible length wins: it is `min(tokens, len(pages)*page)` and can be
-            # a few tokens SHORTER than the page product. Using the product here made the engine's
-            # `num_computed_tokens` disagree with the installed row by up to a page, shifting every
-            # later position and corrupting the context (measured: 80K prompts answered with noise
-            # whenever prefill-time compaction ran).
-            visible = int(visible_tokens or 0) or int(len(pages)) * int(page_tokens)
-            before_computed = int(req.num_computed_tokens)
-            applied = _compact_state.get(request_id)
-            already = applied == visible
-            if already and before_computed <= visible:
-                # TP-rank idempotency: the peer rank already applied this compaction. Still report
-                # `truncated` so the second rank installs its own view (each rank owns its KV).
-                return {"ok": True, "truncated": True, "visible": visible}
-            req.num_computed_tokens = max(0, visible)
-            # The served count and the resident count differ by exactly this rewind, and nothing
-            # else: the scheduler re-derives `num_logical = num_computed + offset` after every
-            # schedule, so the offset MUST be updated together with the rewind. Without it the two
-            # books disagree after the first compaction and the scheduler over-schedules.
-            req.num_kvmem_offset = int(getattr(req, "num_logical_tokens", 0)) \
-                - int(req.num_computed_tokens)
-            if rebuild and request_id in _rebuilt_requests:
-                return {"ok": True, "truncated": True, "rebuild": True, "skipped": "already rebuilt"}
+            # Logical page ids select tokens; physical slots identify allocator-owned blocks.
+            # Never use one namespace as the other, even when their initial values coincide.
+            from kvmem_reconstruction import select_tokens, adopt_attention_blocks
             if rebuild:
-                # RECONSTRUCTION (upstream's CheckpointPurpose::Reconstruction): rewrite the
-                # request's token book to the COMPACTED sequence and rewind both counters to zero,
-                # so the engine prefills the selected pages from scratch. The recurrent state is
-                # zeroed by the worker beforehand, which is what removes the approximation that
-                # prefill-time compaction leaves in it.
-                try:
-                    pages = [int(p) for p in pages]
-                    ids = list(getattr(req, "_all_token_ids", []) or [])
-                    new_ids = []
-                    for p in pages:
-                        new_ids.extend(ids[p * page_tokens:(p + 1) * page_tokens])
-                    if new_ids:
-                        new_ids = new_ids[:visible] if visible else new_ids
-                        req._all_token_ids[:] = new_ids
-                        req.num_prompt_tokens = len(new_ids)
-                        req.num_computed_tokens = 0
-                        req.num_logical_tokens = 0
-                        req.num_kvmem_offset = 0
-                        # Drafts and placeholders describe the sequence BEFORE the rewrite; keeping
-                        # them makes the next schedule ask for more logits rows than it schedules
-                        # (measured: scheduled=4, logits=5 -> assert in prepare_inputs).
-                        try:
-                            req.spec_token_ids = []
-                            # One placeholder = "a token is in flight", which is the state of a
-                            # request that has JUST finished prefilling. Setting 0 made the sampler
-                            # emit nothing after the rebuild ("no sampled token", 26-minute stall).
-                            req.num_output_placeholders = 1
-                        except Exception:
-                            pass
-                        _compact_state[request_id] = visible      # peer message sees "already applied"
-                        _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
-                                {"kind": "compact_rebuilt", "req": request_id,
-                                 "pages": len(pages), "tokens": len(new_ids)})
-                        _rebuilt_requests.add(request_id)
-                        try:
-                            # A rebuilt request must not speculate either: after the rewrite its
-                            # num_kvmem_offset is 0, so the offset-based gate no longer catches it,
-                            # and the draft rows then exceed what the re-prefill step schedules
-                            # ('assert (num_scheduled_tokens_np >= num_logits) in prepare_inputs').
-                            req.kvmem_rebuilt = True
-                        except Exception:
-                            pass
-                        return {"ok": True, "truncated": True, "rebuild": True,
-                                "tokens": len(new_ids)}
-                except Exception:
-                    _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
-                            {"kind": "compact_rebuild_error", "req": request_id,
-                             "error": traceback.format_exc()[-400:]})
-            # Adopt the compacted block list in the ENGINE. The paged table is a flat reflection of
-            # the request's engine blocks (a block owns `block_pages` consecutive page slots, block i
-            # at pages i*block_pages...), so after installing a shorter row the ENGINE must also
-            # think the request has exactly those blocks - otherwise the next allocation appends at
-            # the OLD block position and leaves a gap of stale page ids that the kernel then attends
-            # to (this is the beyond-pool illegal access).
-            try:
-                if int(block_pages or 0) > 1 and pages:
-                    _bp = int(block_pages)
-                    _sel = [int(p) for p in pages]
-                    _blocks = sorted({p // _bp for p in _sel})
-                    _whole = all(len([p for p in _sel if p // _bp == b]) == _bp for b in _blocks)
-                    if not _whole:
-                        _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
-                                {"kind": "compact_blocks_partial", "req": request_id,
-                                 "pages": len(_sel), "blocks": len(_blocks), "block_pages": _bp})
-                    _mgr = None
-                    for _m in list(getattr(scheduler.kv_cache_manager.coordinator,
-                                           "single_type_managers", ()) or ()):
-                        if "FullAttention" in type(_m).__name__:
-                            _mgr = _m
-                            break
-                    _map = getattr(_mgr, "req_to_blocks", None) if _mgr is not None else None
-                    if _map is not None:
-                        _new = []
-                        for _b in _blocks:
-                            _obj = None
-                            try:
-                                _obj = scheduler.kv_cache_manager.block_pool.blocks[_b]
-                            except Exception:
-                                _obj = None
-                            if _obj is not None:
-                                _new.append(_obj)
-                        _old = list(_map.get(request_id) or ())
-                        _freed = [b for b in _old if b not in _new]
-                        if _new:
-                            _map[request_id] = _new
-                        if _freed:
-                            scheduler.kv_cache_manager.block_pool.free_blocks(_freed)
-                        _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
-                                {"kind": "compact_blocks_adopted", "req": request_id,
-                                 "blocks": len(_new), "freed": len(_freed),
-                                 "whole": bool(_whole),
-                                 "free_blocks": int(scheduler.kv_cache_manager.block_pool
-                                                    .get_num_free_blocks())})
-            except Exception:
+                token_ids = select_tokens(req.prompt_token_ids, pages, page_tokens)
+                reply = scheduler.queue_kvmem_reconstruction(request_id, token_ids)
                 _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
-                        {"kind": "compact_blocks_error", "req": request_id,
-                         "error": traceback.format_exc()[-300:]})
-            # Pool accounting: a compaction rewinds the resident book but the ENGINE still owns the
-            # evicted blocks (vLLM frees blocks only at request end), so every compaction can leak
-            # them and the pool fills until the scheduler preempts - which then recomputes against a
-            # compacted row. Record the free-block count so the leak is visible.
-            try:
-                _pool = getattr(getattr(scheduler, "kv_cache_manager", None), "block_pool", None)
-                _free = int(_pool.get_num_free_blocks()) if _pool is not None else -1
-                _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
-                        {"kind": "compact_pool", "req": request_id, "visible": int(visible),
-                         "free_blocks": _free})
-            except Exception:
-                pass
-            # Pool accounting: a compaction rewinds the resident book but the ENGINE still owns the
-            # evicted blocks (vLLM frees blocks only at request end), so every compaction can leak
-            # them, the pool fills, and the scheduler preempts - which then recomputes against a
-            # compacted row. Record the free-block count so the leak is visible.
-            try:
-                _pool = getattr(getattr(scheduler, "kv_cache_manager", None), "block_pool", None)
-                _free = int(_pool.get_num_free_blocks()) if _pool is not None else -1
-                _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
-                        {"kind": "compact_pool", "req": request_id, "visible": int(visible),
-                         "free_blocks": _free})
-            except Exception:
-                pass
-            _compact_state[request_id] = visible
-            # Hand the engine's OWN bookkeeping the compacted row. Until now only the worker's block
-            # table was rewritten, so the engine kept the pre-compaction block list (and kept
-            # allocating new blocks for every chunk on top of it): the pool drained to a handful of
-            # free blocks and the scheduler preempted, whose recompute then faced a compacted row.
-            _gt = set(int(p) for p in pages)
-            try:
-                if os.environ.get("KVMEM_COMPACT_FREE", "1") == "1":
-                    _pool = scheduler.kv_cache_manager.block_pool
-                    # The engine keeps its OWN per-request block list (per KV cache group) inside the
-                    # coordinators; `req.block_ids` is not populated in this fork. Rewriting only the
-                    # worker's block table left it holding the pre-compaction blocks forever, so
-                    # every chunk allocated new ones and the pool drained.
-                    _groups = []
-                    try:
-                        _coord = scheduler.kv_cache_manager.coordinator
-                        _groups = list(getattr(_coord, "single_type_managers", ()) or ())
-                    except Exception:
-                        _groups = []
-                    _blocks = getattr(req, "block_ids", None)
-                    if not _groups:
-                        _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
-                                {"kind": "compact_free_nogroups", "req": request_id})
-                    for _mgr in _groups:
-                        _map = getattr(_mgr, "req_to_blocks", None)
-                        if not _map:
-                            continue
-                        _cur = _map.get(request_id)
-                        if not _cur:
-                            continue
-                        _keep = [b for b in _cur if int(getattr(b, "block_id", -1)) in _gt]
-                        _gone = [b for b in _cur if int(getattr(b, "block_id", -1)) not in _gt]
-                        if _gone:
-                            _pool.free_blocks(_gone)
-                            _map[request_id] = _keep
-                        _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
-                                {"kind": "compact_freed", "req": request_id,
-                                 "group": type(_mgr).__name__, "kept": len(_keep),
-                                 "freed": len(_gone),
-                                 "free_blocks": int(_pool.get_num_free_blocks())})
-                    if _blocks:
-                        _kept = [int(p) for p in pages]
-                        _kept_set = set(_kept)
-                        _old = list(_blocks[0])
-                        _drop = [int(b) for b in _old if int(b) not in _kept_set]
-                        if _drop:
-                            _objs = [_pool.blocks[b] for b in _drop
-                                     if 0 <= b < len(getattr(_pool, "blocks", []))]
-                            _pool.free_blocks(_objs)
-                        _blocks[0] = _kept
-                        _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
-                                {"kind": "compact_freed", "req": request_id,
-                                 "kept": len(_kept), "freed": len(_drop),
-                                 "free_blocks": int(_pool.get_num_free_blocks())})
-            except Exception:
-                _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
-                        {"kind": "compact_free_error", "req": request_id,
-                         "error": traceback.format_exc()[-300:]})
+                        {"kind": "compact_rebuild_queued", "req": request_id,
+                         "pages": len(pages), "tokens": len(token_ids), **reply})
+                return reply
+            visible = int(visible_tokens or 0) or len(pages) * int(page_tokens)
+            before_computed = int(req.num_computed_tokens)
+            physical = tuple(int(p) for p in (physical_pages or ()))
+            key = (visible, physical)
+            if _compact_state.get(request_id) == key and before_computed <= visible:
+                return {"ok": True, "truncated": True, "visible": visible}
+            if not physical:
+                raise ValueError("compaction requires physical page slots separately from logical pages")
+            adopted = adopt_attention_blocks(scheduler.kv_cache_manager, request_id,
+                                              physical, max(1, int(block_pages or 1)))
+            req.num_computed_tokens = max(0, visible)
+            req.num_kvmem_offset = int(getattr(req, "num_logical_tokens", 0)) - visible
+            _compact_state[request_id] = key
+            _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
+                    {"kind": "compact_blocks_adopted", "req": request_id, **adopted})
             entry = {"kind": "compact_applied", "pid": os.getpid(),
                      "req": request_id, "pages": len(pages),
                      "visible_tokens": visible,
@@ -1659,7 +1478,6 @@ def register():
         # request_id -> visible length of the last applied compaction (TP-rank idempotency).
         _compact_state = {}
         _replay_state = {}       # request_id -> visible length of the last applied replay
-        _rebuilt_requests = set()  # requests whose token book was rewritten (reconstruction)
         # request ids already examined for a resume (a waiting request is looked at once).
         _resume_decided = set()
 
@@ -1850,6 +1668,11 @@ def _install(cls, module_name, probe, smoke, state):
                     _rid = getattr(_nr, "req_id", None)
                     if _rid is None:
                         continue
+                    if getattr(_nr, "kvmem_rebuilt", False):
+                        _rt0.accept_reconstruction(_rid)
+                        state.get("computed_before", {}).pop(_rid, None)
+                        state.get("was_decode", {}).pop(_rid, None)
+                        continue
                     _ids = getattr(_nr, "prompt_token_ids", None)
                     _rt0.note_prompt_ids(_rid, _ids)
                     _nlg = int(getattr(_nr, "num_logical_tokens", 0) or 0)
@@ -1893,6 +1716,13 @@ def _install(cls, module_name, probe, smoke, state):
                 elif _rt is not None:
                     _hot_apply(self, _rt, probe or smoke or "/tmp/kvmem_sparse.jsonl")
                 for _req, _n in list(_counts.items()):
+                    if _rt.is_rebuilt(_req):
+                        # Fresh dense prefill must use position zero, including capture buffers.
+                        for _attr in ("_kvmem_slot_offset", "kvmem_rope_offset", "kvmem_slot_offset"):
+                            _buf = getattr(self, _attr, None)
+                            if _buf is not None:
+                                _buf.zero_()
+                        continue
                     # Publishes how many leading rows of this step may enter the key statistics:
                     # a draft-carrying step writes 1 target + K drafts and only the target is
                     # certain to be accepted (eager path; the compiled path is documented as
@@ -1931,28 +1761,6 @@ def _install(cls, module_name, probe, smoke, state):
                                     _rt.harvest_decode_rows(_req, _delta)
                                 state.setdefault("computed_before", {})[_req] = _now
                                 state.setdefault("was_decode", {})[_req] = int(_n) <= 8
-                    except Exception:
-                        pass
-                    # (per-step book dump removed: it wrote ~100 records per long prompt)
-                    try:
-                        # Mirror exactly what the engine has written (its own cursor), then make the
-                        # attention length match. Both are needed: the row is the KV addressing and
-                        # the length is what the kernel is told to read.
-                        _bt = getattr(self, "block_tables", None)
-                        _bpk = list(getattr(_bt, "blocks_per_kv_block", []) or [])
-                        _nb = getattr(_bt, "num_blocks", None)
-                        if _nb is not None and _bpk:
-                            _idx = None
-                            try:
-                                _idx = getattr(self, "req_states").req_id_to_index.get(_req)
-                            except Exception:
-                                _idx = None
-                            if _idx is not None:
-                                for _g in range(len(_bpk)):
-                                    if int(_bpk[_g]) > 1:
-                                        _rt.sync_row_from_engine(
-                                            _req, int(_nb.np[_g, int(_idx)]), int(_n))
-                                        break
                     except Exception:
                         pass
                     _rt.advance_tokens(_req, int(_n))
@@ -1997,24 +1805,18 @@ def _install(cls, module_name, probe, smoke, state):
                     # compaction yet) makes the subtraction a no-op.
                     try:
                         _st = _rt.state(_req)
-                        # The offset must describe the ENGINE's own books, not the runtime's copy:
-                        # after an in-prefill compaction the engine's num_computed can be one chunk
-                        # AHEAD of the resident book, which made (tokens - seq_len) negative - and a
-                        # negative offset shifted every slot index past the row (illegal memory
-                        # access). Use num_logical - num_computed from the request state, and never
-                        # publish a negative value.
-                        _off = None
-                        try:
-                            _rso = getattr(self, "req_states", None)
-                            _io = _rso.req_id_to_index.get(_req) if _rso is not None else None
-                            if _io is not None:
-                                _lg = int(_rso.num_logical_tokens_np[_io])
-                                _cp = int(_rso.num_computed_tokens_np[_io])
-                                _off = _lg - _cp
-                        except Exception:
-                            _off = None
+                        # V2's CPU num_computed_tokens_np mirrors the LOGICAL sampler
+                        # frontier, not resident KV. After compaction subtracting that
+                        # mirror produced offset zero and wrote the next chunk into
+                        # old page slots. The scheduler output carries both books.
+                        from kvmem_position_books import scheduled_position_offset
+                        _off = scheduled_position_offset(scheduler_output, _req)
                         if _off is None:
-                            _off = int(getattr(_st, "tokens", 0)) - int(getattr(_st, "seq_len", 0))
+                            # No published scheduler book (e.g. a dummy step): use
+                            # the runtime's resident/served counters, never the CPU
+                            # sampler upper bound as though it were resident KV.
+                            _off = int(getattr(_st, "tokens", 0)) - int(
+                                getattr(_st, "seq_len", 0))
                         if _off < 0:
                             _off = 0
                         _buf = getattr(self, "_kvmem_slot_offset", None)
@@ -2073,6 +1875,8 @@ def _install(cls, module_name, probe, smoke, state):
                                    "orch": runtime._orch.get(req),
                                    "index": runtime._retrieval.get(req),
                                    "stats": runtime._statistics.get(req)})
+                    if runtime.is_rebuilt(req):
+                        continue
                     if cap is not None:
                         cap.note_tokens(int(n_new))
                     # KVMem mean-K statistics (v0.19 design): the model has just written this
@@ -2099,6 +1903,18 @@ def _install(cls, module_name, probe, smoke, state):
                             _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                                     {"kind": "stats_harvest_error", "req": req,
                                      "error": traceback.format_exc()[-600:]})
+                    if runtime.compact_rebuild:
+                        _rs = self.req_states
+                        _idx = _rs.req_id_to_index.get(req)
+                        if _idx is not None:
+                            _logical = int(_rs.num_logical_tokens_np[_idx])
+                            _resident = int(_rs.num_computed_tokens_np[_idx])
+                            _plen = int(_rs.prompt_len.np[_idx])
+                            if (_plen > runtime.budget_tokens
+                                    and _logical < _plen <= _logical + int(n_new)):
+                                runtime.finish_prompt_for_reconstruction(
+                                    req, int(n_new), _logical + int(n_new),
+                                    _resident + int(n_new))
                     # Token accounting now lives in runtime.advance_tokens (driven from this
                     # wrapper's entry). Calling after_step here as well double-counted the
                     # frontier: a 37K request reached tokens=98327.
@@ -2132,6 +1948,8 @@ def _install(cls, module_name, probe, smoke, state):
                             pass
         except Exception:
             _append(smoke or probe, {"kind": "hook_error", "error": traceback.format_exc()})
+            if getattr(state.get("sparse"), "compact_rebuild", False):
+                raise  # Never publish an old-context sample after a failed reconstruction.
             state["adapter_step"] = None
             state["attach_failed"] = True
         return result
@@ -2192,7 +2010,7 @@ def _install(cls, module_name, probe, smoke, state):
                         for _nr in (getattr(scheduler_output, "scheduled_new_reqs", None)
                                     or getattr(scheduler_output, "new_reqs", None) or ()):
                             _rid = getattr(_nr, "req_id", None)
-                            if _rid is None:
+                            if _rid is None or rt.is_rebuilt(_rid):
                                 continue
                             try:
                                 _ids = getattr(_nr, "prompt_token_ids", None)
@@ -2215,6 +2033,21 @@ def _install(cls, module_name, probe, smoke, state):
                             csl = _np.concatenate(([0], _np.cumsum(counts_np)))
                             idx = getattr(batch_req_state, "idx_mapping_np", None)
                             rt.view.bind_step(idx, reqs, csl)
+                            # execute_model has already applied staged block-table writes at this
+                            # point. Reading at its entry used the NEW cursor with OLD GPU pages;
+                            # before_step then wrote that stale prefix over the valid new blocks.
+                            bt = self.block_tables
+                            for group, pages_per_block in enumerate(bt.blocks_per_kv_block):
+                                if int(pages_per_block) > 1:
+                                    for pos, req in enumerate(reqs):
+                                        if rt.is_rebuilt(req):
+                                            continue
+                                        row = int(idx[pos]) if idx is not None else pos
+                                        rt.state(req).row_index = row
+                                        rt.sync_row_from_engine(
+                                            req, int(bt.num_blocks.np[group, row]),
+                                            int(counts_np[pos]))
+                                    break
                             for gone in [r for r in rt.live_requests() if r not in reqs]:
                                 rt.release(gone)
                                 _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
@@ -2285,6 +2118,8 @@ def _install(cls, module_name, probe, smoke, state):
                             nlg = getattr(getattr(self, "req_states", None),
                                           "num_logical_tokens_np", None)
                             for req in reqs:
+                                if rt.is_rebuilt(req):
+                                    continue
                                 row = rt.view.row_index(req)
                                 if row is None:
                                     continue

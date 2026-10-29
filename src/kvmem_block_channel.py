@@ -19,10 +19,9 @@ DEFAULT_PATH = "/tmp/kvmem_block_channel.sock"
 class BlockChannelScheduler:
     """Runs inside EngineCore: serves block requests from the allocator supplied by the plugin.
 
-    Also serves ``compact`` messages (in-request compaction, Route A): the worker tells the
-    engine which pages survived a reselect, and the engine truncates the request's
-    ``_all_token_ids`` to those pages and rewinds ``num_computed_tokens`` so the scheduler sees no
-    gap (the three-book reconciliation). ``compactor(request_id, pages, page_tokens)`` performs it.
+    Compact messages carry original logical page IDs and physical device slots separately.
+    Ordinary compaction reconciles resident allocation without changing the logical token book.
+    Explicit reconstruction queues a replacement prompt for the scheduler's safe output boundary.
     """
 
     def __init__(self, allocator, path=DEFAULT_PATH, backlog=8, compactor=None,
@@ -86,16 +85,17 @@ class BlockChannelScheduler:
                                                 else {"ok": bool(reply)}).encode())
                         continue
                     if kind == "compact":
-                        # In-request compaction: the worker selected a working set; the engine
-                        # truncates _all_token_ids to those pages and rewinds num_computed_tokens.
+                        # Preserve typed reconstruction replies; bool(dict) hides refusals and
+                        # drops the queued/tokens fields needed by both TP workers.
                         if self._compactor is None:
                             raise RuntimeError("no compactor installed")
-                        ok = bool(self._compactor(req.get("request"),
+                        ok = self._compactor(req.get("request"),
                                                   [int(p) for p in req.get("pages", [])],
                                                   int(req.get("page_tokens", 0)),
                                                   int(req.get("visible_tokens", 0) or 0),
                                                   bool(req.get("rebuild", False)),
-                                                  int(req.get("block_pages", 0) or 0)))
+                                                  int(req.get("block_pages", 0) or 0),
+                                                  req.get("physical_pages", []))
                         self.compacts_applied += 1
                         # `ok` = the engine's book is now consistent with the worker's view;
                         # `truncated` = it actually shortened (so installing the view is needed).
@@ -103,7 +103,7 @@ class BlockChannelScheduler:
                             conn.sendall(json.dumps(ok).encode())
                         else:
                             conn.sendall(json.dumps({"ok": bool(ok),
-                                                     "truncated": bool(ok)}).encode())
+                                                    "truncated": bool(ok)}).encode())
                     elif kind == "session_park":
                         if self._session_sink is not None:
                             self._session_sink(req)
@@ -185,12 +185,12 @@ class BlockChannel:
         return reply
 
     def compact(self, request_id, pages, page_tokens, visible_tokens=0, rebuild=False,
-                block_pages=0):
+                block_pages=0, physical_pages=None):
         """Tell EngineCore that `request_id` compacted to `pages` (in compacted order).
 
-        The engine truncates the request's `_all_token_ids` to the tokens of those pages and
-        rewinds `num_computed_tokens`, so the scheduler sees no gap and does not recompute the
-        spilled tokens. Returns True when the engine applied it.
+        Logical ``pages`` select original tokens; ``physical_pages`` identifies allocator slots.
+        Ordinary compaction rewinds residency. Reconstruction queues a fresh prompt admission.
+        Return the full acknowledgement, including explicit refusals and pending status.
         """
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(self._timeout)
@@ -200,13 +200,12 @@ class BlockChannel:
                                       "page_tokens": int(page_tokens),
                                       "visible_tokens": int(visible_tokens or 0),
                                       "rebuild": bool(rebuild),
-                                      "block_pages": int(block_pages or 0)}).encode())
+                                      "block_pages": int(block_pages or 0),
+                                       "physical_pages": list(physical_pages or [])}).encode())
             data = sock.recv(4096)
         reply = json.loads(data.decode())
         if "error" in reply:
             raise RuntimeError(f"compact request failed: {reply['error']}")
         # `ok` also covers the "nothing to truncate" case; `truncated` is the signal the worker
         # needs to decide whether its compacted view may be installed at all.
-        return {"ok": bool(reply.get("ok", False)),
-                "truncated": bool(reply.get("truncated", reply.get("ok", False))),
-                "visible": int(reply.get("visible", 0) or 0)}
+        return reply

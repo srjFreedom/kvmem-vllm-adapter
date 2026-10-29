@@ -1,6 +1,10 @@
 # kvmem-vllm 适配器交付说明（v0.19 对齐）
 
-更新：2026-10-29。**压缩版**：结论 + 证据 + 下一步。逐轮过程见
+更新：2026-10-29。**实验性整体重算验收**：TP2 / MTP4 / 同步 V2、单文本请求，
+`GPU_UTIL=0.65` 的物理池 122,816 token，居中 needle 的真实 prompt 196,598 token：
+27 次 `compact_applied` + 1 次 `compact_rebuild_queued` + 两 rank 各 1 次 `reconstruction_started`，
+API `usage.prompt_tokens=196598`、HTTP 200、回答 **`ZX-4417-QJ7`**（耗时 320.24s）。
+完整复现命令见 `BEYOND-POOL-PLAN.md`。逐轮过程见
 [`archive/BEYOND-POOL-PLAN-log.md`](archive/BEYOND-POOL-PLAN-log.md)，超池机制图见
 [`BEYOND-POOL-PLAN.md`](BEYOND-POOL-PLAN.md)。
 
@@ -16,13 +20,20 @@
 5. `CheckpointCatalog` 落地并接管 session store 的状态镜像（一个所有者、容量与淘汰统一）。
 6. 超池**通道**打通：196,673 token prompt 答对；152,820 token prompt 在 122,816 token 的池上返回 200
    （9~25 次压缩）；`KVMEM_SKIP_KV_CHECK` 解除启动不变式、`scheduler_reserve_full_isl` 解除准入闸门、
-   `KVMEM_BLOCK_SIZE=16` 解决块回收。
+   attention 原生块按 EngineCore 所有权回收（实际 1,616 token/块）。
 
-**未完成**
+**超池整体重算（实验，有一次 196,598-token 实测）**
 
-- **超池答案正确性**：保留页的 KV 与循环状态带"被淘汰历史"的近似，输出随压缩次数退化
-  （0 次=正确 / 1 次=`ZXZXZX-4417-QJ7` / 9 次=乱码 / 25 次=`0`）。唯一出路是"按压缩顺序整体重算"，
-  已实现骨架，卡在两处待验（见文末）。
+- vLLM 完整预填后按原始逻辑页选 token；两 rank 在这一同步边界对核心评分求均值。
+  EngineCore 在旧输出发布前丢弃旧采样、释放整请求 KV/循环状态并重新入队；两 rank 的 V2
+  fresh admission 重建 token 表和循环状态。压缩时仅回收 EngineCore 所持有的 attention 原生块，
+  worker 的块表行同步移到 staged writes 之后，槽位偏移取 scheduler 的 served-resident 两本账。
+- `196598 > 122816`，居中 needle、27 次压缩后整体重算 33,654 token，回答
+  `ZX-4417-QJ7`；探针 `compact_rebuild_queued`、`reconstruction_started` 两 rank、
+  `/tmp/kvmem-reconstruction-offset.metadata.json`。本次不等于多请求、会话复用或多模态验收。
+- **已知缺口**：重算前的尾页 `needle` 字节检查仍有 false（本次 54 条），attention
+  长度仍出现 `kv_len_clamped`；不能宣称中间压缩视图精确。重建请求的 MTP 投机被禁用，
+  尽管全局配置仍为 MTP4（1+4 状态槽）。当前只确认最终答案一次正确。
 - graph recall / AttentionFeedback（`graph_recall.hpp`）未接入（需注意力质量采样）。
 
 ## 一、这一版是什么
@@ -44,7 +55,8 @@
 |---|---|---|
 | 池内正确性基线 | `GPU_UTIL=0.95 B=200000 INREQUEST_COMPACTION=0`（NVFP4） | 88,256 → `ZX-4417`；196,673 → `ZX-4417-QJ7` |
 | 压缩可读性 | `B=36864` + `KVMEM_RESIDENT_PREFILL_COMPACT=1`，47K prompt | 1 次压缩 → `ZXZXZX-4417-QJ7` |
-| 超池通道 | `GPU_UTIL=0.65`（池 122,816）+ `KVMEM_SKIP_KV_CHECK=1` + `KVMEM_MAX_MODEL_LEN=200000` + `KVMEM_ENTRY_RESIDENT_PREFILL=1` | 152,820 → HTTP 200 |
+| 超池通道（旧基线） | `GPU_UTIL=0.65`（池 122,816）+ `KVMEM_SKIP_KV_CHECK=1` + `KVMEM_MAX_MODEL_LEN=200000` + `KVMEM_ENTRY_RESIDENT_PREFILL=1` | 152,820 → HTTP 200，答案错误 |
+| 超池整体重算（实验） | 同上 + `KVMEM_COMPACT_REBUILD=1` + `KVMEM_PROMPT_END_RESELECT=1` + `KVMEM_RESIDENT_PREFILL_COMPACT=1`、TP2/MTP4、同步 V2 | 196,598 / 池 122,816 → 27 次压缩、最终重算 33,654 token、HTTP 200 → `ZX-4417-QJ7` |
 | 会话复用 | `KVMEM_SESSION_REUSE=1`（catalog 接管状态镜像） | 两轮 200，`session_reuse_on` 正常 |
 
 ## 三、超池的两个硬约束（实测）
@@ -77,11 +89,12 @@ PORT=18200 ./deploy/run-kvmem-vllm.sh
 | 热重载 | `touch /tmp/kvmem_reload.request` → 下一个 prompt 边界 reload + rebind |
 | 探针 | `/tmp/kvmem_sparse.jsonl`（`device_pool`/`pool_ceiling`/`reselect`/`compact_applied`/`reconstruction_started` …） |
 
-## 六、留给下一步的两件事（按顺序）
+## 六、整体重算的验收与限制
 
-1. **确认重建开关生效**：启动后用 console 读 `runtime.compact_rebuild`（两次相同 env 一次生效一次没有，
-   说明有进程读不到；已加 worker env 兜底但未验证）。
-2. **核对重建的 token 映射**：`_compact(rebuild=True)` 现在用
-   `_all_token_ids[p*page_tokens : (p+1)*page_tokens]` 取 token，而 `p` 是**压缩后**的物理页 ——
-   必须按"页 → 原始逻辑位置"的真映射取，否则重算的是错内容。先在 47K（1 次压缩）验证答案回到
-   `ZX-4417-QJ7`，再上 152K 超池。
+`runtime.compact_rebuild=True` 经 worker console 实测，实际加载路径为本仓库 `engines/vllm`；
+所传页号是**原始逻辑页**，经 `select_tokens(req.prompt_token_ids, selected, 16)` 提取，
+物理槽号单独传给 EngineCore 回收块。`BlockChannel` 保留确认字典，不再把拒绝转换成 truthy。
+
+本次端到端验证 **196,598-token / 122,816-token 池**的答案正确，不推广到其他 prompt、
+跨会话状态或并发；后续需修复压缩期间 `needle=false` 与 `kv_len_clamped`，并以多组超池
+needle、MTP 接受长度及跨请求回归扩展验收。所有实验开关默认关闭。

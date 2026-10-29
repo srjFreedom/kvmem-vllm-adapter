@@ -23,7 +23,16 @@ def main():
         return handed[:count]
 
     path = "/tmp/kvmem_block_channel_test.sock"
-    server = BlockChannelScheduler(allocator, path=path).start()
+    received = []
+
+    def compact(request_id, pages, page_tokens, visible, rebuild, block_pages, physical):
+        received.append((request_id, pages, physical))
+        if request_id == "refused":
+            return {"ok": False, "truncated": False, "rebuild": False}
+        return {"ok": True, "truncated": True, "rebuild": bool(rebuild),
+                "queued": bool(rebuild), "tokens": 7}
+
+    server = BlockChannelScheduler(allocator, path=path, compactor=compact).start()
     client = BlockChannel(path=path, timeout=2.0)
     time.sleep(0.1)
 
@@ -41,6 +50,15 @@ def main():
     check(client.request("req-a", 1) == [200], "the scheduler keeps serving after a failure")
     check(server.requests_served == 3, f"served {server.requests_served} requests")
 
+    reply = client.compact("rebuild", [0, 8], 4, visible_tokens=7,
+                           rebuild=True, physical_pages=[40, 41])
+    check(reply.get("rebuild") and reply.get("queued") and reply.get("tokens") == 7,
+          "rebuild metadata survives server and client without bool coercion")
+    check(received[-1] == ("rebuild", [0, 8], [40, 41]),
+          "logical pages and physical slots travel independently")
+    reply = client.compact("refused", [0], 4, physical_pages=[40])
+    check(not reply["ok"] and not reply["truncated"],
+          "a nonempty refusal dictionary remains a refusal")
     server.stop()
     print("PASS block_channel_test" if not failed else "FAILED block_channel_test")
     sys.exit(0 if not failed else 1)

@@ -222,14 +222,11 @@ def main(argv=None) -> int:
     _resident = str(env.get("KVMEM_ENTRY_RESIDENT_PREFILL", "")).strip().lower() in (
         "1", "true", "yes", "on")
     if _wanted <= 0 and _resident:
-        # Lossless long prompts: the engine window is the PHYSICAL pool (auto-fitted to the card),
-        # not N x (B+R). A whole prompt up to that window stays resident, so no compaction has to
-        # happen while the prompt is still being prefilled (that path is not reliable yet); the
-        # entry's CTX remains the logical ceiling.
-        # The window is the PHYSICAL pool, so let vLLM fit it: -1 = auto. No static number, no
-        # separate knob - whatever the card/pool can hold is exactly what one request may keep
-        # resident. The launcher treats a non-positive MAX_MODEL_LEN as "auto" and skips its
-        # N x window check (that check assumes the static N x (B+R) scheme).
+        # Resident entry leaves the prompt intact. Auto-fit may hold a prompt inside the
+        # physical pool; beyond-pool experiments explicitly set KVMEM_MAX_MODEL_LEN and
+        # compact during prefill before the pool runs out. CTX remains the logical cap.
+        # Auto-fit (-1) is used only without that explicit ceiling; the launcher skips
+        # its N x window check for this resident scheduling scheme.
         env["KV_CONCURRENCY_EFFECTIVE_LEN"] = str(int(ns.kvmem_budget))
         # An explicit ceiling wins: vLLM's auto-fit lands BELOW the KV pool (measured 177,760 on a
         # 203,616-token pool), and every buffer sized by max_model_len - including the rotary cache -
@@ -242,17 +239,18 @@ def main(argv=None) -> int:
         else:
             args += ["--set", "MAX_MODEL_LEN=-1"]
             env["MAX_MODEL_LEN"] = "-1"
-        print("[kvmem backends/vllm] KVMEM_ENTRY_RESIDENT_PREFILL=1 -> MAX_MODEL_LEN auto "
-              "(engine window = KV pool), prefill stays resident, compaction is decode-only")
+        print("[kvmem backends/vllm] KVMEM_ENTRY_RESIDENT_PREFILL=1 -> "
+              f"MAX_MODEL_LEN={env['MAX_MODEL_LEN']} (full prompt enters the engine; "
+              "beyond-pool mode requires prefill compaction)")
         _wanted = 0
-    # KVMem works in 16-token pages. The engine's own block must be the SAME unit, otherwise a
-    # scattered page selection cannot be handed back to the pool (a 1616-token block is only free
-    # when ALL 101 of its pages are dropped), the pool drains, and the second compaction dies on
-    # 'assert block' in block_pool.get_new_blocks.
+    # Request a smaller block size for KVMem's 16-token pages. Hybrid models can still align
+    # full attention blocks to the Mamba page size (measured: 1616 tokens = 101 KVMem pages),
+    # so compaction must use the runner's actual blocks_per_kv_block and EngineCore ownership.
     _bs = int(os.environ.get("KVMEM_BLOCK_SIZE", "0") or 0)
     if _bs > 0:
         args += ["--set", f"BLOCK_SIZE={_bs}"]
-        print(f"[kvmem backends/vllm] BLOCK_SIZE pinned to {_bs} (engine block == KVMem page)")
+        print(f"[kvmem backends/vllm] BLOCK_SIZE requested as {_bs} "
+              "(hybrid attention may align it upward)")
     if _wanted <= 0 and not _resident:
         _wanted = max(1, int(ns.max_num_seqs)) * (int(ns.kvmem_budget) + int(ns.kvmem_gen_reserve))
         print(f"[kvmem backends/vllm] max_model_len auto = {ns.max_num_seqs} x "

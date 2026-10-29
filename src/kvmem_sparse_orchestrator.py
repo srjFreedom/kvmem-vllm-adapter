@@ -627,7 +627,7 @@ class SparseOrchestrator:
 
     # --- reselect ---------------------------------------------------------------------
     def reselect(self, mandatory_pages=(), slots=None, page_to_slot=None,
-                 prefill_pressure=False, forced_pages=()):
+                 prefill_pressure=False, forced_pages=(), score_reducer=None):
         # The selector works on the token frontier, which can include a partially-filled last
         # selection block; only pages that already hold written tokens may be selected.
         core = None
@@ -635,6 +635,8 @@ class SparseOrchestrator:
             core = self.core_selection_scores()
         except Exception as exc:
             _probe_write({"kind": "core_scores_error", "error": f"{type(exc).__name__}: {exc}"})
+        if score_reducer is not None:
+            core = score_reducer(core, int(self.selector.selection_blocks()))
         # Default to "no ranking": when the core scorer has nothing (e.g. prefill pressure before any
         # query exists) and the legacy fallback is off, `raw` used to be unbound and the whole
         # reselect raised UnboundLocalError - which the caller swallows, so compaction silently did
