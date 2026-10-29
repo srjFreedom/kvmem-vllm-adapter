@@ -1731,7 +1731,11 @@ class VllmSparseRuntime:
         # RoPE phase can describe it. Measured on 0.2.2: 207 of 238 compactions ran unaligned, the
         # needle check compared against the same wrong delta so it passed, and the answers rotted.
         # Defer instead: decode crosses a page boundary within <= page_tokens steps.
-        if int(st.tokens) % int(self.page_tokens):
+        # A REBUILD is exempt: it discards the old KV and pre-fills the working set from token 0,
+        # so no write continues from the compacted position that invariant protects. Blocking it
+        # here made the prompt-end hook raise ("did not queue a fresh admission") and killed the
+        # engine on requests whose last chunk ended mid-page.
+        if not rebuild and int(st.tokens) % int(self.page_tokens):
             if self.log is not None:
                 self.log({"kind": "compact_deferred_align", "req": req,
                           "tokens": int(st.tokens), "seq_len": int(st.seq_len),
