@@ -1901,6 +1901,11 @@ class VllmSparseRuntime:
                                  visible_tokens=int(st.seq_len), rebuild=_rebuild,
                                  block_pages=int(getattr(self, "block_pages", 0) or 0))
                 if _rebuild and isinstance(res, dict) and res.get("rebuild"):
+                    try:
+                        self._rebuilt_req = getattr(self, "_rebuilt_req", set())
+                        self._rebuilt_req.add(req)      # once per request, ever
+                    except Exception:
+                        pass
                     # One reconstruction per request: repeating it re-prefills the compacted
                     # sequence again and again (measured: compact_rebuilt fired twice with
                     # 36864 then 32768 tokens before the engine tripped an assert).
