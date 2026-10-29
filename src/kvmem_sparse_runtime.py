@@ -1494,6 +1494,13 @@ class VllmSparseRuntime:
                                           "error": _tb.format_exc()[-500:]})
                 return st
             high = self.prefill_high_watermark
+            # Hard cap at the comparison itself: the pool ceiling minus one chunk. The watermark is
+            # (re)assigned in several places (init, after each compaction), so capping only at the
+            # assignment left the trigger above the ceiling and the prefill stopped with the pool dry
+            # (measured: row 5,656 pages = 90,496 tokens, free_blocks=9, 0 compactions).
+            if int(getattr(self, "pool_ceiling_tokens", 0) or 0) > 0:
+                high = min(high, max(64, (int(self.pool_ceiling_tokens) - 4096 - 2048)
+                                     // max(1, self.page_tokens)))
             finishing = False  # query reselect happens on the first decode step (see below)
             if (finishing and st.row and not st.query_reselected
                     and getattr(orch, "retrieval_index", None) is not None):

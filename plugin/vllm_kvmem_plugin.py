@@ -745,6 +745,19 @@ def _attach_sparse(runner, log_path):
         if _nb and _bs:
             _reserve = (3 * (1 + _spec) + 3 + 2)      # mamba state blocks + one chunk + slack
             runtime.pool_ceiling_tokens = max(0, (_nb - _reserve) * _bs)
+            # The runtime computed its watermark in __init__, BEFORE this number existed, so apply
+            # the cap here as well (otherwise the pool-driven threshold is published and ignored).
+            try:
+                _pt = int(getattr(runtime, "page_tokens", 16) or 16)
+                # Leave room for the NEXT chunk plus a margin: the ceiling itself is where the
+                # allocator already fails (measured: the row stops exactly at the cap, free_blocks=9,
+                # and `row > high` never becomes true because the row cannot grow to high+1).
+                _chunk = 4096 + 2048
+                _cap = max(64, max(0, int(runtime.pool_ceiling_tokens) - _chunk) // max(1, _pt))
+                if int(getattr(runtime, "prefill_high_watermark", 0) or 0) > _cap:
+                    runtime.prefill_high_watermark = _cap
+            except Exception:
+                pass
             _append(log_path, {"kind": "pool_ceiling", "pid": os.getpid(),
                                "blocks": _nb, "block_size": _bs,
                                "reserve_blocks": _reserve,
