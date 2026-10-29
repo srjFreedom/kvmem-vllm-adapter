@@ -77,20 +77,15 @@
 ## 5. 复现命令
 
 ```bash
-# 独立测试端口，确认无请求后再启动；只改本仓库与其 engines/vllm
-FOREGROUND=1 SKIP_STARTUP_SMOKE=1 KVMEM_ENTRY_RESIDENT_PREFILL=1 GPU_UTIL=0.65 \
+# 独立端口、确认无请求后再启动；只改本仓库与其 engines/vllm
+MODEL=$HOME/models/<your-model> SKIP_STARTUP_SMOKE=1 GPU_UTIL=0.65 \
 KVMEM_SKIP_KV_CHECK=1 KVMEM_MAX_MODEL_LEN=200000 B=36864 R=48000 \
-INREQUEST_COMPACTION=1 KVMEM_RESIDENT_PREFILL_COMPACT=1 KVMEM_BLOCK_SIZE=16 \
-KVMEM_COMPACT_REBUILD=1 KVMEM_PROMPT_END_RESELECT=1 KVMEM_STATS=core \
-KVMEM_FORCE_EAGER=1 VLLM_USE_V2_MODEL_RUNNER=1 \
-MODEL=/home/srj/models/Coder390/NVFP4/W4A16-fp8mtp \
-SERVED_NAME=Qwen3.5-Coder-NVFP4-MTP ADAPTER=$PWD VLLM_DIR=$PWD/engines/vllm \
-RUNTIME_ROOT=$PWD/engines/vllm VLLM_PY=$PWD/engines/vllm/.venv/bin/python \
+KVMEM_RESIDENT_PREFILL_COMPACT=1 KVMEM_BLOCK_SIZE=16 \
+KVMEM_COMPACT_REBUILD=1 KVMEM_STATS=core KVMEM_FORCE_EAGER=1 \
 PORT=18200 ./deploy/run-kvmem-vllm.sh
 
 PYTHONPATH=$PWD/engines/vllm engines/vllm/.venv/bin/python \
-  scripts/reconstruction_needle.py \
-  --tokenizer /home/srj/models/Coder390/NVFP4/W4A16-fp8mtp \
+  scripts/reconstruction_needle.py --tokenizer "$MODEL" \
   --pool-tokens 122816 --output /tmp/kvmem-reconstruction-offset
 ```
 

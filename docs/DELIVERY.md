@@ -75,10 +75,8 @@ API `usage.prompt_tokens=196598`、HTTP 200、回答 **`ZX-4417-QJ7`**（耗时 
 ## 四、运行方式
 
 ```bash
-B=36864|131072  INREQUEST_COMPACTION=0|1  KVMEM_STATS=core  KVMEM_FORCE_EAGER=1 \
-ADAPTER=/home/srj/src/kvmem-vllm-adapter \
-VLLM_DIR=/home/srj/src/kvmem-vllm-adapter/engines/vllm \
-PORT=18200 ./deploy/run-kvmem-vllm.sh
+MODEL=$HOME/models/<your-model> KVMEM_STATS=core KVMEM_FORCE_EAGER=1 \
+  ./deploy/run-kvmem-vllm.sh        # 默认常驻模式；B/R/PORT 等见 run-kvmem-vllm.sh 头部
 ```
 
 启动日志检查：`Spec decode: mtp/4`、`lrfu=False score=mean`、`[kvmem] device KV pool = … tokens`、

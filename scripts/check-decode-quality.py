@@ -14,6 +14,7 @@ Gate: greedy output must stay coherent and must not repeat an n-gram.
 Exit code 0 = all cases passed, 1 = at least one degenerate case.
 """
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -22,7 +23,7 @@ from collections import Counter
 PORT = sys.argv[1] if len(sys.argv) > 1 else "18200"
 MAX_TOKENS = int(sys.argv[2]) if len(sys.argv) > 2 else 400
 BASE = f"http://127.0.0.1:{PORT}/v1/chat/completions"
-MODEL = "Qwen3.8-27B-Coder390-EfficientThink-FP8-MTP"
+MODEL = os.environ.get("SERVED_NAME", "Qwen3.8-27B-FP8-MTP")  # SERVED_NAME 覆盖
 
 CASES = [
     ("short-zh", "用一句话介绍长江。", 0.0),

@@ -87,10 +87,10 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
-| `MODEL` | `$HOME/models/Coder390/FP8-fp8mtp`（示例）| 权重目录（需含 `config.json`、tokenizer、safetensors）。**不限于 FP8**：vLLM 支持的模型都能用，本部署的 FP8+MTP 只是实测配置 |
+| `MODEL` | 必填（无默认）| 权重目录（需含 `config.json`、tokenizer、safetensors）。**不限于 FP8**：vLLM 支持的模型都能用，本部署的 FP8+MTP 只是实测配置 |
 | `CHAT_TEMPLATE_FILE` | `.../FP8/chat_template.jinja` | 聊天模板；该模型内置模板为空，必须显式给 |
 | `PROFILE` | `2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env` | 引擎档位 .env（量化/KV dtype/上下文/投机），由 worker.py exec 的 `deploy/run-kvmem-engine.sh` 喂给 launcher.sh；任何并发数都走同一个脚本，改环境变量即生效 |
-| `SERVED_NAME` | `Qwen3.8-27B-Coder390-EfficientThink-FP8-MTP` | 对外模型 id（客户端用它）|
+| `SERVED_NAME` | `Qwen3.8-27B-FP8-MTP` | 对外模型 id（客户端用它）|
 
 换模型的最短清单：`MODEL` + `CHAT_TEMPLATE_FILE` + `PROFILE` + `SERVED_NAME`。
 

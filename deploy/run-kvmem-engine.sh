@@ -22,7 +22,7 @@ if [ -n "${THINKING_BUDGET:-}" ]; then export REASONING_BUDGET="$THINKING_BUDGET
 # 注意：这些注释必须留在 ARGS 上方，绝不能插进参数表中间。
 #  [教训] 反斜杠续行的参数表中间插 # 注释会静默截断命令，后面所有 --set 全部失效。
 ARGS=(
-  --model-dir "${MODEL:-$HOME/models/Coder390/FP8-fp8mtp}"
+  --model-dir "${MODEL:?MODEL not set: point it at your weights directory}"
   --profile "${PROFILE:-2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env}"
   --mode fast --gpu-devices 0,1 --tp-size 2 --pp-size 1
   --set MAX_MODEL_LEN=${MAX_MODEL_LEN:-32768}
