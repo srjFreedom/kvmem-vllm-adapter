@@ -205,3 +205,22 @@ http          = 200，引擎存活
 
 同一模型上 128,898 token prompt（B=131072）也答对，耗时 2m58（FP8 版同规模约 3m20），
 压测速度确实更快。
+
+## 十二、用 GPU_UTIL 缩小物理池来做"超池"测试（第 45 轮，回答"能否用小 prompt 触发超池"）
+
+可以，而且这把测试成本降下来了。物理池与 `GPU_UTIL` 的实测关系（NVFP4 模型，2×22.5GB）：
+
+```
+GPU_UTIL=0.85 → 387,840 tokens   (24,240 pages × 16)
+GPU_UTIL=0.70 → 189,072 tokens
+GPU_UTIL=0.65 → 122,816 tokens
+GPU_UTIL=0.55 → 启动失败：not enough GPU memory to serve even a single token
+```
+
+也就是说 0.65 时**一个 13 万 token 的 prompt 就已经超出物理池**（12.3 万），prefill 只需 ~2 分钟，
+不必再构造 20 万以上的 prompt。这是本轮新增的 `device_pool` 探针（启动时打印
+`[kvmem] device KV pool = N tokens`）测出来的。
+
+**但它只降低测试成本，不改变结论**：在上面 0.65 的配置里跑 133K prompt（B=36864、压缩开），
+仍然是 `illegal memory access`（引擎退出），与大盘子下的超池表现一致。所以"缩小池"是方便的
+**测试手段**，不是修复超池正确性的方法；正确性仍受第十节所述的近似限制。

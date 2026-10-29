@@ -719,6 +719,19 @@ def _attach_sparse(runner, log_path):
     # sequence, zero the recurrent state and re-prefill the selected pages. This is what removes the
     # approximation that in-prefill compaction leaves in a hybrid model's state.
     try:
+        # Physical KV pool in tokens: the number everything else is compared against ("beyond pool").
+        _v = getattr(runtime, "view", None)
+        _pool_tokens = int(_v.num_blocks()) * int(_v.page_tokens)
+        _append(log_path, {"kind": "device_pool", "pid": os.getpid(),
+                           "tokens": _pool_tokens,
+                           "pages": int(_v.num_blocks()),
+                           "page_tokens": int(_v.page_tokens),
+                           "budget": int(getattr(runtime, "budget_tokens", 0) or 0)})
+        print(f"[kvmem] device KV pool = {_pool_tokens} tokens "
+              f"({_v.num_blocks()} pages x {_v.page_tokens})")
+    except Exception:
+        pass
+    try:
         # Native pages per ENGINE block for the full-attention group (1616-token blocks over
         # 16-token pages -> 101). The compaction needs it to keep the paged table a faithful
         # reflection of the engine's block list.
@@ -730,9 +743,11 @@ def _attach_sparse(runner, log_path):
         runner.kvmem_runtime = runtime      # diagnostic hooks in the runner read the books here
     except Exception:
         pass
-    # Experimental: rewriting the engine's token book stalls the request today ("no sampled
-    # token"), so it stays OFF unless explicitly enabled.
-    runtime.compact_rebuild = (os.environ.get("KVMEM_COMPACT_REBUILD", "0") == "1")
+    # Experimental: rewriting the engine's token book used to loop (fixed) and still needs the sampler
+    # path proven, so it stays OFF unless explicitly enabled. The config is the reliable channel -
+    # KVMEM_* set on the API server does not reach the workers.
+    runtime.compact_rebuild = (bool(cfg.get("compact_rebuild", False))
+                               or os.environ.get("KVMEM_COMPACT_REBUILD", "0") == "1")
     # The rebuild rewrites ONE engine-side token book, so only rank 0 may ask for it. Both ranks
     # still send their ordinary compact message (each owns its KV), but a second rebuild would
     # re-derive the token list from an already-rewritten book (measured: 7 rebuild records and
