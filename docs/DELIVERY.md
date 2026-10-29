@@ -1,6 +1,6 @@
 # kvmem-vllm 适配器交付说明（v0.19 对齐）
 
-更新：2026-10-29（第 25 轮）
+更新：2026-10-29（第 32 轮，已验证配置表）
 
 ## 一、这一版是什么
 
@@ -104,3 +104,24 @@ ValueError: To serve at least one request with the model's max seq len (203000),
 超池要真正打通，需要解决 **prefill 期的抢占路径**（本 fork 下抢占 = 重算，重算面对压缩过的行
 会越界），这与"prompt 不受显存限制"是同一件事的两面。压缩本身（prefill 末）是可用的：58K 实测
 `mid_selected=True` 且答案含 `ZX-4417`。
+
+
+## 七、已验证配置（第 32 轮复测，可直接照抄）
+
+| 场景 | 启动参数 | 实测 |
+|---|---|---|
+| 长上下文正确性基线 | `B=131072 INREQUEST_COMPACTION=0 KVMEM_STATS=core` | 88,256 token prompt → `ZX-4417` ✅ |
+| 超出常驻窗口（B）但未超池 | `B=36864 KVMEM_RESIDENT_PREFILL_COMPACT=1 INREQUEST_COMPACTION=1` | 147,367 token → HTTP 200 ✅（prefill 期压缩 24+ 次） |
+| 真正超池 | 同上 | 201,915 token → HTTP 200 ✅（38 次压缩） |
+| 压缩后的检索 | 同上 + `--kvmem-retrieval` | needle 块排名第一（5.32 vs 次名 1.77）✅ |
+| 压缩请求的解码 | 同上（MTP 开） | 不再崩（压缩请求禁止投机）✅ |
+
+**答案正确性只在前两行成立**：只要在 prefill 期间发生过"把中段丢掉"的压缩，模型的循环状态就与
+最终工作集不一致，题目里的 needle 即使被检索排在第一位，答案仍然错（实测输出 `7`）。详见
+`docs/BEYOND-POOL-PLAN.md` 第 29~31 轮。
+
+## 八、留给下一阶段的一件事
+
+`KVMEM_PROMPT_END_RESELECT=1` + `KVMEM_COMPACT_REBUILD=1` 会触发"用零状态重新 prefill 选中的
+36,864 token"，`compact_rebuilt` 能触发、引擎能重新 prefill，但随后停摆（`no sampled token`，
+约 26 分钟后才返回）。修好这个停摆，超池的答案正确性就补齐了。
