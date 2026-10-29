@@ -28,7 +28,7 @@
 2. 或按上游 `prefix_checkpoint` 做多检查点 + 尾部重算（本适配器的 catalog 已具备容器）；
 3. 之后再把 `reselect_at_prompt_end` / `KVMEM_COMPACT_REBUILD` 从实验开关转正。
 
-更新：2026-10-29（第 42 轮，摘要与回归完成）
+更新：2026-10-29（第 60 轮，最终）
 
 ## 一、这一版是什么
 
@@ -247,3 +247,31 @@ GPU_UTIL=0.55 → 启动失败：not enough GPU memory to serve even a single to
    循环状态仍带"被淘汰历史"的近似（1 次压缩可读、20+ 次全错）。
 
 第 6 条是下一步唯一的入口。
+
+
+## 十四、最终状态（第 51~60 轮，超池专项）
+
+### 打通的（可复现）
+
+| 环节 | 证据 |
+|---|---|
+| 窗口 > 池可启动 | `KVMEM_SKIP_KV_CHECK=1`（关掉 vLLM 的 `max_model_len ≤ 池` 启动检查） |
+| 超池请求可准入 | 关闭 `scheduler_reserve_full_isl`（KVMem 模式下自动关闭）——这是之前"停在 waiting"的真闸门 |
+| 超池 prefill + 压缩 + 解码 | 152,820 token prompt / 池 122,816 → HTTP 200（9~25 次压缩） |
+| 池内正确性 | 196,673 token prompt + 集中 needle → `ZX-4417-QJ7` |
+| 调试设施 | 断点已接进 **EngineCore 与入口中间件**；断点文件热重载（不再需要重启） |
+
+### 未打通的（以及原因，均已实测）
+
+| 问题 | 原因 | 证据 |
+|---|---|---|
+| 超池答案正确性 | 保留页的 KV 与循环状态带"被淘汰历史"的近似，压缩次数越多越不自洽 | 0 次→正确；1 次→`ZXZXZX-4417-QJ7`；9 次→乱码；25 次→只输出 `0` |
+| B 无法放大以减少压缩 | 块池 76 块，三个 Mamba 组每请求固定占 15 块（1 状态+4 投机），注意力实际只剩 ~58 块 ≈ 93K token | 断点：`row=5656 页 / seq_len=86016 / free_blocks=9`，B=90K/100K/110K 均停住 |
+| Mamba 块尺寸不能与窗口解耦 | `mamba_cache_mode=none` 下状态是"每序列一份"，块表按此开；改小后分配器索要 cdiv(seq,1616) 个状态块 → 越界 | `Block table write for request 0, group 0 exceeds row capacity (10 > 5)` |
+
+### 下一步（唯一入口）
+
+1. 实现 **compacted-sequence 接口**（`prepare_inputs` 的 logits 口径 + token 账本），使"按压缩顺序整体
+   重算选中的 B 段"可行——这是消除近似、让超池答对的唯一路径；
+2. 把 Mamba 15 块/请求的固定开销从注意力预算里正确扣除，从而把可用 B 推到 ~90K，压缩次数降到 1~2 次；
+3. 两件事都做完后，超池才能既"跑通"又"答对"。
