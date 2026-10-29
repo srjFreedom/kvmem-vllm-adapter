@@ -9,6 +9,14 @@
 #     通过官方 vllm.endpoint_plugins 扩展点加载，不再有旁挂网关。
 #
 #   覆盖：B= R= SINK= RECENT= SESSIONS= HOST_MIB= N= CTX= PORT= ./本脚本
+#   超池相关（默认关闭/默认值，仅供实验）：
+#     SELECT_BLOCK_TOKENS=1616   选择网格 = 引擎块（默认 32 = 32 token）
+#     KVMEM_BLOCK_SIZE=16        引擎块 = KVMem 页（默认走模型的 1616-token 块）；
+#                                设为 16 后分散的页选择才能被池子回收（否则第二次压缩 assert block）
+#     KVMEM_PROMPT_END_RESELECT=1 prefill 结束用 query 重排工作集
+#     KVMEM_CHECKPOINT_REPLAY=1  重排后把尾部 N 个 token 按新视图重算（QueryReplay）
+#     KVMEM_REPLAY_WINDOW=2048   尾部长度的默认值
+#     KVMEM_COMPACT_REBUILD=1    改写 token 账本做整体重建（当前会停摆，仅实验用）
 # ============================================================================
 set -uo pipefail
 LOG=${LOG:-$HOME/kvmem.log}

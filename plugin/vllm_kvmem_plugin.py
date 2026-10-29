@@ -1858,24 +1858,7 @@ def _install(cls, module_name, probe, smoke, state):
                                 state.setdefault("was_decode", {})[_req] = int(_n) <= 8
                     except Exception:
                         pass
-                    try:
-                        _stb = _rt.state(_req)
-                        _rsb = getattr(self, "req_states", None)
-                        _cb = _lb = -1
-                        if _rsb is not None:
-                            _ib = _rsb.req_id_to_index.get(_req)
-                            if _ib is not None:
-                                _cb = int(_rsb.num_computed_tokens_np[_ib])
-                                _lb = int(_rsb.num_logical_tokens_np[_ib])
-                        _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
-                                {"kind": "prefill_book", "req": str(_req)[:8], "n": int(_n),
-                                 "computed": _cb, "logical": _lb,
-                                 "row": len(getattr(_stb, "row", ())),
-                                 "seq_len": int(getattr(_stb, "seq_len", 0)),
-                                 "tokens": int(getattr(_stb, "tokens", 0))})
-                    except Exception as _exc:
-                        _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
-                                {"kind": "prefill_book_error", "error": str(_exc)[:160]})
+                    # (per-step book dump removed: it wrote ~100 records per long prompt)
                     try:
                         # Mirror exactly what the engine has written (its own cursor), then make the
                         # attention length match. Both are needed: the row is the KV addressing and
