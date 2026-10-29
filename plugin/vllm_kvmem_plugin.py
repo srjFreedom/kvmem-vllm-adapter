@@ -1512,7 +1512,8 @@ def register():
                     page_tokens=int(payload.get("page_tokens", 0) or 0),
                     pages_per_block=int(payload.get("pages_per_block", 1) or 1),
                     capacity_pages=int(payload.get("capacity_pages", 0) or 0),
-                    has_state=bool(payload.get("has_state", False)))
+                    has_state=bool(payload.get("has_state", False)),
+                    prefix_digest=str(payload.get("prefix_digest", "") or ""))
                 _append(_sched_cfg(_channel_state.get("scheduler")).get("probe_log")
                         or "/tmp/kvmem_sparse.jsonl",
                         {"kind": "session_meta_parked", "pid": os.getpid(),
@@ -1533,7 +1534,20 @@ def register():
             engine allocate exactly the pages the worker will fill from RAM, and setting the served
             book to the hit length makes it schedule ONLY the genuinely new tokens.
             """
-            if not _resume_decided_is_enabled(scheduler):
+            _en = _resume_decided_is_enabled(scheduler)
+            if not getattr(_maybe_resume, "_probed", False):
+                _maybe_resume._probed = True
+                try:
+                    from kvmem_session_store import get_meta_store as _gms
+                    _store0 = _gms()
+                except Exception:
+                    _store0 = None
+                _append("/tmp/kvmem_sparse.jsonl",
+                        {"kind": "resume_probe", "pid": os.getpid(), "enabled": bool(_en),
+                         "store": len(_store0) if _store0 is not None else -1,
+                         "waiting": len(getattr(scheduler, "waiting", []) or []),
+                         "running": len(getattr(scheduler, "running", []) or [])})
+            if not _en:
                 return
             try:
                 from kvmem_session_store import block_hash_sequence, get_meta_store
@@ -1564,12 +1578,24 @@ def register():
                                  "n": len(ids), "block": block_size, "pid": os.getpid()})
                         continue
                     _hashes = block_hash_sequence(ids, block_size)
-                    found = store.lookup(_hashes)
+
+                    def _digest(nblocks, _ids=ids, _bs=block_size):
+                        import hashlib as _hl
+                        upto = int(nblocks) * int(_bs)
+                        return _hl.sha256(b"".join(
+                            int(t).to_bytes(4, "little", signed=False)
+                            for t in _ids[:upto])).hexdigest()
+
+                    found = store.lookup(_hashes, prefix_digest=_digest)
                     if found is None:
                         _append(_sched_cfg(scheduler).get("probe_log")
                                 or "/tmp/kvmem_sparse.jsonl",
                                 {"kind": "resume_skip", "req": rid, "why": "no prefix match",
-                                 "blocks": len(_hashes), "parked": len(store), "pid": os.getpid()})
+                                 "blocks": len(_hashes), "parked": len(store),
+                                 "block": int(block_size), "prompt_ids": len(ids),
+                                 "parked_blocks": [len(e.block_hashes) for e in
+                                                   list(getattr(store, "_entries", {}).values())[:4]],
+                                 "pid": os.getpid()})
                         continue
                     meta, blocks = found
                     hit = int(blocks) * block_size
@@ -1908,7 +1934,7 @@ def _install(cls, module_name, probe, smoke, state):
                             _logical = int(_rs.num_logical_tokens_np[_idx])
                             _resident = int(_rs.num_computed_tokens_np[_idx])
                             _plen = int(_rs.prompt_len.np[_idx])
-                            if (_plen > runtime.budget_tokens
+                            if (runtime.needs_reconstruction(req)
                                     and _logical < _plen <= _logical + int(n_new)):
                                 runtime.finish_prompt_for_reconstruction(
                                     req, int(n_new), _logical + int(n_new),

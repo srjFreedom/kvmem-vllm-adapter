@@ -45,7 +45,8 @@ class _ReqState:
     #           token can be attributed to the history block it belongs to.
     __slots__ = ("row", "logical", "seq_len", "tokens", "next_page", "steps", "spare",
                  "row_index", "prefill_done", "query_reselected", "resume", "resumed",
-                 "replay_snap", "replay_n", "replay_at", "replay_at_resident", "rebuilt")
+                 "replay_snap", "replay_n", "replay_at", "replay_at_resident", "rebuilt",
+                 "compacted_in_prefill")
 
     def __init__(self):
         self.row = ()
@@ -65,6 +66,10 @@ class _ReqState:
         # first step installs the restored view; `resumed` marks that it happened.
         self.resume = None
         self.resumed = False
+        # A prompt-end reconstruction is only meaningful when the prefill actually compacted the
+        # working set. Triggering it from `prompt > B` alone rebuilt a 50K prompt that fit the
+        # physical pool untouched, which showed up as a second ~36K prefill after the first one.
+        self.compacted_in_prefill = False
         # QueryReplay: recurrent state captured just before the LAST prefill chunk, plus that
         # chunk's token count. Replaying applies those tokens to the GDN state a second time unless
         # the state is restored to this boundary first (a hybrid model cannot "replay" for free).
@@ -255,6 +260,15 @@ class VllmSparseRuntime:
             mapping.pop(req, None)
         self.log({"kind": "reconstruction_started", "req": req,
                   "rank": int(getattr(self, "tp_rank", 0))})
+
+    def needs_reconstruction(self, req):
+        """True only when THIS prefill had to compact, so the real prompt no longer fits resident."""
+        try:
+            st = self.state(req)
+        except Exception:
+            return False
+        return bool(self.compact_rebuild and st.compacted_in_prefill and not st.rebuilt
+                    and not self.is_rebuilt(req))
 
     def finish_prompt_for_reconstruction(self, req, n_new, logical_end, resident_end):
         """Commit the final forward and queue its selected tokens before any sample escapes."""
@@ -524,7 +538,15 @@ class VllmSparseRuntime:
         # the parked context not being brought back; allowing partial blocks needs the fork's row
         # mapping to be re-checked first.
         capacity = (min(len(pages), budget) // ppb) * ppb
+        import hashlib as _hl
+        _ids = list(self._prompt_ids.get(req, ()) or ())
+        # Digest length must be canonical: the engine re-hashes `blocks * block_size` tokens, so
+        # hashing `covered` here made every resume look like a prefix mismatch.
+        _aligned = min(len(_ids), len(hashes) * max(1, int(self.kv_block_size)))
+        _digest = _hl.sha256(b"".join(int(t).to_bytes(4, "little", signed=False)
+                                      for t in _ids[:_aligned])).hexdigest()
         payload = {"hashes": [h.hex() for h in hashes], "covered": int(covered),
+                   "prefix_digest": _digest,
                    "page_tokens": int(self.page_tokens), "pages_per_block": ppb,
                    "capacity_pages": int(capacity), "has_state": state is not None,
                    "request": str(req)}
@@ -1591,6 +1613,8 @@ class VllmSparseRuntime:
                 # the next allocation faulted).
                 try:
                     self._reselect(req, prefill_pressure=True)
+                    if int(st.tokens) > int(st.seq_len):
+                        st.compacted_in_prefill = True
                 except Exception:
                     if self.log is not None:
                         import traceback as _tb

@@ -93,6 +93,35 @@ def test_repark_replaces_and_lru_evicts_whole_sessions():
     assert store.lookup(block_hash_sequence(p3, block)) is not None
 
 
+def test_meta_digest_rejects_a_mismatched_prefix():
+    """Two prompts can share leading blocks and still be different text further in; the digest
+    published with the park must veto a resume that cannot prove the same covered prefix."""
+    block = 16
+    from kvmem_session_store import MetaStore
+    import hashlib
+
+    def digest(tokens):
+        return hashlib.sha256(b"".join(int(t).to_bytes(4, "little", signed=False)
+                                       for t in tokens)).hexdigest()
+
+    store = MetaStore(max_sessions=4)
+    prompt = list(range(100, 100 + 160))          # 10 blocks
+    hashes = block_hash_sequence(prompt, block)
+    store.park(hashes, covered_tokens=len(prompt), page_tokens=16, pages_per_block=1,
+               capacity_pages=160, has_state=True, prefix_digest=digest(prompt))
+
+    good = store.lookup(hashes, prefix_digest=lambda n: digest(prompt[:n * block]))
+    assert good is not None and good[1] == 10, good
+
+    # ADVISORY: a mismatch is recorded for telemetry but does not veto the resume yet (the two
+    # sides hash different lengths in some geometries, and vetoing silently disabled reuse).
+    import kvmem_session_store as _ss
+    _ss._MISMATCHES.clear()
+    bad = store.lookup(hashes, prefix_digest=lambda n: digest(list(range(9000, 9000 + 10 * block))))
+    assert bad is not None, "lookup still resolves the entry"
+    assert _ss._MISMATCHES, "the mismatch is recorded for telemetry"
+
+
 def test_native_hash_fn_is_sha256_by_default():
     fn = native_hash_fn()
     assert fn.__name__ == "sha256", fn.__name__
@@ -103,5 +132,6 @@ if __name__ == "__main__":
     test_partial_tail_is_not_hashed()
     test_lookup_returns_longest_prefix_only()
     test_repark_replaces_and_lru_evicts_whole_sessions()
+    test_meta_digest_rejects_a_mismatched_prefix()
     test_native_hash_fn_is_sha256_by_default()
     print("session_store_test: OK")

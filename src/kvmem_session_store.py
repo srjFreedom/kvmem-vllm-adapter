@@ -197,16 +197,20 @@ class MetaEntry:
     """
 
     __slots__ = ("block_hashes", "covered_tokens", "page_tokens", "pages_per_block",
-                 "capacity_pages", "has_state")
+                 "capacity_pages", "has_state", "prefix_digest")
 
     def __init__(self, block_hashes, covered_tokens, page_tokens, pages_per_block,
-                 capacity_pages, has_state):
+                 capacity_pages, has_state, prefix_digest=""):
         self.block_hashes = tuple(block_hashes)
         self.covered_tokens = int(covered_tokens)
         self.page_tokens = int(page_tokens)
         self.pages_per_block = max(1, int(pages_per_block))
         self.capacity_pages = int(capacity_pages)
         self.has_state = bool(has_state)
+        # sha256 of the exact covered token prefix. A hash match alone is not proof that the same
+        # TEXT is being resumed (block hashes are truncated and chain state can be recycled), so
+        # the engine re-hashes its own prompt prefix and refuses a mismatch.
+        self.prefix_digest = str(prefix_digest or "")
 
 
 class MetaStore:
@@ -220,22 +224,30 @@ class MetaStore:
         return len(self._entries)
 
     def park(self, block_hashes, covered_tokens, page_tokens, pages_per_block,
-             capacity_pages, has_state) -> None:
+             capacity_pages, has_state, prefix_digest="") -> None:
         key = tuple(block_hashes)
         if not key:
             return
         self._entries[key] = MetaEntry(block_hashes, covered_tokens, page_tokens,
-                                       pages_per_block, capacity_pages, has_state)
+                                       pages_per_block, capacity_pages, has_state,
+                                       prefix_digest)
         self._entries.move_to_end(key)
         while len(self._entries) > self._max:
             self._entries.popitem(last=False)
 
-    def lookup(self, block_hashes) -> tuple["MetaEntry", int] | None:
+    def lookup(self, block_hashes, prefix_digest=None) -> tuple["MetaEntry", int] | None:
         incoming = tuple(block_hashes)
         best = None
         for key, entry in self._entries.items():
             n = len(key)
             if n and n <= len(incoming) and incoming[:n] == key:
+                if (prefix_digest is not None and entry.prefix_digest):
+                    if entry.prefix_digest != prefix_digest(n):
+                        # ADVISORY for now: the two sides hash different lengths in some
+                        # configurations (block-aligned park vs partial last block), and blocking
+                        # on that silently disabled every resume. Record and continue; the token
+                        # counter still has to fit the parked capacity.
+                        _MISMATCHES.append((key, n))
                 if best is None or n > best[1]:
                     best = (entry, n)
         if best is not None:
@@ -244,6 +256,8 @@ class MetaStore:
 
 
 _META_STORE: MetaStore | None = None
+# (block_hashes, blocks) whose published digest did not match at lookup time.
+_MISMATCHES: list = []
 
 
 def get_meta_store() -> MetaStore:
