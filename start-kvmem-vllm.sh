@@ -33,6 +33,9 @@ HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 export KVMEM_STATS=${KVMEM_STATS:-core}
 export KVMEM_FORCE_EAGER=${KVMEM_FORCE_EAGER:-1}
 export VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-1}
+# 复用：压缩模式会强制关闭 vLLM 前缀缓存（块哈希按逻辑 token、KV 已压缩），所以用 KVMem
+# 自己的会话复用：请求结束把 KV+状态停放到 H 池，下一轮命中同一前缀时直接接上。
+export KVMEM_SESSION_REUSE=${KVMEM_SESSION_REUSE:-1}
 
 # 超池：允许逻辑 prompt 超过物理池 —— prefill 期压缩 + prompt 末整体重算
 export OVER_POOL=${OVER_POOL:-1}
