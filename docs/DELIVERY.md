@@ -1,6 +1,6 @@
 # kvmem-vllm 适配器交付说明（v0.19 对齐）
 
-更新：2026-10-29（第 32 轮，已验证配置表）
+更新：2026-10-29（第 38 轮）
 
 ## 一、这一版是什么
 
@@ -125,3 +125,21 @@ ValueError: To serve at least one request with the model's max seq len (203000),
 `KVMEM_PROMPT_END_RESELECT=1` + `KVMEM_COMPACT_REBUILD=1` 会触发"用零状态重新 prefill 选中的
 36,864 token"，`compact_rebuilt` 能触发、引擎能重新 prefill，但随后停摆（`no sampled token`，
 约 26 分钟后才返回）。修好这个停摆，超池的答案正确性就补齐了。
+
+
+## 九、超池（prompt > 池）的最终状态（第 37~38 轮）
+
+**根因链已经完整**：
+
+1. 引擎的块是 1616 token，KVMem 的页是 16 token。一个引擎块只有在其 **101 个页全部被丢弃**时才能
+   归还池子，而分散选择永远不会整块丢弃 → 池子被榨干 → `assert block`（第 37 轮）。
+   修法：`KVMEM_BLOCK_SIZE=16` 让两者同单位（已验证：58,994 token + 2 次压缩从"引擎死"变成 HTTP 200）。
+2. 保留下来的页，其 KV 是在"中段已被淘汰"的状态下算出来的；循环状态同样如此。
+   实测规律：**1 次压缩≈可读（`ZXZXZX-4417-QJ7`），2~6 次≈退化（`ZX ZX = = =`），20+ 次≈完全错（`7`）**。
+3. 尾部重算（QueryReplay）只能修最后 N 个 token，修不了其余保留页（第 35 轮已证否）。
+4. 整体重算（把选中的 36,864 token 按压缩顺序重新 prefill）需要引擎的 token 账本与行一致，而 token
+   账本被改写后采样簿记失效（`no sampled token` 停摆，第 31 轮）。
+
+因此 **超池的正确性需要 compacted-sequence 接口**（`DESIGN-compacted-sequence.md` 的第三块拼图：
+`prepare_inputs` 的 logits 行口径），这不是参数或补丁能解决的。当前能保证正确性的是"prompt ≤ 池"
+（第 7 节第一行，88K 实测 `ZX-4417`）。
