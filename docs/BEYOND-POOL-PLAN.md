@@ -502,3 +502,28 @@ free_blocks = 59
 - 断点 `scheduler.py:899` 应看到 `MambaManager(block_size=1616)`，且 245K prompt 能进入
   `allocate_slots`（而不是停在 waiting）；
 - 再跑 200K/245K prompt 看是否正常进入压缩与解码。
+
+## 第 52 轮：Mamba 块解耦被实测否决
+
+改动（`KVMEM_MAMBA_BLOCK_TOKENS=1616`，窗口 200,000）后断点确认块尺寸确实变了：
+
+```
+groups = [('MambaManager', 1616, 5), ('MambaManager', 1616, 5), ('MambaManager', 1616, 5),
+          ('FullAttentionManager', 1616, 1)]
+```
+
+但大 prompt 一发就得到明确的引擎错误：
+
+```
+Block table write for request 0, group 0 exceeds row capacity (10 > 5)
+```
+
+原因：本 fork 在 `mamba_cache_mode="none"` 下，**每个请求只有一个状态块**，块表行也只按这个尺寸开
+（5 列 = 1 状态 + 4 投机槽）。把块尺寸改成 1616 后，分配器按 `cdiv(seq_len, 1616)` 索要状态块
+（10 个），直接越过 5 列的容量。
+
+所以 **`mamba_block_size` 必须等于 `max_model_len`**：状态是"每序列一份"，块表按此开。
+这不是参数问题，而是这套混合模型状态管理的结构性约束。已回退（`b5c4f34`），并把原因写进提交信息。
+
+**对超池的含义**：窗口 > 池在这套架构里不可行，除非把 Mamba 状态改成"与窗口无关的每序列一份、
+块尺寸恒为 1"的布局（fork 级重构：`MambaManager` 的分配数学 + 块表宽度）。
