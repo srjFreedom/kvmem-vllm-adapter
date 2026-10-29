@@ -245,6 +245,14 @@ def main(argv=None) -> int:
         print("[kvmem backends/vllm] KVMEM_ENTRY_RESIDENT_PREFILL=1 -> MAX_MODEL_LEN auto "
               "(engine window = KV pool), prefill stays resident, compaction is decode-only")
         _wanted = 0
+    # KVMem works in 16-token pages. The engine's own block must be the SAME unit, otherwise a
+    # scattered page selection cannot be handed back to the pool (a 1616-token block is only free
+    # when ALL 101 of its pages are dropped), the pool drains, and the second compaction dies on
+    # 'assert block' in block_pool.get_new_blocks.
+    _bs = int(os.environ.get("KVMEM_BLOCK_SIZE", "0") or 0)
+    if _bs > 0:
+        args += ["--set", f"BLOCK_SIZE={_bs}"]
+        print(f"[kvmem backends/vllm] BLOCK_SIZE pinned to {_bs} (engine block == KVMem page)")
     if _wanted <= 0 and not _resident:
         _wanted = max(1, int(ns.max_num_seqs)) * (int(ns.kvmem_budget) + int(ns.kvmem_gen_reserve))
         print(f"[kvmem backends/vllm] max_model_len auto = {ns.max_num_seqs} x "
