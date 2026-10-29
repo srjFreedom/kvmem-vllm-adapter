@@ -635,6 +635,11 @@ class SparseOrchestrator:
             core = self.core_selection_scores()
         except Exception as exc:
             _probe_write({"kind": "core_scores_error", "error": f"{type(exc).__name__}: {exc}"})
+        # Default to "no ranking": when the core scorer has nothing (e.g. prefill pressure before any
+        # query exists) and the legacy fallback is off, `raw` used to be unbound and the whole
+        # reselect raised UnboundLocalError - which the caller swallows, so compaction silently did
+        # not happen and the pool drained to an illegal access.
+        raw = []
         if core is not None:
             blocks = list(range(len(core)))
             raw = [float(v) for v in core]
