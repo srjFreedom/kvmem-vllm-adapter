@@ -62,7 +62,7 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 |---|---|---|---|
 | `GPU_UTIL` | `0.97` | vLLM 请求的显存占用比例（`--gpu-memory-utilization`）| 22 GB 卡用 0.97；显存更小的卡降低（0.90~0.95），OOM 时**先降这个** |
 | `MAX_BATCHED_TOKENS` | `4096` | 单步 prefill 的 token 上限（chunk 大小）| 调大可减少 chunk 数、提升 prefill 并行度，但吃显存；调大后必须重跑启动 smoke |
-| `KVMEM_ENTRY_RESIDENT_PREFILL` | `0`（启用内压缩时自动设为 1）| 入口不裁剪，完整 prompt 进入引擎；池内可常驻，**超池时仍须在 prefill 中压缩**（`KVMEM_RESIDENT_PREFILL_COMPACT=1`） | 单独打开并不能让超池 prompt 装入物理池 |
+| `KVMEM_ENTRY_RESIDENT_PREFILL` | `1`（随内压缩自动打开）| 入口不裁剪，完整 prompt 进入引擎；池内可常驻，**超池时仍须在 prefill 中压缩**（`KVMEM_RESIDENT_PREFILL_COMPACT=1`） | 单独打开并不能让超池 prompt 装入物理池 |
 | `--kvmem-block-tokens` | `32` | 选片块大小（必须是最小 KV 页 16 的整数倍）| 32 是修复值：检索按块取 pre-RoPE key 的**均值**打分，128 会让一条关键行（key/id/罕见词）被同块另外 ~127 个 token 稀释 —— 实测 200K prompt 在 50%~73% 换出时，128 答非所问、32 两把 needle 全中。调回 128 只在上下文很短（<32K）且不需要精确召回时才有意义 |
 | `KVMEM_DEBUG_POS` | 空（关）| 诊断：每一步在 `/tmp/kvmem_sparse.jsonl` 落一条 `debug_pos`，记录引擎为该请求算出的 `positions` 前 8 个、`npc`（常驻计数镜像）、`nlg`（服务计数镜像）、`seq_len` | 只在查「解码位置不前进 / 输出重复」时打开；`n` 应恒为 1+drafts（MTP=4 时 5），位置窗口应逐 step 前进 |
 | `SPECULATIVE_TOKENS` | `4` | MTP 投机 token 数 | `0` = 关闭投机：省显存/更稳，但 decode 变慢 |
@@ -72,7 +72,7 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 | `KVMEM_SKIP_KV_CHECK` / `KVMEM_MAX_MODEL_LEN` | `0` / 引擎窗口 | 允许逻辑 prompt 超过物理池并提供足够的输入缓冲区 | 显式实验开关，默认不得跳过 KV 容量检查。 |
 | `KVMEM_RESIDENT_PREFILL_COMPACT` | `0` | 在物理池装不下原 prompt 时按高水位压缩常驻工作集 | 不开会在块池耗尽前停住。 |
 | `KVMEM_BLOCK_SIZE` | 未指定 | 请求引擎使用小块；混合模型实际 attention 块仍可能按 Mamba 对齐放大（实测为 1616 token=101 个 16-token 页） | 重算回收按实际 `blocks_per_kv_block`，不按环境变量猜块大小。 |
-| `--kvmem-inrequest-compaction` | **关**（默认经典模式） | **常驻工作区的 opt-in 开关**：入口上限 `R`→`CTX` + 入口不再裁剪历史 + 引擎内压缩（prefill 与 decode）+ block 通道 + 同步调度 + 关闭前缀缓存。打开时也打开 `KVMEM_ENTRY_RESIDENT_PREFILL=1`；默认关时入口裁到 B、上限 R、前缀缓存开 | 设 `INREQUEST_COMPACTION=1` 会关闭前缀缓存；超池正确性另须显式打开上述实验开关 |
+| `--kvmem-inrequest-compaction` | **开**（默认常驻模式） | **常驻工作区的唯一开关**：入口上限 `R`→`CTX` + 入口不再裁剪历史 + 引擎内压缩（prefill 与 decode）+ block 通道 + 同步调度 + 关闭前缀缓存。默认开启时同时打开常驻工作区（`KVMEM_ENTRY_RESIDENT_PREFILL=1`）；设 0 = 退回 vLLM 原始路径（入口裁到 B、上限 R、前缀缓存开，未修复的旧路径）| 加这一个参数，显存就是每请求 `B+R`（与上下文长度无关）；超池正确性另须显式打开上述实验开关 |
 | `MESSAGE_TYPE` | `text+image` | 是否加载视觉塔 | 纯文本模型/只跑文本时设 `text`（省 ~0.9 GiB 权重）|
 | `MM_IMAGE_LIMIT` | `64` | 每 prompt 允许图片数 | 与 `MESSAGE_TYPE` 配套 |
 | `SERVICE_SCOPE` | `lan` | 监听范围 | `lan` = `0.0.0.0`；`local` = 只监听 `127.0.0.1` |

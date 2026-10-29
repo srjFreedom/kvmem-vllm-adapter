@@ -1753,3 +1753,24 @@ kvmem: no new tokens … logical=83445 computed=83445 tokens=83441
 
 **现状**：仓库默认 = 经典（有缓存、稳定）；常驻压缩仍是 opt-in（`INREQUEST_COMPACTION=1`），
 并发/解码期压缩的修复（图分发器对追赶批的判定 + MTP draft 回滚）仍未完成。
+
+### 0.3.0 默认回到常驻模式（2026-10-29）
+
+**背景**：第 17 轮曾把仓库默认改成经典模式（压缩关、前缀缓存开），理由是当时常驻压缩在
+并发/MTP 解码期没修完。0.3.0 的超池验收（196,598 token prompt / 122,816 token 池，27 次
+压缩 + 整体重算，答案 `ZX-4417-QJ7`）跑的是常驻 + 压缩路径，经典模式**没有**这条能力，
+且入口裁到 B 会丢掉中间内容（已实测错答）。用户明确：默认值取现在这套正确的，不退回旧的
+有 bug 的默认。
+
+**改动**：
+
+| 文件 | 改动 |
+|---|---|
+| `deploy/run-kvmem-vllm.sh` | `INREQUEST_COMPACTION` / `KVMEM_ENTRY_RESIDENT_PREFILL` 默认 `0` → `1`；注释写明 0 只用于调试旧路径 |
+| `docs/PARAMETERS.md` | 两行默认值同步回 `1` / **开**，并标注经典路径为"未修复的旧路径" |
+
+**验证**：`bash -n` 通过；定向回归（reconstruction / position_books / block_channel /
+prefill_compaction / tp_scores + 引擎 5 项）全通过；超池端到端结果见 `docs/DELIVERY.md`。
+
+**已知边界**：重建前的尾页 `needle=false` 与 `kv_len_clamped` 未消除；重建请求禁用投机；
+并发、多模态、会话复用未验收。
