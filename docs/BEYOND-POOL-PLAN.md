@@ -397,3 +397,23 @@ token 账本当前一旦被改写，采样簿记就失效（`no sampled token` �
 
 与第 35 轮的否证一致：尾部重放（QueryReplay）只能修最后 8K，修不了其余 28K 保留页的近似。
 唯一解是**把选中的 36,864 token 按压缩顺序整体重算**（compacted-sequence 接口）。
+
+## 第 42 轮：停摆的确切现场（留给下一阶段的唯一线索）
+
+重建之后引擎停摆，日志里的那一行是全部信息：
+
+```
+kvmem: prompt served but no sampled token
+  req=... logical=36864 computed=36864 tokens=36865 prompt=36864 scheduled=4096 placeholders=1
+```
+
+解读：
+- `computed == prompt == logical == 36864` → 重新 prefill 已经完成；
+- `tokens = 36865` → `num_tokens` 只比 prompt 多 1（我们留的那个 in-flight placeholder）；
+- **`scheduled = 4096`** → 调度器却给这一步排了 4,096 个 token（等于一个满 chunk），
+  而请求已经没有更多 token 可算 → worker 不产生 logits → 采样器无 token 可出 → 停摆。
+
+也就是说，问题不在采样器写法，而在**重建之后调度器对"这一步要算多少 token"的判断**：
+`is_prefill_chunk` / `num_output_placeholders` / `num_tokens_with_spec` 三者的组合让它以为还要走一个
+满 chunk 的 prefill。下一阶段要从这里入手（在 `schedule()` 里为"刚完成重建"的请求打印/校正
+`num_new_tokens`）。
