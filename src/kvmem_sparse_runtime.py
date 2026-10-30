@@ -2698,11 +2698,18 @@ class VllmSparseRuntime:
         self._in_rebuild_select = True
         selected = None
         try:
-            orch.reselect(slots=lambda count: pool_pages[:count],
-                          mandatory_pages=forced_tail, forced_pages=forced_tail,
-                          prefill_pressure=False, rebake=True)
-            selected = [int(p) for p in
-                        (orch.last_view.row_pages if orch.last_view else ())]
+            cap_pages = min(len(pool_pages) // bp * bp,
+                            int(self.budget_tokens) // pt // bp * bp)
+            cap_pages = max(bp * 2, cap_pages)
+            orch.max_select_pages_override = cap_pages
+            try:
+                orch.reselect(slots=lambda count: pool_pages[:count],
+                              mandatory_pages=forced_tail, forced_pages=forced_tail,
+                              prefill_pressure=False, rebake=True)
+                selected = [int(p) for p in
+                            (orch.last_view.row_pages if orch.last_view else ())]
+            finally:
+                orch.max_select_pages_override = None
         except Exception as exc:
             self._in_rebuild_select = False
             return False, f"picker error: {type(exc).__name__}: {exc}"

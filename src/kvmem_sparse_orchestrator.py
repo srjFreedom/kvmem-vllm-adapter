@@ -839,6 +839,13 @@ class SparseOrchestrator:
         else:
             raw = self.selector.select_pages(list(mandatory_pages))
         selected = [p for p in raw if p * self.page_tokens < max(self.total_tokens, 1)]
+        _cap = getattr(self, "max_select_pages_override", None)
+        if _cap:
+            # a caller-sized selection (stage-2 rebuild): the C++ store's budget is fixed at
+            # construction, so an ad-hoc smaller view is clamped here - ascending order keeps
+            # the sink+question bands (they are the ends; the score-ranked middle fills the
+            # rest, and truncation drops the LOWEST-scoring tail blocks, never the forced set).
+            selected = list(selected)[:int(_cap)]
         if forced_pages:
             # Hard requirement from the caller (the backend's prompt, which vLLM keeps immutable):
             # the selector/planner may rank, but they may not drop these pages. The result MUST stay
