@@ -336,12 +336,12 @@ class VllmSparseRuntime:
             sm = self.view.runner.block_tables.slot_mappings
             g = self.view.attn_groups[0]
             row = sm[g]
-            out = {}
-            for q in range(int(span[0]), int(span[1])):
-                if q < int(row.shape[0]):
-                    slot = int(row[q])
-                    if slot >= 0:
-                        out[q] = slot // self.page_tokens
+            p0, p1 = int(span[0]), min(int(span[1]), int(row.shape[0]))
+            if p1 <= p0:
+                return None
+            vals = row[p0:p1].tolist()          # ONE device sync for the whole span
+            pt = self.page_tokens
+            out = {p0 + k: v // pt for k, v in enumerate(vals) if v >= 0}
             return out or None
         except Exception:
             return None
@@ -1889,6 +1889,8 @@ class VllmSparseRuntime:
                     grown.append(page)
                 st.row = tuple(grown)
             touched = {}
+            _sm_span = getattr(self, "_slot_span_prev", {}).get(req)
+            _smap = self.slot_pages_for(req) if _sm_span else None
             for i in range(n_new_tokens):
                 logical = (st.tokens + i) // self.page_tokens
                 rank = (start + i) // self.page_tokens
@@ -1913,20 +1915,14 @@ class VllmSparseRuntime:
                 tb_val = None
                 slot_src = "row"
                 page = None
-                # Priority: the KERNEL's slot mapping for this step's tokens (authoritative),
-                # then the engine table mirror at rank, then the request row.
-                try:
-                    _span = getattr(self, "_slot_span_prev", {}).get(req)
-                    if _span:
-                        _p0, _p1 = int(_span[0]), int(_span[1])
-                        _q = _p0 + max(0, logical * self.page_tokens - int(st.tokens))
-                        if _p0 <= _q < _p1:
-                            _smap = self.slot_pages_for(req)
-                            if _smap and _q in _smap:
-                                page = _smap[_q]
-                                slot_src = "slotmap"
-                except Exception:
-                    page = None
+                # Priority: the KERNEL's slot mapping for the step under commit
+                # (authoritative - it IS the address the kernels used to write the bytes we
+                # are capturing), then the staging table mirror at rank, then the row.
+                if _smap and _sm_span:
+                    _q = int(_sm_span[0]) + max(0, logical * self.page_tokens - int(st.tokens))
+                    if _q in _smap:
+                        page = _smap[_q]
+                        slot_src = "slotmap"
                 if page is None:
                     try:
                         _tbl = self.view.block_table_rows()[0]
