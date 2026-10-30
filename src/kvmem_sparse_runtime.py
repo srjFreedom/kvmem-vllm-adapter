@@ -2693,9 +2693,13 @@ class VllmSparseRuntime:
         # [0..bp-1], so the first usable page is (first_page//bp + 1)*bp and the last is
         # whole-block truncated. A non-aligned destination window makes the packed physical
         # row span partial blocks, which `adopt_attention_blocks` can never validate.
-        first = (-(-int(self.first_page) // bp)) * bp
-        last = (n_blocks * pt) // bp * bp
-        pool_pages = list(range(first, last))
+        # vLLM addresses a page by ITS BLOCK INDEX times the pages-per-engine-block; the
+        # paged-KV tensor rows are indexed the same way, so the pool window must be built as
+        # ascending block ids scaled by `bp` (a bare `range()` here would address sub-pages
+        # of the first two blocks and every page above them would alias).
+        first = max(1, (-(-int(self.first_page) // bp)))
+        last = int(self.view.num_blocks())
+        pool_pages = [b * bp + o for b in range(first, last) for o in range(bp)]
         if len(pool_pages) < tail_pages_n + bp:
             return False, f"pool window too small ({len(pool_pages)})"
         # 1) score-ranked selection in the picker's SELECT-BLOCK grid, quantised to whole
@@ -2703,8 +2707,9 @@ class VllmSparseRuntime:
         #    can never be half-dropped), question tail forced, capped to the aligned window.
         self._in_rebuild_select = True
         try:
+            pool_blocks = int(self.view.num_blocks())
             cap_engine_blocks = max(2, min(
-                len(pool_pages) // bp, int(self.budget_tokens) // pt // bp))
+                pool_blocks, int(self.budget_tokens) // (bp * pt)))
             rank = None
             try:
                 rank = orch.selector.select_pages(forced_tail)
