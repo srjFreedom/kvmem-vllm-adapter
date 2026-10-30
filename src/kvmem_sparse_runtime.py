@@ -1851,7 +1851,7 @@ class VllmSparseRuntime:
         self._ensure(req)
         if (bool(getattr(self, "sched_compact", False))
                 and bool(getattr(self._state[req], "applied_view_coord", False))
-                and int(self._decode_probe.get(req, 0) or 0) < 3):
+                and int(self._decode_probe.get(req, 0) or 0) < 2):
             # GPU truth probe (measured once per request, first three decode steps after the
             # engine entered view coordinates): does the engine's OWN device book stay rewound,
             # and does the kernel really write new tokens at the row tail? If the feed pushes
@@ -2548,6 +2548,15 @@ class VllmSparseRuntime:
         if proposal is None:
             # Diagnostic: Core saw "incomplete TP compaction proposal" with no field saying why
             # (alignment deferral, empty selection and a refused planner all looked alike).
+            # Once per (req, shape) - the pressure trigger re-enters this path every 64 epochs
+            # and an unconditional line per entry is a log storm (measured: 366K rows).
+            _sig = ("empty", req, int(st.tokens), int(st.seq_len))
+            _seen = getattr(self, "_empty_logged", None)
+            if _seen is None:
+                _seen = self._empty_logged = set()
+            if _sig in _seen:
+                return None
+            _seen.add(_sig)
             self.log({"kind": "quiescent_compact_empty", "req": req,
                       "tokens": int(getattr(st, "tokens", 0) or 0),
                       "seq_len": int(getattr(st, "seq_len", 0) or 0),

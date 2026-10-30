@@ -2119,6 +2119,16 @@ def register():
                                 if epoch - last < 64:
                                     return
                                 idle[request.request_id] = epoch
+                                # pressure that never clears (prefix reporting keeps the
+                                # resident high by design, rebuild has not landed yet) must
+                                # not re-fire forever either: cap attempts per request
+                                tried = getattr(scheduler, "kvmem_pressure_tries", None)
+                                if tried is None:
+                                    tried = scheduler.kvmem_pressure_tries = {}
+                                tried[request.request_id] = n2 = int(tried.get(
+                                    request.request_id, 0)) + 1
+                                if n2 > 12:
+                                    return
                             _append(log_path, {"kind": "sched_compact_idle", "pid": os.getpid(),
                                                "req": request.request_id, "epoch": epoch})
                             return
