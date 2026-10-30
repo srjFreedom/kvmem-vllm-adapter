@@ -2574,12 +2574,16 @@ class VllmSparseRuntime:
                 self._reselect_prefix(req, pressure=pressure)
                 self._prefix_active = True
                 self._last_proposal = None
-                if int(getattr(self, "compact_rebuild", False)):
+                if (int(getattr(self, "compact_rebuild", False))
+                        and int(self._prompt_len.get(req, 0) or st.tokens)
+                        > int(self.budget_tokens)):
                     # Stage 2 fires at BOTH boundaries: the prompt-complete final (the only
                     # moment the frozen question exists for retrieval) AND pool pressure
                     # during a long prefill (measured: a 165K prompt stalls the scheduler at
                     # ~91% of the pool, so the final boundary NEVER arrives and the request
                     # starves with the GPU idle - pressure must be able to trigger it too).
+                    # A prompt that fits the budget is answered DENSE and must never pay for
+                    # a reconstruction (88K under the old unconditional trigger rebuilt anyway).
                     q = getattr(self, "_rebuild_queue", None)
                     if q is None:
                         q = self._rebuild_queue = {}
