@@ -2002,13 +2002,19 @@ class VllmSparseRuntime:
             _view_basis = bool(getattr(st, "applied_view_coord", False))
             for logical, tup in touched.items():
                 slot, rank = int(tup[0]), int(tup[1])
-                # The engine wrote these tokens into COMPACTED positions, so the page's bytes are
-                # baked `(rank - logical) * page_tokens` away from its logical start. Recording the
-                # rank (not the engine page id) is what lets a later resume, or a second request
-                # whose pool pages start at another base, restore the page to the right position.
+                # PHASE BASIS. After a FINAL apply (book rewind landed) the engine bakes at
+                # VIEW coordinates, so the page carries `(rank - logical) * page_tokens` of
+                # rotation. After a PRESSURE apply - or with no apply at all - the engine's book
+                # still runs on the logical frontier (the feed never rewinds it for a running
+                # request, 891a2cf) and the engine's bake is ALREADY the logical phase: delta 0.
+                # Passing the rank-based delta during a pressure epoch stored 124K tokens of
+                # wrongly-rotated pages - the streamed commits survive a later repack, so the
+                # poison reached the final view (measured: 891a2cf run, ArchiveArchive).
+                _vb = bool(getattr(st, "applied_view_coord", False))
                 if not orch.commit_written_page(
                         logical, slot,
-                        baked=0 if self._pure_copy() else (rank - logical) * self.page_tokens):
+                        baked=0 if (self._pure_copy() or not _vb)
+                        else (rank - logical) * self.page_tokens):
                     refused.append((int(logical), int(slot), int(rank)))
                 if st.spare == slot:
                     st.spare = None
@@ -2435,6 +2441,20 @@ class VllmSparseRuntime:
                       "sel_max": max(proposal.get("selected_pages") or (0,))
                       if proposal.get("selected_pages") else -1})
         return proposal
+
+    def note_applied_epoch(self, req, epoch, visible, logical):
+        """Core applied a boundary compaction at this epoch. A PRESSURE apply (visible <
+        logical) leaves the engine's book on the logical frontier until the final rewind -
+        the request therefore still runs in TRUE coordinates; a final apply with the book
+        rewind switches the whole pipeline to VIEW coordinates (book_rewound)."""
+        st = self.state(req)
+        hist = getattr(self, "_applied_epochs", None)
+        if hist is None:
+            hist = self._applied_epochs = {}
+        hist[req] = int(epoch)
+        if visible < logical and not bool(getattr(st, "applied_view_coord", False)):
+            st.applied_view_coord = False
+        return True
 
     def book_rewound(self, req, visible):
         """EngineCore applied a boundary compaction and the engine's resident book now reads
