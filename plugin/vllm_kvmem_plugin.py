@@ -1687,8 +1687,27 @@ def register():
             # Never use one namespace as the other, even when their initial values coincide.
             from kvmem_reconstruction import select_tokens, adopt_attention_blocks
             if rebuild:
+                # Do NOT mutate the scheduler from this (channel) thread: select the tokens
+                # here (read-only over the request's prompt book), mark the request pending,
+                # and let the patched `Scheduler.schedule` perform the detach+requeue at the
+                # start of the NEXT step - the one point where it owns the data structures.
                 token_ids = select_tokens(req.prompt_token_ids, pages, page_tokens)
-                reply = scheduler.queue_kvmem_reconstruction(request_id, token_ids)
+                pending = getattr(self, "kvmem_rebuild_pending", None)
+                if pending is None:
+                    pending = self.kvmem_rebuild_pending = {}
+                already = request_id in pending
+                pending[request_id] = {
+                    "token_ids": token_ids,
+                    "visible": int(visible_tokens or 0),
+                    "attempts": int((pending.get(request_id) or {}).get("attempts", 0)) + 1,
+                }
+                reply = {"ok": True, "queued": True, "pending": True,
+                         "tokens": len(token_ids), "pages": len(pages),
+                         "already_pending": already}
+                if len(token_ids) >= int(getattr(req, "num_prompt_tokens", 0) or 0):
+                    del pending[request_id]
+                    reply = {"ok": False, "error": "rebuild not shrinking",
+                             "new": len(token_ids)}
                 _append(_channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
                         {"kind": "compact_rebuild_queued", "req": request_id,
                          "pages": len(pages), "tokens": len(token_ids), **reply})
@@ -1979,6 +1998,19 @@ def register():
         if not getattr(original, "_kvmem_channel_patched", False):
             def schedule(self, *args, **kwargs):
                 _channel_state["scheduler"] = self
+                # Stage-2 rebuild: perform queued reconstructions HERE - on the scheduler
+                # thread, before anything else reads the queues this step.
+                _pend = getattr(self, "kvmem_rebuild_pending", None)
+                if _pend:
+                    for _rid, _info in list(_pend.items()):
+                        _pend.pop(_rid, None)
+                        try:
+                            self.queue_kvmem_reconstruction(_rid, _info["token_ids"])
+                        except Exception:
+                            _append(_channel_state.get("probe_log")
+                                    or "/tmp/kvmem_sparse.jsonl",
+                                    {"kind": "rebuild_apply_error", "pid": os.getpid(),
+                                     "req": _rid, "error": traceback.format_exc()[-300:]})
                 # Wire the live debugger into EngineCore as well: kvmem_dbg.install() sets a tracer on
                 # the CURRENT process, and the worker console can only reach the worker. With this one
                 # check, dropping /tmp/kvmem_dbg.bp and sending a request lets a breakpoint dump the
@@ -2483,27 +2515,27 @@ def _install(cls, module_name, probe, smoke, state):
                         # the worker has with the final chunk already committed to the store.
                         _rq = getattr(runtime, "_rebuild_queue", None)
                         if _rq and req in _rq:
-                            try:
-                                _ok, _det = runtime._rebuild_select(req)
-                                if _ok:
-                                    _rq.pop(req, None)
-                                else:
-                                    _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
-                                            {"kind": "rebuild_select_retry", "req": req,
-                                             "detail": str(_det)[:200]})
-                                    # give up after five attempts so a doomed request cannot
-                                    # spend the whole generation in picker+channel traffic
-                                    _tr = getattr(runtime, "_rebuild_tries", None)
-                                    if _tr is None:
-                                        _tr = runtime._rebuild_tries = {}
-                                    _tr[req] = int(_tr.get(req, 0)) + 1
-                                    if _tr[req] >= 5:
+                                try:
+                                    _ok, _det = runtime._rebuild_select(req)
+                                    if _ok:
                                         _rq.pop(req, None)
-                            except Exception:
-                                _rq.pop(req, None)
-                                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
-                                        {"kind": "rebuild_select_error", "req": req,
-                                         "error": traceback.format_exc()[-400:]})
+                                    else:
+                                        _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                                {"kind": "rebuild_select_retry", "req": req,
+                                                 "detail": str(_det)[:200]})
+                                        # give up after five attempts so a doomed request cannot
+                                        # spend the whole generation in picker+channel traffic
+                                        _tr = getattr(runtime, "_rebuild_tries", None)
+                                        if _tr is None:
+                                            _tr = runtime._rebuild_tries = {}
+                                        _tr[req] = int(_tr.get(req, 0)) + 1
+                                        if _tr[req] >= 5:
+                                            _rq.pop(req, None)
+                                except Exception:
+                                    _rq.pop(req, None)
+                                    _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                            {"kind": "rebuild_select_error", "req": req,
+                                             "error": traceback.format_exc()[-400:]})
                     if runtime.compact_rebuild:
                         _rs = self.req_states
                         _idx = _rs.req_id_to_index.get(req)

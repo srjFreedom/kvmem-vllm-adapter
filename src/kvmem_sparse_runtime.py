@@ -2521,15 +2521,16 @@ class VllmSparseRuntime:
                 self._reselect_prefix(req, pressure=pressure)
                 self._prefix_active = True
                 self._last_proposal = None
-                if final and int(getattr(self, "compact_rebuild", False)):
-                    # Stage 2: the prompt completed beyond the resident budget with reporting
-                    # only - the engine read it dense and the store holds every page. Queue
-                    # the retrieval-rebuild for THIS request; the driver in the worker's
-                    # post-block fires it once the final forward's pages are committed.
+                if int(getattr(self, "compact_rebuild", False)):
+                    # Stage 2 fires at BOTH boundaries: the prompt-complete final (the only
+                    # moment the frozen question exists for retrieval) AND pool pressure
+                    # during a long prefill (measured: a 165K prompt stalls the scheduler at
+                    # ~91% of the pool, so the final boundary NEVER arrives and the request
+                    # starves with the GPU idle - pressure must be able to trigger it too).
                     q = getattr(self, "_rebuild_queue", None)
                     if q is None:
                         q = self._rebuild_queue = {}
-                    q[req] = int(st.tokens)
+                    q.setdefault(req, int(st.tokens))
             elif bool(getattr(self, "blockwise_view", False)):
                 self._reselect_blockwise(req, pressure=pressure)
             else:
@@ -2622,7 +2623,14 @@ class VllmSparseRuntime:
         self._in_rebuild_select = False
         if not selected:
             return False, "picker returned nothing"
-        usable = [p for p in selected if p < head_pages and orch.store.has(p)]
+        # store keys are LOGICAL page ids (commit recorded them in the prompt's own frame) -
+        # test the ids, never the physical row entries `last_view.row_pages` carries.
+        by_logical = {}
+        for lp, phys in zip(st.logical or (), st.row or ()):
+            if lp is not None:
+                by_logical.setdefault(int(lp), int(phys))
+        usable = [p for p in selected if p < head_pages
+                  and (orch.store.has(p) or p in by_logical)]
         usable = sorted(set(usable)[:select_budget_pages])
         if not usable:
             return False, f"no canonical middle pages selected ({len(selected)})"
