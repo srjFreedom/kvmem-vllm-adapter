@@ -2234,7 +2234,7 @@ class VllmSparseRuntime:
                           "error": _tb.format_exc()[-400:]})
             return None
 
-    def quiescent_compact(self, req, frontier=None):
+    def quiescent_compact(self, req, frontier=None, computed=None, final=None):
         """EngineCore-callable compaction on the scheduler thread, between steps.
 
         The worker has completed the previous forward but not yet committed it (the commit runs at
@@ -2242,6 +2242,13 @@ class VllmSparseRuntime:
         the one EngineCore scheduled, then moves pages and installs the compacted row WITHOUT the
         BlockChannel call: EngineCore adopts the blocks and rewrites its own books from the returned
         proposal, so no worker-originated scheduler mutation happens off the main thread.
+
+        REFUSAL MUST NOT DIVERGE: the worker moves its view before Core can validate, so every
+        pre-move book check runs HERE first (frontier AND resident: `computed` is Core's
+        `num_computed_tokens`), and the pre-move state is snapshotted so Core's
+        `kvmem_revert_quiescent` RPC can restore it after a refusal. The revert is safe because the
+        canonical store holds the real bytes (verified this session: dense commits captured them),
+        so re-installing the old view is a pure store->device copy.
         """
         if not req or req not in self._state:
             return None
@@ -2254,6 +2261,22 @@ class VllmSparseRuntime:
             self.log({"kind": "quiescent_compact_stale", "req": req,
                       "want": int(frontier), "have": int(st.tokens)})
             return None
+        if computed is not None and int(computed) != int(st.seq_len):
+            # The two resident books must agree BEFORE the move; refusing here (instead of after
+            # the move) is what keeps a disagreement recoverable (measured: one refused final
+            # proposal left the worker at 20,161 while Core kept 54,326 and every later proposal
+            # was refused with "frontier differs" for the rest of the request).
+            self.log({"kind": "quiescent_compact_stale", "req": req,
+                      "want_logical": int(frontier or 0), "have_logical": int(st.tokens),
+                      "want_resident": int(computed), "have_resident": int(st.seq_len),
+                      "reason": "resident"})
+            return None
+        self._quiescent_snap = {
+            "req": req, "row": st.row, "logical": st.logical, "seq_len": st.seq_len,
+            "spare": st.spare, "owned": tuple(self._owned_slots.get(req, ())),
+            "resident": set(self._orch[req].resident),
+            "slot_of": dict(self._orch[req].slot_of),
+            "baked_delta": dict(self._orch[req].baked_delta)}
         self._last_proposal = None
         # Two different core selections: prefill PRESSURE compaction has no usable query yet and
         # the core's pressure picker deliberately ranks by sink/recency; the FINAL reselect (the
@@ -2261,7 +2284,16 @@ class VllmSparseRuntime:
         # `pick_topk_blocks`, the only path that reads retrieval scores. Measured: the pressure
         # picker ignored a #1-ranked needle block and filled the middle by recency.
         _pl = int(self._prompt_len.get(req, 0) or 0)
-        pressure = not (_pl and int(st.tokens) >= _pl)
+        if final is None:
+            pressure = not (_pl and int(st.tokens) >= _pl)
+        else:
+            # EngineCore owns the final-vs-pressure decision (it already computed `request in
+            # final` from `num_logical_tokens >= num_prompt_tokens`). The worker's `_prompt_len`
+            # can be missing (the plen row-index hook did not fire), which silently classified
+            # every prompt-end reselect as PRESSURE - the recency picker then dropped the actual
+            # question (measured: the final selection stopped at the pre-prompt tail page and Core
+            # refused it for lacking the last page).
+            pressure = not bool(final)
         # Both TP ranks are inside this collective_rpc together: the exact boundary where the
         # score consensus may run. Without it each rank ranked the middle by its OWN shard's
         # scores and proposed different working sets (measured: "TP ranks proposed different
@@ -2295,8 +2327,49 @@ class VllmSparseRuntime:
                       "visible": proposal.get("visible_tokens"),
                       "pages": len(proposal.get("physical_pages") or ()),
                       "logical": proposal.get("logical_frontier"),
-                      "resident": proposal.get("resident_frontier")})
+                      "resident": proposal.get("resident_frontier"),
+                      "store": proposal.get("store_pages"),
+                      "store_max": proposal.get("store_max"),
+                      "sel_max": max(proposal.get("selected_pages") or (0,))
+                      if proposal.get("selected_pages") else -1})
         return proposal
+
+    def revert_quiescent(self, req):
+        """EngineCore-callable rollback after it REFUSED the last quiescent proposal.
+
+        The worker moves its view before Core can validate; without this, one refusal (measured:
+        the final reselect whose store lacked the tail) leaves the worker permanently at the
+        proposed books while Core keeps the old ones, and every later proposal then refuses with
+        "frontier differs" until the request ends with a torn view. The canonical store has the
+        real bytes, so restoring the snapshotted row is a pure store->device copy plus a book
+        rewind. Consumes the snapshot (idempotent afterwards)."""
+        snap = getattr(self, "_quiescent_snap", None)
+        if not snap or snap.get("req") != req or req not in self._state:
+            return False
+        self._quiescent_snap = None
+        st = self._state[req]
+        orch = self._orch[req]
+        try:
+            for page, slot in zip(snap["logical"] or (), snap["row"]):
+                if page is None:
+                    continue
+                try:
+                    orch.restore_page(int(page), int(slot))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        st.row, st.logical = snap["row"], snap["logical"]
+        st.seq_len, st.spare = snap["seq_len"], snap["spare"]
+        self._owned_slots[req] = list(snap["owned"])
+        orch.resident = snap["resident"]
+        orch.slot_of = snap["slot_of"]
+        orch.baked_delta = snap["baked_delta"]
+        if self.log is not None:
+            self.log({"kind": "quiescent_reverted", "req": req,
+                      "seq_len": int(st.seq_len), "tokens": int(st.tokens),
+                      "row": len(st.row or ())})
+        return True
 
     def _reselect(self, req, prefill_pressure=False, probe=False, rebuild=False, send=True):
         st = self._state[req]
@@ -2632,6 +2705,15 @@ class VllmSparseRuntime:
                 "block_pages": int(getattr(self, "block_pages", 1) or 1),
                 "engine_logical": self._engine_logical.get(req),
                 "engine_computed": self._engine_computed.get(req),
+                # Canonical-store coverage at proposal time: if the tail pages are NOT in the store
+                # the selection CANNOT contain them, and Core's mandatory tail-page check will
+                # (correctly) refuse - this field separates "selector dropped the tail" from
+                # "the tail was never committed".
+                "store_pages": len(getattr(self._orch[req], "store", None).pages
+                                   if getattr(self._orch[req], "store", None) is not None else ()),
+                "store_max": (max(self._orch[req].store.pages)
+                              if getattr(self._orch[req], "store", None) is not None
+                              and self._orch[req].store.pages else -1),
                 "prepare": bool(prefill_pressure)}
             if self.set_block_cursor is not None and st.row:
                 try:

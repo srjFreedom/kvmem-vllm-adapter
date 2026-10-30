@@ -1417,7 +1417,8 @@ def register():
                 return runtime.check_session_checkpoint(owner, hashes, frontier, digest,
                                                         capacity_pages)
 
-            def _kvmem_quiescent_compact(worker, request_id, frontier, epoch):
+            def _kvmem_quiescent_compact(worker, request_id, frontier, epoch, computed=None,
+                                         final=None):
                 """EngineCore-side compaction: flush, move pages, return the proposal.
 
                 Must not call back into EngineCore (no BlockChannel): Core applies the books.
@@ -1428,7 +1429,10 @@ def register():
                 if runtime is None:
                     return None
                 try:
-                    proposal = runtime.quiescent_compact(str(request_id), int(frontier))
+                    proposal = runtime.quiescent_compact(
+                        str(request_id), int(frontier),
+                        None if computed is None else int(computed),
+                        None if final is None else bool(final))
                 except Exception:
                     # A worker RPC must never take the engine down; Core treats None as refusal.
                     proposal = None
@@ -1440,7 +1444,23 @@ def register():
             _GPUWorker.prepare_kvmem_session_checkpoints = _prepare_kvmem_session_checkpoints
             _GPUWorker.abort_kvmem_session_checkpoints = _abort_kvmem_session_checkpoints
             _GPUWorker.check_kvmem_session_checkpoint = _check_kvmem_session_checkpoint
+            def _kvmem_revert_quiescent(worker, request_id):
+                """Restore the worker's pre-proposal view after EngineCore REFUSED it.
+
+                Must run as a collective like the compaction itself; without it one refusal
+                diverges the worker view from Core's books for the rest of the request.
+                """
+                runner = getattr(worker, "model_runner", None)
+                runtime = getattr(runner, "kvmem_runtime", None)
+                if runtime is None:
+                    return False
+                try:
+                    return bool(runtime.revert_quiescent(str(request_id)))
+                except Exception:
+                    return False
+
             _GPUWorker.kvmem_quiescent_compact = _kvmem_quiescent_compact
+            _GPUWorker.kvmem_revert_quiescent = _kvmem_revert_quiescent
     except Exception:
         _boot("session checkpoint worker RPC install failed: " + traceback.format_exc())
     _ensure_import_path()
@@ -1861,7 +1881,8 @@ def register():
                         records = executor.collective_rpc(
                             "kvmem_quiescent_compact", timeout=120,
                             args=(request.request_id, int(request.num_logical_tokens),
-                                  epoch))
+                                  epoch, int(request.num_computed_tokens),
+                                  request in final))
                         result = validate_quiescent_compaction(
                             request, records, tp_size, epoch, manager)
                         outcome = apply_compaction(
@@ -1869,8 +1890,17 @@ def register():
                             lambda visible, pages, block_pages: adopt_attention_blocks(
                                 manager, request.request_id, pages, block_pages))
                     except Exception as exc:
+                        # The worker already moved its view for this proposal; roll it back
+                        # (symmetric collective) so the books cannot diverge after a refusal.
+                        try:
+                            reverted = executor.collective_rpc(
+                                "kvmem_revert_quiescent", timeout=60,
+                                args=(request.request_id,))
+                        except Exception:
+                            reverted = None
                         _append(log_path, {"kind": "sched_compact_refused", "pid": os.getpid(),
                                            "req": request.request_id,
+                                           "reverted": bool(any(reverted or ())),
                                            "error": f"{type(exc).__name__}: {exc}"})
                         return
                     if request in final:
