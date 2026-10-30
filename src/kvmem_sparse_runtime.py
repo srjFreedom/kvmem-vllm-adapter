@@ -2588,7 +2588,13 @@ class VllmSparseRuntime:
                 self._reselect_blockwise(req, pressure=pressure)
             else:
                 _rebuild_mode = bool(mode == "page"
-                                     and int(getattr(self, "compact_rebuild", False)))
+                                     and int(getattr(self, "compact_rebuild", False))
+                                     # only when the prompt genuinely does NOT fit the resident
+                                     # budget - an in-budget prompt is answered dense by the
+                                     # engine and must never pay for a reconstruction (88K
+                                     # regression: the old prompt-end trigger rebuilt it anyway)
+                                     and int(self._prompt_len.get(req, 0) or st.tokens)
+                                     > int(self.budget_tokens))
                 self._in_page_rebuild = _rebuild_mode
                 try:
                     self._reselect(req, prefill_pressure=pressure, send=False)
