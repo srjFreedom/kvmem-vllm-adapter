@@ -1828,6 +1828,69 @@ class VllmSparseRuntime:
                     st.row = tuple(grown)
                 slot = int(st.row[rank])
                 touched[logical] = (slot, rank)
+            _tp = getattr(self, "trace_pages", None)
+            if _tp and self.log is not None and any(lp in _tp for lp in touched):
+                # Decisive commit-time probe: does the device page we are about to capture carry
+                # bytes? Compare the chosen slot against the engine table at RANK and at LOGICAL
+                # position, with each candidate page's live byte-sum.
+                try:
+                    tbl = self.view.block_table_rows()[0][st.row_index]
+                    tb_list = tbl.tolist()
+                    dev = list(self._orch[req].kvs)
+                    rows = []
+                    for lp in _tp:
+                        if lp not in touched:
+                            continue
+                        s, r = touched[lp]
+                        def dsum(page):
+                            if page is None or int(page) <= 0 or int(page) >= len(dev[0]):
+                                return None
+                            return int(dev[0][int(page)].view(
+                                __import__("torch").uint8).to("cpu").numpy().astype("int64").sum())
+                        rows.append({"logical": int(lp), "rank": int(r), "slot": int(s),
+                                     "start": int(start), "tokens": int(st.tokens),
+                                     "seq_len": int(st.seq_len),
+                                     "d_pages": (int(st.tokens) - int(st.seq_len)) // self.page_tokens,
+                                     "eng_at_rank": tb_list[r] if r < len(tb_list) else None,
+                                     "eng_at_logical": tb_list[lp] if lp < len(tb_list) else None,
+                                     "row_len": len(st.row), "dev_sum_slot": dsum(s),
+                                     "dev_sum_eng_logical": dsum(tb_list[lp]) if lp < len(tb_list) else None})
+                    # Where did the engine ACTUALLY write? One reduction over the whole layer-0
+                    # cache. If the non-zero pages cluster around a TRUE-position mapping instead
+                    # of the packed row, the kernel's write address ignored the compaction.
+                    try:
+                        import torch as _t
+                        sums = dev[0].view(_t.uint8).to(_t.int16).sum(dim=(1, 2, 3))
+                        sums_cpu = sums.to("cpu").tolist()
+                        nz_pages = sum(1 for v in sums_cpu if v > 1000)
+                        first_nz = [i for i, v in enumerate(sums_cpu) if v > 1000][:8]
+                        probe_page = next((x for x in _tp if x in touched), None)
+                        s0 = int(touched[probe_page][0]) if probe_page is not None else 0
+                        want_at = {}
+                        for name, pos in (("logical_plus_base", probe_page + 196),
+                                          ("slot", s0), ("rank", int(touched[probe_page][1])
+                                                          if probe_page else 0)):
+                            if 0 <= pos < len(sums_cpu):
+                                want_at[name] = sums_cpu[pos]
+                        # Does the DEVICE page holding real bytes sit where the DENSE mapping
+                        # would put the chunk? Search a window around the written token span.
+                        lo = max(0, int(st.seq_len) // self.page_tokens - 8)
+                        window = sums_cpu[lo:lo + 200]
+                        self.log({"kind": "commit_map_probe", "req": req,
+                                  "nonzero_pages": int(nz_pages),
+                                  "first_nonzero": first_nz, "row_len": len(st.row),
+                                  "seq_len": int(st.seq_len), "tokens": int(st.tokens),
+                                  "want_at": want_at,
+                                  "tail_row_pages_sum": [sums_cpu[p] for p in
+                                                         list(st.row[lo:lo + 8])]})
+                    except Exception:
+                        self.log({"kind": "commit_map_probe_error", "req": req,
+                                  "error": __import__("traceback").format_exc()[-200:]})
+                    self.log({"kind": "commit_probe", "req": req, "rows": rows})
+                except Exception:
+                    import traceback as _tb
+                    self.log({"kind": "commit_probe_error", "req": req,
+                              "error": _tb.format_exc()[-300:]})
             for logical, (slot, rank) in touched.items():
                 # The engine wrote these tokens into COMPACTED positions, so the page's bytes are
                 # baked `(rank - logical) * page_tokens` away from its logical start. Recording the
