@@ -151,3 +151,9 @@ needle、MTP 接受长度及跨请求回归扩展验收。所有实验开关默�
 
 2026-10-30 提交 `3b18b5e` 后的 decode 字节探针（console，step 280/320，tokens 170,020/170,060）：needle 页 2654-2657 **全部 resident、槽位 580-583 在行内、rank 384-387（紧跟 sink）、`needle()` 全 true**，seq_len 覆盖之——即压缩视图在结构上完全正确，共识 degraded=0、final 压缩在 decode 前应用。回答仍是 `Based access access…`。`needle()` 是 device↔store 的自洽检查，无法证明 store 规范字节本身未被早前压缩周期的槽位复用污染（历史备忘中"检查与自身错误 delta 一致"的坑）。
 **下一步分叉实验（便宜且决定性）**：把 prompt 缩到刚过池（如 ~165K，needle 仍在中间）使压缩次数降到 1-2 次：若回答正确 → 多次压缩链在污染 store/槽位；若仍错 → restore/提交路径本身有缺陷。之后再回 169,998 全链验证。会话复用仍默认关；无 warm 对照。
+
+2026-10-30 敏感性分叉实验（console 注入 + `KVMEM_NO_SEQ` 反向开关）：
+- 把 `st.seq_len` 截到 1 的输出与不截**完全相同**——事后查明注入被 `after_step` 的 post_prefill_shrink 恢复（该分支在 sched 模式下**未 gate**，是并存的第二条 socket 压缩路径：本轮 36 次 applied/12 次 query_reselect 即它造成），截断从未到达 kernel；该实验本身无效，但暴露了 wiring bug。
+- `KVMEM_NO_SEQ=1`（builder 拿到 dense seq_lens）→ 输出**改变**为连贯英文（"Based on the archive entries provided, there is no special access code recorded…"）。**seq_lens 覆盖路径是活的**，kernel 确实在读我们 install 的视图。
+- 结论翻转：问题不是时序/账本/选片/seq_lens，而是**压缩视图的内容语义损坏**。needle 抽查 device==store 是自洽检查，store 规范字节本身可能在提交时已被污染——首要嫌疑：压缩后新 chunk 的**写入槽位（kernel slot = positions - slot_offset）与 runtime 提交 rank（(st.seq_len+i)//page）不一致**，导致 commit 抓错 slot 的字节，把 question 段的 KV 以错误来源写入 store。NO_SEQ 下模型能读连贯的 archive 尾部却说"没有 code"，与 needle 段（compacted 前 1,176 页内）字节已坏一致。
+- 下一段（明确）：在首个 decode 步对比 attention 分数——用 console 直接读 needle rank 384-387 页与 rank 0 页的 K 字节做点积参照，或离线复算（同 prompt 基线 run 的 store 字节 vs 压缩 run 的 store 字节，逐页 diff）。修复方向是统一"kernel 写槽 = runtime 提交 rank"。
