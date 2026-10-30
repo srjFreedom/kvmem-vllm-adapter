@@ -71,6 +71,64 @@ def test_lookup_returns_longest_prefix_only():
     assert store.lookup(block_hash_sequence(divergent, block)) is None
 
 
+def test_identical_prefixes_are_isolated_by_native_session_id():
+    from kvmem_session_store import MetaStore
+
+    block = 16
+    prompt = list(range(700, 700 + 160))
+    hashes = block_hash_sequence(prompt, block)
+    a, b = object(), object()
+    store = SessionStore(max_sessions=4)
+    owner_a = ("tenant-a", "conversation-a")
+    owner_b = ("tenant-b", "conversation-b")
+    store.park(hashes, a, len(prompt), 16, owner_session_id=owner_a)
+    store.park(hashes, b, len(prompt), 16, owner_session_id=owner_b)
+
+    assert len(store) == 2
+    hit_a = store.lookup(hashes, owner_session_id=owner_a)
+    hit_b = store.lookup(hashes, owner_session_id=owner_b)
+    assert hit_a is not None and hit_a[0].orchestrator is a
+    assert hit_b is not None and hit_b[0].orchestrator is b
+    assert store.lookup(hashes, owner_session_id=("tenant-a", "unknown")) is None
+
+    meta = MetaStore(max_sessions=4)
+    meta.park(hashes, len(prompt), 16, 1, 160, True, owner_session_id=owner_a)
+    meta.park(hashes, len(prompt), 16, 1, 160, True, owner_session_id=owner_b)
+    assert meta.lookup(hashes, owner_session_id=owner_a)[0].owner_session_id == owner_a
+    assert meta.lookup(hashes, owner_session_id=owner_b)[0].owner_session_id == owner_b
+    assert meta.lookup(hashes, owner_session_id=("tenant-a", "unknown")) is None
+
+
+def test_native_session_id_survives_scheduler_worker_boundary():
+    from types import SimpleNamespace
+    from vllm.v1.core.sched.output import NewRequestData
+
+    request = SimpleNamespace(
+        request_id="r", prompt_token_ids=[1, 2, 3], mm_features=[],
+        sampling_params=None, pooling_params=None, num_computed_tokens=0,
+        num_logical_tokens=0, lora_request=None, prompt_embeds=None,
+        prompt_is_token_ids=None, kvmem_rebuilt=False,
+        session_id="conversation-7", cache_salt="tenant-2")
+    data = NewRequestData.from_request(request, block_ids=([],))
+    assert data.session_id == "conversation-7"
+    assert data.cache_salt == "tenant-2"
+
+
+def test_idle_checkpoint_eviction_releases_its_host_share():
+    from kvmem_session_budget import SessionBudgetPool
+
+    pool = SessionBudgetPool(host_bytes=1024, sessions=1)
+    grant = pool.open(1)
+    store = SessionStore(max_sessions=1, on_evict=lambda entry: pool.close(entry.session_id))
+    hashes = block_hash_sequence(list(range(16)), 16)
+    store.park(hashes, object(), 16, 16, session_id=grant.session)
+    assert pool.active_sessions() == 1
+    assert store.evict_oldest()
+    assert not store.evict_oldest()
+    assert pool.active_sessions() == 0
+    assert pool.open(2).session == 2
+
+
 def test_repark_replaces_and_lru_evicts_whole_sessions():
     block = 16
     evicted = []
@@ -113,13 +171,51 @@ def test_meta_digest_rejects_a_mismatched_prefix():
     good = store.lookup(hashes, prefix_digest=lambda n: digest(prompt[:n * block]))
     assert good is not None and good[1] == 10, good
 
-    # ADVISORY: a mismatch is recorded for telemetry but does not veto the resume yet (the two
-    # sides hash different lengths in some geometries, and vetoing silently disabled reuse).
-    import kvmem_session_store as _ss
-    _ss._MISMATCHES.clear()
     bad = store.lookup(hashes, prefix_digest=lambda n: digest(list(range(9000, 9000 + 10 * block))))
-    assert bad is not None, "lookup still resolves the entry"
-    assert _ss._MISMATCHES, "the mismatch is recorded for telemetry"
+    assert bad is None, "a digest mismatch must not resume"
+
+
+def test_checkpoint_chunk_splits_before_pressure_for_beyond_pool_prompt():
+    from kvmem_session_store import (session_checkpoint_frontier,
+                                     clip_session_checkpoint_chunk)
+
+    # 196K prompt, 122K physical pool, B=36K; leave a block before B pressure.
+    target = session_checkpoint_frontier(196598, 1616, 36864)
+    assert target == 33936
+    assert clip_session_checkpoint_chunk(32768, 4096, 196598, 1616, 36864) == 1168
+    assert clip_session_checkpoint_chunk(target, 4096, 196598, 1616, 36864) == 4096
+    # Actual MTP-off geometry on this machine: 1568 tokens/block, pressure at 36064.
+    assert session_checkpoint_frontier(169998, 1568, 36864, 32) == 34496
+    assert session_checkpoint_frontier(169998, 1568, 36864, 128) == 31360
+    assert clip_session_checkpoint_chunk(28672, 4096, 169998, 1568, 36864, 128) == 2688
+    assert session_checkpoint_frontier(1, 1616, 36864) == 0
+
+
+def test_terminal_retirement_needs_normal_finish_and_all_tp_ranks():
+    from types import SimpleNamespace as NS
+    from kvmem_session_store import terminal_checkpoint_requests, verify_tp_checkpoint_records
+
+    batch = {0: NS(outputs=[NS(request_id="good", finish_reason=0),
+                            NS(request_id="failed", finish_reason=3),
+                            NS(request_id="pending", finish_reason=None)])}
+    assert terminal_checkpoint_requests(batch, (0, 1)) == ["good"]
+    record = {"request": "good", "hashes": ["ab", "cd"], "covered": 32,
+              "kv_block_size": 16, "page_tokens": 16, "pages_per_block": 1,
+              "capacity_pages": 2, "has_state": True, "session_id": ["tenant", "chat"],
+              "prefix_digest": "a" * 64, "expected_ranks": 2}
+    left, right = {**record, "rank": 0}, {**record, "rank": 1}
+    assert verify_tp_checkpoint_records([left, right], 2, "good") == left
+    for bad in ([left], [left, {**right, "covered": 48}],
+                [left, {**right, "rank": 0}],
+                [left, {**right, "prefix_digest": "b" * 64}],
+                [left, {**right, "capacity_pages": 0}],
+                [{**left, "capacity_pages": 1}, {**right, "capacity_pages": 1}]):
+        try:
+            verify_tp_checkpoint_records(bad, 2, "good")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("incomplete or mismatched TP checkpoint was accepted")
 
 
 def test_native_hash_fn_is_sha256_by_default():
@@ -131,6 +227,11 @@ if __name__ == "__main__":
     test_prefix_hashes_are_stable_and_extendable()
     test_partial_tail_is_not_hashed()
     test_lookup_returns_longest_prefix_only()
+    test_identical_prefixes_are_isolated_by_native_session_id()
+    test_native_session_id_survives_scheduler_worker_boundary()
+    test_checkpoint_chunk_splits_before_pressure_for_beyond_pool_prompt()
+    test_terminal_retirement_needs_normal_finish_and_all_tp_ranks()
+    test_idle_checkpoint_eviction_releases_its_host_share()
     test_repark_replaces_and_lru_evicts_whole_sessions()
     test_meta_digest_rejects_a_mismatched_prefix()
     test_native_hash_fn_is_sha256_by_default()

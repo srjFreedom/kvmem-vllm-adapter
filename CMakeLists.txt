@@ -8,14 +8,12 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE RelWithDebInfo)
 endif()
 
-# The decoupled, engine-agnostic kvmem library, built from the origin/master worktree so the
-# user's feb4742 checkout (the running llama.cpp KVMem) is left untouched.
-# kvmem-v018rc1 provides the NVMe disk tier (nvme_kv_tier.hpp) the disk layer needs; the older
-# adapter-base worktree predates it. The contract headers this adapter uses are unchanged.
+# The pinned native KVMem source is prepared in this repository; callers can supply an
+# explicit KVMEM_BASE or KVMA_SRC for a separate, compatible source checkout.
 if(DEFINED ENV{KVMA_SRC} AND NOT KVMEM_BASE)
   set(KVMEM_BASE "$ENV{KVMA_SRC}" CACHE PATH "kvmem worktree root")
 else()
-  set(KVMEM_BASE "$ENV{HOME}/src/kvmem-v018rc1" CACHE PATH "kvmem worktree root")
+  set(KVMEM_BASE "${CMAKE_CURRENT_SOURCE_DIR}/engines/kvmem" CACHE PATH "kvmem worktree root")
 endif()
 # v0.19's DEFAULT Query scorer is page-softmax, whose CUDA object lives in the core's optional
 # recall target (`kvmem-recall-cuda`, source src/cuda/page_softmax.cu). Without it the core only has

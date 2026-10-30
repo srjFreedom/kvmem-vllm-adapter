@@ -291,8 +291,9 @@ INTEGRATION-SURFACE.md      touch-point list and source-change registry
   prefill-time compaction), retrieval has no score for freshly generated blocks (the runtime keeps
   the recent tail mandatory), and a step that carries speculative drafts is not compacted. A single
   long text request is validated; concurrency is not
-- `SESSIONS` splits the H pool across **live** requests; a finished request releases its share, which
-  is not the reference backends' "retain N inactive histories"
+- `SESSIONS` splits H into shares and must cover `N` active requests. Normally a finished request
+  releases its share; opt-in, unqualified session checkpoints retain one share until evicted, and a
+  new cold request evicts an idle checkpoint before acquiring another. Reuse remains off by default
 - No tiered disk / session cold store (`nvme-gb`, `session-cache-dir`) and no NVMe page tier
 - UI features that rely on llama.cpp/ninfer server extensions (`/v1/chat/completions/control`,
   `/v1/stream`, `/slots`) return 404 here

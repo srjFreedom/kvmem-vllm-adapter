@@ -59,7 +59,11 @@ API `usage.prompt_tokens=196598`、HTTP 200、回答 **`ZX-4417-QJ7`**（耗时 
 | 压缩可读性 | `B=36864` + `KVMEM_RESIDENT_PREFILL_COMPACT=1`，47K prompt | 1 次压缩 → `ZXZXZX-4417-QJ7` |
 | 超池通道（旧基线） | `GPU_UTIL=0.65`（池 122,816）+ `KVMEM_SKIP_KV_CHECK=1` + `KVMEM_MAX_MODEL_LEN=200000` + `KVMEM_ENTRY_RESIDENT_PREFILL=1` | 152,820 → HTTP 200，答案错误 |
 | 超池整体重算（实验） | 同上 + `KVMEM_COMPACT_REBUILD=1` + `KVMEM_PROMPT_END_RESELECT=1` + `KVMEM_RESIDENT_PREFILL_COMPACT=1`、TP2/MTP4、同步 V2 | 196,598 / 池 122,816 → 27 次压缩、最终重算 33,654 token、HTTP 200 → `ZX-4417-QJ7` |
-| 会话复用 | `KVMEM_SESSION_REUSE=1`（catalog 接管状态镜像） | 两轮 200，`session_reuse_on` 正常 |
+| 会话复用（待验） | 默认关闭；显式 opt-in 仅支持 MTP=0、块对齐的完整驻留前缀以及双 TP 退休确认 | 尚无超池 cold/restore token-ID 相等验收；早期两轮 HTTP 200 不证明恢复正确 |
+
+FP8/TP2、MTP=0 的 169,998-token 实验（物理池 161,832）仍未通过冷跑。首次把压力阈值改到物理池附近后，压缩在 145,088 和 149,184 连续发生并以 CUDA illegal access 退出；加入 R=16,384 的最小间隔后，压缩改在 145,088 与 161,472 发生，第二次压缩后的 forward 仍发生 CUDA illegal access。进一步核对发现两次 worker 前沿均比 EngineCore 当时的逻辑前沿落后 8,192 token。新增的双 TP quiescent/frontier/物理块校验仅是只读契约，**尚未接入调度边界或 GPU 搬页**，不能当作修复。此前缀 checkpoint 因 runtime 页映射缺口未能封存；原生 dense block-table 回查及 StateImage 绑定的修复只经离线测试。没有 warm token-ID 对照，不得宣称复用可用。
+
+压缩视图现在在安装 `seq_lens`/positions 之前检查 `resident seq_len + 本步 query ≤ 已发布页容量`，不足即抛 `SparseViewCapacityError` 并由 worker hook 向上传递（不再静默钳制后继续 forward）；会话恢复同时保留引擎本步已同步的调度页，避免误拒合法恢复。`sparse_runtime_test` 与 `sparse_concurrency_test` 的 needle 失败经“移除该保护后逐字复现”确认为**既有偏差**，与本检查无关，尚未修复。
 
 ## 三、超池的两个硬约束（实测）
 

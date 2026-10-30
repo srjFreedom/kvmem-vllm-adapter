@@ -59,6 +59,12 @@ def main():
     reply = client.compact("refused", [0], 4, physical_pages=[40])
     check(not reply["ok"] and not reply["truncated"],
           "a nonempty refusal dictionary remains a refusal")
+    try:
+        client.session_park({"request": "unfenced", "hashes": ["abc"]})
+        check(False, "unfenced worker announcements must not publish a session")
+    except RuntimeError as exc:
+        check("terminal acknowledgment" in str(exc),
+              "session metadata only publishes after EngineCore's all-TP barrier")
     server.stop()
     print("PASS block_channel_test" if not failed else "FAILED block_channel_test")
     sys.exit(0 if not failed else 1)

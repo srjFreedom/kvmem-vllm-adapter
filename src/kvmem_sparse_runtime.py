@@ -35,8 +35,25 @@ class RunnerView:
         raise NotImplementedError
 
 
+def pool_prefill_high_watermark(ceiling_tokens, page_tokens):
+    """First pressure boundary: physical KV ceiling minus one chunk and allocator slack."""
+    return max(64, max(0, int(ceiling_tokens) - 4096 - 2048)
+               // max(1, int(page_tokens)))
+
+
+def prefill_pressure_due(tokens, resident_pages, high_pages, last_reselect, reserve):
+    """R is the minimum prefill advance between pressure compactions once one has succeeded."""
+    return (int(resident_pages) > int(high_pages)
+            and (int(last_reselect) <= 0 or
+                 int(tokens) - int(last_reselect) >= int(reserve)))
+
+
 class _SkipSeqFromRow(Exception):
     """Internal: this experiment is switched off."""
+
+
+class SparseViewCapacityError(RuntimeError):
+    """The compacted block-table row cannot address the scheduled attention tokens."""
 
 
 class _ReqState:
@@ -159,6 +176,12 @@ class VllmSparseRuntime:
         self.session_store = None
         self.kv_block_size = 0
         self._prompt_ids = {}
+        self._session_ids = {}
+        self._session_checkpoints = {}  # req -> (frontier, exact tokens, StateImage, sealed statistics)
+        self._preparked_requests = set()
+        self.session_checkpoint_chunk_tokens = 0
+        self.session_checkpoint_speculative_tokens = 0
+        self.session_checkpoint_executed_frontier = None
         # req -> (hit_tokens, visible_tokens) decided by EngineCore for a resumed session.
         self._resume = {}
         # Optional hooks supplied by the plugin for the non-attention (GDN/Mamba) state, which is
@@ -349,38 +372,41 @@ class VllmSparseRuntime:
                 # compacted selection degenerated to sink+recent - dropping the question itself,
                 # which reads as repeated output.
                 if self.retrieval_enabled:
-                    try:
-                        from kvmem_retrieval_index import KvmemRetrievalIndex
-                        _kv = self.view.paged_kv()
-                        index = KvmemRetrievalIndex(self.select_block_tokens, self.page_tokens,
-                                                    self.head_dim, len(_kv))
-                        self._retrieval[req] = index
-                        orch.retrieval_index = index
-                        if orch.planner is not None:
-                            orch.planner.pre_rope_statistics = True
-                    except Exception:
-                        pass
+                    index = getattr(orch, "retrieval_index", None)
+                    if index is None:
+                        # A cached KV prefix without its sealed mean-K identity cannot answer the
+                        # next query safely. _adopt_session checks this before consuming the entry.
+                        self.log({"kind": "resume_miss", "req": req,
+                                  "reason": "sealed retrieval statistics missing"})
+                        return
+                    index.reset_query()
+                    self._retrieval[req] = index
+                    orch.retrieval_index = index
+                    if orch.planner is not None:
+                        orch.planner.pre_rope_statistics = True
+                if self.stats_core:
+                    saved_stats = getattr(orch, "statistics", None)
+                    if saved_stats is None or int(saved_stats.frontier) != int(hit_tokens):
+                        raise RuntimeError("resumed request lost exact-prefix mean-K statistics")
+                    self._statistics[req] = saved_stats
+                    self._stats_next[req] = int(hit_tokens)
+                    self._stats_written[req] = 0
                 try:
                     self.attach_statistics(req)
                 except Exception:
                     pass
                 return
             kv_tensors = self.view.paged_kv()
-            session = max(1, len(self._orch) + 1)
+            session = None
             store = None
             # KVMem's host tier owns the spilled payload and enforces H. Falls back to the plain
             # host store when the native extension is unavailable.
             if getattr(self, "use_kvmem_host", True):
                 try:
                     from kvmem_sparse_orchestrator import KvmemHostStore
-                    # H is shared across the live sessions (KVMem contract), so each session gets
-                    # its fair share of the pool instead of the whole budget.
-                    if getattr(self, "budget_pool", None) is None:
-                        from kvmem_session_budget import SessionBudgetPool
-                        self.budget_pool = SessionBudgetPool(
-                            host_bytes=int(self.host_mib) * 1024 * 1024,
-                            sessions=max(1, int(self.sessions)))
-                    share = self.budget_pool.open(session).capacity_bytes
+                    # H is shared across live and parked sessions. Reusing len(_orch)+1 after a
+                    # park aliased an idle grant and silently handed two stores the full H budget.
+                    session, share = self._open_host_share()
                     # Disk tier (D budget): pages evicted from the H share stage out here instead of
                     # being dropped, matching what the llama/ninfer backends do with nvme_kv_tier.
                     store = KvmemHostStore(capacity_bytes=share,
@@ -400,7 +426,12 @@ class VllmSparseRuntime:
                                   - int(self.budget_tokens)})
                     except Exception:
                         pass
-                except Exception:
+                except Exception as exc:
+                    from kvmem_session_budget import BudgetError
+                    if isinstance(exc, BudgetError):
+                        raise
+                    if session is not None and getattr(self, "budget_pool", None) is not None:
+                        self.budget_pool.close(session)
                     store = None
             orch = SparseOrchestrator(
                 self.selector, kv_tensors, self.page_tokens, self.head_dim,
@@ -463,7 +494,23 @@ class VllmSparseRuntime:
         self.session_reuse = True
         # A parked session holds a slice of H until it is evicted; hand it back then.
         store._on_evict = self._release_parked
+        store._max_sessions = max(1, int(self.sessions))
         return store
+
+    def _open_host_share(self):
+        """Use a fresh H identity; evict idle checkpoints before spending another share."""
+        from kvmem_session_budget import BudgetError, SessionBudgetPool
+
+        if self.budget_pool is None:
+            self.budget_pool = SessionBudgetPool(
+                host_bytes=int(self.host_mib) * 1024 * 1024,
+                sessions=max(1, int(self.sessions)))
+        while self.budget_pool.active_sessions() >= self.budget_pool.sessions:
+            if self.session_store is None or not self.session_store.evict_oldest():
+                raise BudgetError("no idle H share: all configured sessions are active")
+        session = int(getattr(self, "_next_host_session_id", 0)) + 1
+        self._next_host_session_id = session
+        return session, self.budget_pool.open(session).capacity_bytes
 
     def _release_parked(self, entry):
         pool = getattr(self, "budget_pool", None)
@@ -481,6 +528,115 @@ class VllmSparseRuntime:
         except Exception:
             pass
 
+    def note_session_id(self, req, session_id, cache_salt=None):
+        """Carry vLLM's native (cache_salt, session_id) namespace into the worker store."""
+        if (isinstance(session_id, str) and session_id and len(session_id) <= 1024
+                and (cache_salt is None or isinstance(cache_salt, str))
+                and len(cache_salt or "") <= 1024):
+            self._session_ids[req] = (cache_salt or "", session_id)
+
+    def _seal_session_checkpoint_kv(self, req, frontier):
+        """Fill missing pre-pressure H pages from this request's own completed GPU row."""
+        orch = self._orch.get(req)
+        if orch is None:
+            return False
+        self._absorb_engine_row(req)
+        mapping = self._page_map.get(req, {})
+        pages = int(frontier) // self.page_tokens
+        st = self._state.get(req)
+        if st is None or st.compacted_in_prefill or st.row:
+            return False
+        try:
+            row = self.view.block_table_rows()[0][st.row_index]
+            for page in range(pages):
+                if orch.store.has(page) or getattr(orch.store, "has_disk", lambda p: False)(page):
+                    continue
+                slot = mapping.get(page)
+                if slot is None:
+                    # The row is still the original dense prefix: the engine owns these pages,
+                    # even when the lagged `_absorb_upto` map has not recorded every column.
+                    # Never use this fallback after a compaction changed logical page positions.
+                    if page >= len(row):
+                        return False
+                    slot = int(row[page].item())
+                if int(slot) <= 0:
+                    return False
+                orch.commit_written_page(page, int(slot), baked=0)
+            return all(orch.store.has(page) or
+                       getattr(orch.store, "has_disk", lambda p: False)(page)
+                       for page in range(pages))
+        except Exception as exc:
+            self.log({"kind": "session_checkpoint_seal_error", "req": req,
+                      "error": f"{type(exc).__name__}: {exc}"})
+            return False
+
+    def _maybe_capture_session_checkpoint(self, req, st):
+        """Capture a completed, pre-pressure prompt prefix before the next forward."""
+        if (not self.session_reuse or req in self._session_checkpoints
+                or self.capture_state is None or not self.kv_block_size
+                or int(self.session_checkpoint_speculative_tokens) > 0
+                or self.session_checkpoint_executed_frontier is None):
+            return False
+        owner = self._session_ids.get(req)
+        ids = self._prompt_ids.get(req)
+        prompt = int(self._prompt_len.get(req, 0) or 0)
+        from kvmem_session_store import session_checkpoint_frontier
+        target = session_checkpoint_frontier(prompt, self.kv_block_size,
+                                             self.budget_tokens, self.select_block_tokens)
+        if not owner or not ids or len(ids) < prompt or getattr(st, "compacted_in_prefill", False):
+            return False
+        try:
+            frontier = int(self.session_checkpoint_executed_frontier(req))
+        except Exception:
+            return False
+        if frontier != target:
+            return False
+        if int(getattr(st, "tokens", 0) or 0) > frontier:
+            self.log({"kind": "session_checkpoint_skipped", "req": req,
+                      "reason": "runtime ahead of GPU frontier", "frontier": frontier,
+                      "runtime_tokens": int(st.tokens)})
+            return False
+        if not self._seal_session_checkpoint_kv(req, frontier):
+            self.log({"kind": "session_checkpoint_skipped", "req": req,
+                      "reason": "prefix KV could not be sealed", "frontier": frontier})
+            return False
+        try:
+            state = self.capture_state(req, frontier) if self.has_recurrent else None
+        except Exception:
+            state = None
+        if self.has_recurrent and state is None:
+            self.log({"kind": "session_checkpoint_skipped", "req": req,
+                      "reason": "recurrent StateImage unavailable", "frontier": frontier})
+            return False
+        exact_tokens = tuple(int(t) for t in ids[:frontier])
+        index = self._retrieval.get(req)
+        try:
+            index_checkpoint = index.checkpoint_prefix(frontier) if index is not None else None
+        except Exception as exc:
+            self.log({"kind": "session_checkpoint_skipped", "req": req,
+                      "reason": f"retrieval checkpoint failed: {type(exc).__name__}"})
+            return False
+        if self.retrieval_enabled and (index_checkpoint is None or
+                index_checkpoint.covered_blocks() !=
+                list(range(frontier // index_checkpoint.block_tokens))):
+            return False
+        stats = self._statistics.get(req) if self.stats_core else None
+        if self.stats_core and (stats is None or stats.frontier != frontier):
+            self.log({"kind": "session_checkpoint_skipped", "req": req,
+                      "reason": "core statistics frontier incomplete", "frontier": frontier,
+                      "stats_frontier": getattr(stats, "frontier", -1)})
+            return False
+        try:
+            mean_tail = stats.mean_checkpoint(frontier) if stats is not None else None
+        except Exception:
+            return False
+        self._session_checkpoints[req] = (
+            frontier, exact_tokens, state, index_checkpoint, mean_tail)
+        self.log({"kind": "session_checkpoint_captured", "req": req,
+                  "frontier": frontier, "suffix": prompt - frontier,
+                  "state": state is not None})
+        return True
+
     def note_resume(self, req, hit_tokens, visible_tokens):
         """EngineCore decided `req` continues a parked session after `hit_tokens` tokens."""
         try:
@@ -488,76 +644,148 @@ class VllmSparseRuntime:
         except Exception:
             pass
 
-    def _session_hashes(self, req):
-        ids = self._prompt_ids.get(req)
+    def _session_hashes(self, req, ids=None):
+        ids = self._prompt_ids.get(req) if ids is None else ids
         if not ids or not self.kv_block_size:
             return []
         from kvmem_session_store import block_hash_sequence
         return block_hash_sequence(ids, self.kv_block_size)
 
     def _park_session(self, req):
-        """Keep a finished request's session (KV pages + recurrent state) instead of dropping it."""
+        """Prepare a sealed prefix for EngineCore's all-TP terminal publication barrier."""
         if not self.session_reuse or self.session_store is None:
+            return False
+        owner_session_id = self._session_ids.get(req)
+        if not owner_session_id:
+            self.log({"kind": "session_park_skipped", "req": req,
+                      "reason": "native session_id missing"})
+            return False
+        checkpoint = self._session_checkpoints.pop(req, None)
+        if checkpoint is None:
+            self.log({"kind": "session_park_skipped", "req": req,
+                      "reason": "no sealed executed-frontier checkpoint"})
+            return False
+        covered, ids, state, index_checkpoint, mean_tail = checkpoint
+        if (covered <= 0 or covered % max(1, self.kv_block_size)
+                or len(ids) != covered or (self.has_recurrent and state is None)):
+            self.log({"kind": "session_park_skipped", "req": req,
+                      "reason": "invalid checkpoint frontier", "frontier": int(covered),
+                      "state": state is not None})
             return False
         orch = self._orch.get(req)
         if orch is None:
             return False
-        hashes = self._session_hashes(req)
-        pages = orch.usable_pages()
-        if not hashes or not pages:
+        hashes = self._session_hashes(req, ids)
+        pages = orch.usable_pages(covered)
+        if self.retrieval_enabled and index_checkpoint is None:
             self.log({"kind": "session_park_skipped", "req": req,
-                      "reason": "no hashes" if not hashes else "no pages",
+                      "reason": "sealed retrieval statistics checkpoint unavailable"})
+            return False
+        stats = self._statistics.get(req) if self.stats_core else None
+        if self.stats_core and (stats is None or stats.frontier < covered):
+            self.log({"kind": "session_park_skipped", "req": req,
+                      "reason": "core statistics checkpoint unavailable"})
+            return False
+        expected_pages = covered // max(1, self.page_tokens)
+        if not hashes or len(pages) < expected_pages:
+            self.log({"kind": "session_park_skipped", "req": req,
+                      "reason": "checkpoint KV coverage incomplete",
                       "blocks": len(hashes), "pages": len(pages),
-                      "prompt_ids": len(self._prompt_ids.get(req, ()) or ()),
-                      "kv_block_size": int(self.kv_block_size)})
+                      "expected_pages": expected_pages, "checkpoint_tokens": int(covered)})
             return False
-        state = None
-        if self.capture_state is not None:
-            try:
-                state = self.capture_state(req)
-            except Exception:
-                state = None
-        if self.has_recurrent and state is None:
-            # Refuse to park: resuming without the recurrent state is worse than a full prefill.
-            self.log({"kind": "session_park_skipped", "req": req,
-                      "reason": "recurrent state unavailable"})
-            return False
-        covered = min(int(getattr(orch, "total_tokens", 0) or 0),
-                      len(self._prompt_ids.get(req, ()) or ()) or int(orch.total_tokens))
-        self.session_store.park(hashes, orch, covered, self.page_tokens,
-                                mamba_state=state, session_id=getattr(orch, "session_id", None))
-        # Tell EngineCore how much of this session may be brought back: the resident book it will
-        # allocate is |sel| pages, so the number must be block-aligned and never exceed what the
-        # store can actually fill.
         ppb = max(1, int(self.pages_per_block))
         budget = int(self.selector.budget_pages())
-        # Whole-block rounding is REQUIRED: the engine allocates the resident book in whole KV
-        # blocks (1616 tokens = pages_per_block pages of 16), and a book that ends mid-block made
-        # the resumed turn answer with empty/garbage output (measured: 316 pages -> empty answer,
-        # 303 pages -> correct answer). The cost is up to one block (<= pages_per_block tokens) of
-        # the parked context not being brought back; allowing partial blocks needs the fork's row
-        # mapping to be re-checked first.
         capacity = (min(len(pages), budget) // ppb) * ppb
+        if capacity <= 0 or capacity * self.page_tokens != covered:
+            # A compressed checkpoint would seed V2 Mamba's running slot from resident length
+            # while its StateImage belongs to the larger logical frontier. Only restore the full
+            # early prefix until that model-state slot contract has been separately qualified.
+            self.log({"kind": "session_park_skipped", "req": req,
+                      "reason": "checkpoint requires full resident prefix",
+                      "frontier": covered, "visible": capacity * self.page_tokens})
+            return False
         import hashlib as _hl
-        _ids = list(self._prompt_ids.get(req, ()) or ())
-        # Digest length must be canonical: the engine re-hashes `blocks * block_size` tokens, so
-        # hashing `covered` here made every resume look like a prefix mismatch.
-        _aligned = min(len(_ids), len(hashes) * max(1, int(self.kv_block_size)))
-        _digest = _hl.sha256(b"".join(int(t).to_bytes(4, "little", signed=False)
-                                      for t in _ids[:_aligned])).hexdigest()
+        _digest = _hl.sha256(b"".join(
+            int(t).to_bytes(4, "little", signed=False) for t in ids)).hexdigest()
         payload = {"hashes": [h.hex() for h in hashes], "covered": int(covered),
-                   "prefix_digest": _digest,
+                   "prefix_digest": _digest, "kv_block_size": int(self.kv_block_size),
                    "page_tokens": int(self.page_tokens), "pages_per_block": ppb,
                    "capacity_pages": int(capacity), "has_state": state is not None,
-                   "request": str(req)}
-        if self.session_park is not None and capacity > 0:
+                   "session_id": owner_session_id, "request": str(req),
+                   "rank": int(getattr(self, "tp_rank", 0)),
+                   "expected_ranks": int(getattr(self, "tp_size", 1))}
+        if index_checkpoint is not None:
+            orch.retrieval_index = index_checkpoint
+        if stats is not None:
             try:
-                self.session_park(payload)
-            except Exception:
-                self.log({"kind": "session_park_publish_failed", "req": req})
-        self.log({"kind": "session_parked", "req": req, "blocks": len(hashes),
+                stats.truncate_to(covered)
+                stats.restore_mean_checkpoint(covered, mean_tail)
+                if stats.frontier != covered or any(
+                        not stats.has_block(b) for b in range(covered // stats.block_tokens)):
+                    raise ValueError("checkpoint statistics coverage is incomplete")
+                orch.statistics = stats
+            except Exception as exc:
+                self.log({"kind": "session_park_prepare_failed", "req": req,
+                          "reason": f"statistics restore: {type(exc).__name__}"})
+                return None
+        try:
+            self.session_store.park(
+                hashes, orch, covered, self.page_tokens, mamba_state=state,
+                session_id=getattr(orch, "session_id", None),
+                owner_session_id=owner_session_id, prefix_digest=_digest,
+                source_request=str(req), capacity_pages=capacity)
+        except Exception as exc:
+            self.log({"kind": "session_park_prepare_failed", "req": req,
+                      "error": f"{type(exc).__name__}: {exc}"})
+            return None
+        self._preparked_requests.add(req)
+        self.log({"kind": "session_park_prepared", "req": req, "blocks": len(hashes),
                   "covered": covered, "pages": len(pages), "capacity": capacity,
-                  "state": state is not None})
+                  "state": state is not None, "rank": int(getattr(self, "tp_rank", 0))})
+        return payload
+
+    def prepare_session_checkpoint(self, req):
+        """Called by EngineCore only after this request has emitted a terminal output."""
+        try:
+            pending = int(self._prev_n.get(req, 0) or 0)
+            if pending:
+                self.after_step(req, pending, prefill=pending >= self.page_tokens)
+                self._prev_n[req] = 0
+            return self._park_session(req)
+        except Exception as exc:
+            self.log({"kind": "session_park_prepare_error", "req": req,
+                      "error": f"{type(exc).__name__}: {exc}"})
+            return None
+
+    def abort_session_checkpoint(self, req):
+        if self.session_store is not None:
+            self.session_store.discard_requests((str(req),))
+        self._preparked_requests.discard(req)
+        checkpoint = self._session_checkpoints.pop(req, None)
+        return checkpoint is not None
+
+    def check_session_checkpoint(self, owner, hashes, frontier, digest, capacity_pages):
+        """Prove this TP rank still owns the exact StateImage/KV before scheduler admission."""
+        if not self.session_reuse or self.session_store is None or not owner:
+            return False
+        found = self.session_store.lookup(tuple(hashes), owner_session_id=tuple(owner))
+        if found is None:
+            return False
+        entry, blocks = found
+        if (blocks != len(hashes) or int(entry.covered_tokens) != int(frontier)
+                or int(capacity_pages) * self.page_tokens != int(frontier)
+                or entry.prefix_digest != digest
+                or int(entry.capacity_pages) != int(capacity_pages)
+                or (self.has_recurrent and entry.mamba_state is None)):
+            return False
+        orch = entry.orchestrator
+        if (len(orch.usable_pages(frontier)) < frontier // self.page_tokens
+                or (self.retrieval_enabled and getattr(orch, "retrieval_index", None) is None)):
+            return False
+        if self.stats_core:
+            stats = getattr(orch, "statistics", None)
+            if stats is None or int(stats.frontier) != int(frontier):
+                return False
         return True
 
     def _resume_selection(self, orch, count, total_tokens):
@@ -598,13 +826,21 @@ class VllmSparseRuntime:
         the compacted rank each page occupies -- one rotation hop from the stored bytes.
         """
         entry, hit_tokens, visible_tokens = st.resume
-        st.resume = None
+        if int(visible_tokens) != int(hit_tokens):
+            raise RuntimeError("compressed session checkpoint lacks a valid Mamba state cursor")
         orch = self._orch.get(req)
         if orch is None:
             return False
         count = int(visible_tokens) // self.page_tokens
         pages = self._resume_selection(orch, count, int(hit_tokens))
         self._absorb_engine_row(req)
+        # `st.row` may already mirror the engine's appended pages for THIS step (the plugin
+        # syncs the block-table row before prepare_inputs). Those entries beyond the restored
+        # prefix are the scheduled chunk's own pages and must survive the resume; dropping them
+        # left the view one page short of the attention length the scheduler had just admitted.
+        # Only the synced prefix is trusted: block-table entries past the engine's write cursor
+        # can be stale ids from an earlier request, so they are never adopted here.
+        synced = tuple(int(v) for v in (getattr(st, "row", ()) or ()))
         try:
             values = [int(v) for v in self.view.block_table_rows()[0][row_index].tolist()]
         except Exception:
@@ -615,7 +851,7 @@ class VllmSparseRuntime:
         # book by one page (16 tokens) against the engine's, and the resumed turn answered with
         # garbage.
         row_values = values[:len(pages)]
-        if not pages or len(row_values) < len(pages) or any(v <= 0 for v in row_values):
+        if len(pages) != count or len(row_values) != count or any(v <= 0 for v in row_values):
             self.log({"kind": "resume_no_room", "req": req, "pages": len(pages),
                       "row": len(row_values), "visible": int(visible_tokens)})
             return False
@@ -625,12 +861,21 @@ class VllmSparseRuntime:
             except Exception:
                 self.log({"kind": "resume_restore_failed", "req": req, "page": int(page)})
                 return False
-        st.row = tuple(row_values[:len(pages)])
+        restored = tuple(row_values[:len(pages)])
+        # Preserve the engine's already-synced tail (this step's chunk pages). A resumed
+        # request schedules the rest of its prompt in the same admission, so the row must cover
+        # `resident prefix + scheduled tokens` before attention is built.
+        st.row = restored + (synced[len(restored):] if len(synced) > len(restored) else ())
         if self.set_block_cursor is not None:
             try:
                 self.set_block_cursor(req, len(st.row))
             except Exception:
                 pass
+        if self.has_recurrent:
+            if (self.restore_state is None or entry.mamba_state is None
+                    or not self.restore_state(req, entry.mamba_state)):
+                raise RuntimeError("resumed GDN StateImage could not be fully restored")
+        st.resume = None
         st.seq_len = len(pages) * self.page_tokens
         st.tokens = int(hit_tokens)
         st.prefill_done = False
@@ -640,11 +885,6 @@ class VllmSparseRuntime:
         orch._tokens_at_reselect = st.seq_len
         orch.prompt_tokens = len(self._prompt_ids.get(req, ()) or ())
         orch.note_tokens(st.tokens)
-        if self.restore_state is not None:
-            try:
-                self.restore_state(req, entry.mamba_state)
-            except Exception:
-                self.log({"kind": "resume_state_failed", "req": req})
         self.log({"kind": "session_resumed", "req": req, "hit": int(hit_tokens),
                   "resident": st.seq_len, "pages": len(pages),
                   "state": entry.mamba_state is not None})
@@ -659,14 +899,36 @@ class VllmSparseRuntime:
         hashes = self._session_hashes(req)
         if not hashes:
             return None
-        found = self.session_store.lookup(hashes)
+        owner_session_id = self._session_ids.get(req)
+        if not owner_session_id:
+            self.log({"kind": "resume_skip", "req": req, "reason": "native session_id missing"})
+            return None
+        ids = tuple(self._prompt_ids.get(req, ()) or ())
+
+        def _digest(frontier):
+            import hashlib
+            return hashlib.sha256(b"".join(
+                int(t).to_bytes(4, "little", signed=False)
+                for t in ids[:int(frontier)])).hexdigest()
+
+        found = self.session_store.lookup(
+            hashes, owner_session_id=owner_session_id, prefix_digest=_digest)
         if found is None:
             self.log({"kind": "resume_miss", "req": req, "hit": hit_tokens})
             return None
         entry, _blocks = found
-        if int(entry.covered_tokens) < int(hit_tokens):
-            self.log({"kind": "resume_short", "req": req, "covered": entry.covered_tokens,
-                      "hit": hit_tokens})
+        if int(entry.covered_tokens) != int(hit_tokens):
+            self.log({"kind": "resume_frontier_mismatch", "req": req,
+                      "covered": entry.covered_tokens, "hit": hit_tokens})
+            return None
+        if self.retrieval_enabled and getattr(entry.orchestrator, "retrieval_index", None) is None:
+            self.log({"kind": "resume_miss", "req": req,
+                      "reason": "sealed retrieval statistics missing"})
+            return None
+        if self.stats_core and (getattr(entry.orchestrator, "statistics", None) is None
+                or int(entry.orchestrator.statistics.frontier) != int(hit_tokens)):
+            self.log({"kind": "resume_miss", "req": req,
+                      "reason": "sealed core statistics missing"})
             return None
         self.session_store.take(entry)
         return entry, int(hit_tokens), int(visible_tokens)
@@ -924,12 +1186,7 @@ class VllmSparseRuntime:
         return list(self._orch.keys())
 
     def release(self, req):
-        """Drop a finished request and give its H share back to the shared pool.
-
-        With session reuse on, the request's session is PARKED instead (KV pages + recurrent-state
-        snapshot, keyed by the prompt's block hashes) and its H share is kept until the park is
-        evicted, so a later turn can resume it instead of prefilling the whole conversation again.
-        """
+        """Retire a request; only a terminal-output handshake may authorize a session park."""
         st = self._state.get(req)
         row = getattr(st, "row_index", None) if st is not None else None
         # One unconditional record per request: whether the kvmem statistics store actually
@@ -941,12 +1198,10 @@ class VllmSparseRuntime:
                           **self.statistics_stats(req)})
             except Exception:
                 pass
-        parked = False
-        if self.session_reuse and st is not None and not self.is_rebuilt(req):
-            try:
-                parked = self._park_session(req)
-            except Exception:
-                parked = False
+        # Only an already acknowledged EngineCore terminal checkpoint retains this H share.
+        # The next prepare_inputs() sweep must never create a park after admission has happened.
+        parked = req in self._preparked_requests
+        self._preparked_requests.discard(req)
         orch = self._orch.pop(req, None)
         self._retrieval.pop(req, None)
         self._state.pop(req, None)
@@ -974,6 +1229,12 @@ class VllmSparseRuntime:
         self._inflight.pop(req, None)
         self._prev_n.pop(req, None)
         self._prompt_ids.pop(req, None)
+        self._session_ids.pop(req, None)
+        self._session_checkpoints.pop(req, None)
+        self._statistics.pop(req, None)
+        self._stats_next.pop(req, None)
+        self._stats_written.pop(req, None)
+        self._stats_skipped.pop(req, None)
         self._resume.pop(req, None)
         getattr(self, "_rebuilt_req", set()).discard(req)
         if (orch is not None and not parked
@@ -1018,13 +1279,20 @@ class VllmSparseRuntime:
             # First step of a request that continues a parked session: fill the engine's freshly
             # allocated resident pages from the store and adopt the parked token book. This must run
             # BEFORE the `not st.row` early-return below (a resumed request has no row yet).
-            self._complete_resume(req, st, int(row_index))
+            if not self._complete_resume(req, st, int(row_index)):
+                raise RuntimeError("KVMem session checkpoint restore could not complete")
         if not st.row:
             return None
         row_index = req if row_index is None else int(row_index)
         if position_slots is None:
             position_slots = [req * n_query_tokens + j for j in range(n_query_tokens)]
         st.row_index = row_index
+        step_end = int(st.seq_len) + len(position_slots)
+        capacity = len(st.row) * int(self.page_tokens)
+        if st.seq_len < 0 or step_end > capacity:
+            raise SparseViewCapacityError(
+                f"request {req}: sparse attention needs {step_end} tokens "
+                f"but {len(st.row)} published pages cover only {capacity}")
         if rows_only:
             # Pre-gather phase: only the block table row must be in place (the kernel's gathered
             # copy is taken from it). seq_lens/positions MUST be written after the engine's own
@@ -1037,14 +1305,14 @@ class VllmSparseRuntime:
                     table[row_index, :len(st.row)] = torch.tensor(
                         st.row, dtype=table.dtype, device=table.device)
             return st
-        self._seq_override[row_index] = st.seq_len + len(position_slots)
+        self._seq_override[row_index] = step_end
         if not self.install:
             return st
         # seq_lens must COVER the tokens of this step: vLLM expects the number of computed
         # tokens INCLUDING the current query. Installing the previous end (what we did before)
         # made every chunk's queries blind to their own chunk — the KV was written but never
         # attended, which silently produced gibberish instead of an error.
-        self._install(row_index, st.row, st.seq_len + len(position_slots), list(position_slots))
+        self._install(row_index, st.row, step_end, list(position_slots))
         if self.install_row:
             self._absorb_upto[req] = max(int(self._absorb_upto.get(req, 0)), len(st.row))
         return st
@@ -1314,6 +1582,16 @@ class VllmSparseRuntime:
                     import traceback as _tb
                     self.log({"kind": "after_step_error", "req": req, "n": prev,
                               "error": _tb.format_exc()})
+            # This call boundary is after the previous model forward and its KV commit, but before
+            # the current chunk starts. A prompt checkpoint saved here names an actually executed
+            # frontier; session hits never combine release-time state with a shorter prompt hash.
+            try:
+                self._maybe_capture_session_checkpoint(req, self.state(req))
+            except Exception:
+                if self.log is not None:
+                    import traceback as _tb
+                    self.log({"kind": "session_checkpoint_capture_error", "req": req,
+                              "error": _tb.format_exc()[-400:]})
         self._prev_n[req] = n_new
         st.tokens = max(st.tokens, getattr(st, "tokens", 0))
         orch.note_tokens(st.tokens)
@@ -1590,8 +1868,8 @@ class VllmSparseRuntime:
             # assignment left the trigger above the ceiling and the prefill stopped with the pool dry
             # (measured: row 5,656 pages = 90,496 tokens, free_blocks=9, 0 compactions).
             if int(getattr(self, "pool_ceiling_tokens", 0) or 0) > 0:
-                high = min(high, max(64, (int(self.pool_ceiling_tokens) - 4096 - 2048)
-                                     // max(1, self.page_tokens)))
+                high = min(high, pool_prefill_high_watermark(
+                    self.pool_ceiling_tokens, self.page_tokens))
             finishing = False  # query reselect happens on the first decode step (see below)
             if (finishing and st.row and not st.query_reselected
                     and getattr(orch, "retrieval_index", None) is not None):
@@ -1604,7 +1882,9 @@ class VllmSparseRuntime:
                 self.log({"kind": "query_reselect", "req": req, "tokens": int(st.tokens),
                           "prompt": prompt_len, "n_new": int(n_new_tokens or 0)})
                 self._reselect(req, probe=True)
-            elif max(len(orch.resident), len(st.row)) > high:
+            elif prefill_pressure_due(
+                    st.tokens, max(len(orch.resident), len(st.row)), high,
+                    getattr(orch, "_tokens_at_reselect", 0), self.gen_reserve):
                 # The ROW is the true residency: pages the engine appended since the last
                 # compaction are in the row immediately (the cursor sync copies them), while
                 # `orch.resident` only knows the set the last compaction installed. Comparing

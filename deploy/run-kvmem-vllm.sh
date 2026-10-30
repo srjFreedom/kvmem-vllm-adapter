@@ -117,6 +117,9 @@ RUN=(env MAX_NUM_SEQS="$N" \
     --no-kvmem-lrfu \
     --kvmem-score-aggregation mean --kvmem-retrieval)
 if [ "$INREQUEST_COMPACTION" = "1" ]; then RUN+=(--kvmem-inrequest-compaction); fi
+if [ -n "${SPECULATIVE_TOKENS:-}" ]; then
+  RUN+=(--speculative-tokens "$SPECULATIVE_TOKENS")
+fi
 
 if [ "${FOREGROUND:-0}" = "1" ]; then
   echo "foreground mode (systemd); log: $LOG"

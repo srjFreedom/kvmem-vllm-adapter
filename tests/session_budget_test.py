@@ -46,6 +46,19 @@ def main():
     pool2.close(1)
     check(pool2.assigned_bytes() < before, "closing a session frees its share")
 
+    # A retained session keeps its H share; a different ID cannot alias or over-assign it.
+    one = SessionBudgetPool(host_bytes=1024 * MiB, sessions=1)
+    held = one.open(1)
+    check(one.open(1) is held, "the same host session ID refers to one grant")
+    try:
+        one.open(2)
+        check(False, "a new H share must not be handed out beyond SESSIONS")
+    except BudgetError:
+        check(True, "an occupied H share cannot be assigned twice")
+    one.close(1)
+    check(one.open(2).capacity_bytes == 1024 * MiB,
+          "an evicted/closed H share becomes available to a fresh ID")
+
     # The pool never exceeds H.
     pool3 = SessionBudgetPool(host_bytes=1024 * MiB, sessions=4)
     for s in range(4):

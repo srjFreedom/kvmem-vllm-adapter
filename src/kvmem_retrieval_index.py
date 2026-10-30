@@ -184,6 +184,25 @@ class KvmemRetrievalIndex:
         self.last_diag = _diag
         return out
 
+    def checkpoint_prefix(self, frontier_tokens):
+        """Copy sealed key statistics through an exact token frontier, without its old query."""
+        frontier_tokens = int(frontier_tokens)
+        if frontier_tokens <= 0 or frontier_tokens % self.block_tokens:
+            raise ValueError("retrieval checkpoint frontier must align to selection blocks")
+        out = KvmemRetrievalIndex(self.block_tokens, self.page_tokens, self.head_dim,
+                                  self.layers, dtype=self.dtype)
+        out.device = getattr(self, "device", None)
+        max_block = frontier_tokens // self.block_tokens
+        out._sums = {b: v.clone() for b, v in self._sums.items() if 0 <= b < max_block}
+        out._counts = {b: v.clone() for b, v in self._counts.items() if 0 <= b < max_block}
+        return out
+
+    def reset_query(self):
+        """A resumed turn retains prefix keys but starts a fresh query accumulator."""
+        self._query = None
+        if hasattr(self, "_query_counts"):
+            del self._query_counts
+
     def covered_blocks(self):
         return sorted(self._sums)
 

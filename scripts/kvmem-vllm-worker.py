@@ -43,7 +43,7 @@ def parse(argv=None):
     ap.add_argument("--kvmem-sink-tokens", type=int, default=DEFAULTS["sink"])
     ap.add_argument("--kvmem-recent-tokens", type=int, default=DEFAULTS["recent"])
     ap.add_argument("--kvmem-sessions", type=int, default=DEFAULTS["sessions"],
-                    help="retained inactive histories (active requests are not counted)")
+                    help="total active and retained H-tier shares; must cover max-num-seqs")
     ap.add_argument("--kvmem-host-mib", type=int, default=DEFAULTS["host_mib"],
                     help="per-rank KV payload RAM budget")
     ap.add_argument("--kvmem-disk-mib", type=int, default=DEFAULTS["disk_mib"])
@@ -97,6 +97,8 @@ def build_config(a) -> dict:
         raise SystemExit("--kvmem-sink-tokens/--kvmem-recent-tokens must be page aligned (16)")
     if a.kvmem_budget <= 0 or a.kvmem_gen_reserve <= 0:
         raise SystemExit("--kvmem-budget and --kvmem-gen-reserve must be positive")
+    if a.kvmem_sessions < a.max_num_seqs or a.kvmem_sessions <= 0:
+        raise SystemExit("--kvmem-sessions must be >= --max-num-seqs (H-tier shares)")
     cfg = {
         "enabled": bool(a.kvmem),
         "sparse": bool(a.kvmem),

@@ -95,6 +95,10 @@ def main(argv=None) -> int:
         # from it instead of prefilling the whole conversation again. Opt-in: each parked session
         # keeps its share of the host budget until it is evicted.
         if _env_flag("KVMEM_SESSION_REUSE"):
+            if int(getattr(ns, "speculative_tokens", -1)) != 0:
+                raise SystemExit(
+                    "KVMEM_SESSION_REUSE requires explicit --speculative-tokens 0; "
+                    "MTP draft StateImage is not checkpointed yet")
             cfg['session_reuse'] = True
         # The logical ceiling must travel WITH the config: the fork's scheduler and the runtime both
         # need it to distinguish "resident KV length" from "served position" (a 199K prompt stalled
@@ -277,7 +281,7 @@ def main(argv=None) -> int:
     if _seqs > 0:
         args += ["--set", f"MAX_NUM_SEQS={_seqs}"]
         env["MAX_NUM_SEQS"] = str(_seqs)
-    _spec = int(getattr(ns, "speculative_tokens", -1) or -1)
+    _spec = int(getattr(ns, "speculative_tokens", -1))
     served = str(getattr(ns, "served_name", "") or "")
     if served:
         # Keep the id stable across backends: clients written against the llama.cpp / ninfer service
@@ -288,6 +292,9 @@ def main(argv=None) -> int:
     if _spec >= 0:
         args += ["--set", f"SPECULATIVE_TOKENS={_spec}"]
         env["SPECULATIVE_TOKENS"] = str(_spec)
+        if _spec == 0:
+            args += ["--set", "SPECULATIVE_METHOD=none"]
+            env["SPECULATIVE_METHOD"] = "none"
         print(f"[kvmem backends/vllm] SPECULATIVE_TOKENS={_spec}")
     if int(getattr(ns, "max_num_batched_tokens", 0) or 0) > 0:
         env["MAX_BATCHED_TOKENS"] = str(int(ns.max_num_batched_tokens))

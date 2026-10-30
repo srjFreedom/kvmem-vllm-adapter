@@ -1,21 +1,11 @@
-"""Cross-request session store: parked KVMem sessions, keyed by vLLM's native block hashes.
+"""Opt-in exact-frontier session candidates; not qualified for production use.
 
-0.2.2 keeps a finished request's whole context in its host tier (`KvmemHostStore`: every written
-page is committed verbatim with the rotation baked into `store_delta`), then throws that store away
-in `release()`. That is why every later turn of a conversation has to be prefilled from scratch.
-
-This module lets the store be PARKED instead: the per-request orchestrator (host store, mean-K
-retrieval index, `store_delta`, token book) plus the GDN/Mamba recurrent-state snapshot stay alive,
-keyed by the request prompt's block-hash sequence. A later request whose prompt extends a parked
-one (its block-hash sequence starts with the parked one) is a prefix HIT.
-
-The hit semantics are vLLM's own (the same chained content-addressed sha256 that the native prefix
-cache and the offloading connector use), so several conversations each hit their own prefix. The
-only difference from 411e7d59be is what happens after the hit: instead of moving the whole context
-to the GPU, the runtime retrieves only the selected working set (B+R) -- KVMem's compression.
-
-Everything here lives in the EngineCore / TP-worker process(es) that own the KV; no cross-process
-channel and no entry-middleware change is involved.
+Native (cache_salt, session_id) scopes a candidate, chained block hashes locate it, and a full
+SHA256 of the executed token prefix independently verifies its identity. Each TP worker retains
+KV/statistics and the GDN StateImage from that SAME block-aligned frontier. EngineCore publishes
+metadata only after both workers acknowledge the terminal checkpoint. A hit restores the full
+resident prefix and prefills the remaining prompt normally; compressed checkpoint restores and
+MTP checkpoints remain unsupported.
 """
 
 from __future__ import annotations
@@ -36,17 +26,23 @@ class SessionEntry:
     """
 
     __slots__ = ("block_hashes", "orchestrator", "covered_tokens", "page_tokens",
-                 "checkpoint", "session_id", "last_used", "_mamba_state")
+                 "checkpoint", "session_id", "owner_session_id", "prefix_digest",
+                 "source_request", "capacity_pages", "last_used", "_mamba_state")
 
     def __init__(self, block_hashes, orchestrator, covered_tokens, page_tokens,
-                 mamba_state=None, session_id=None, checkpoint=None):
+                 mamba_state=None, session_id=None, checkpoint=None, owner_session_id=None,
+                 prefix_digest="", source_request="", capacity_pages=0):
         self.block_hashes = tuple(block_hashes)
         self.orchestrator = orchestrator
         self.covered_tokens = int(covered_tokens)
         self.page_tokens = int(page_tokens)
         self.checkpoint = checkpoint
         self._mamba_state = None if checkpoint is not None else mamba_state
-        self.session_id = session_id
+        self.session_id = session_id  # H-budget pool session, not the API conversation ID
+        self.owner_session_id = owner_session_id
+        self.prefix_digest = str(prefix_digest or "")
+        self.source_request = str(source_request or "")
+        self.capacity_pages = int(capacity_pages)
         self.last_used = 0
 
     @property
@@ -71,8 +67,11 @@ class SessionStore:
         self._on_evict = on_evict
         self.catalog = catalog          # CheckpointCatalog that owns the state images
 
-    def _key(self, block_hashes):
-        return "session:" + ":".join(str(h) for h in tuple(block_hashes)[-2:])
+    def _key(self, block_hashes, owner_session_id=None):
+        import hashlib
+        owner = hashlib.sha256(str(owner_session_id or "").encode()).hexdigest()[:16]
+        return "session:" + owner + ":" + ":".join(
+            str(h) for h in tuple(block_hashes)[-2:])
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -81,10 +80,12 @@ class SessionStore:
         return list(self._entries.keys())
 
     def park(self, block_hashes, orchestrator, covered_tokens, page_tokens,
-             mamba_state=None, session_id=None) -> None:
-        key = tuple(block_hashes)
-        if not key:
+             mamba_state=None, session_id=None, owner_session_id=None,
+             prefix_digest="", source_request="", capacity_pages=0) -> None:
+        hashes = tuple(block_hashes)
+        if not hashes:
             return
+        key = (owner_session_id, hashes)
         old = self._entries.get(key)
         if old is not None and old.orchestrator is not orchestrator:
             # Same conversation re-parked with newer state: the new entry replaces the old one, and
@@ -92,10 +93,14 @@ class SessionStore:
             self._drop(old)
         ck = None
         if self.catalog is not None and mamba_state:
-            ck = self.catalog.put(self._key(block_hashes), "session", int(covered_tokens),
+            ck = self.catalog.put(self._key(hashes, owner_session_id), "session", int(covered_tokens),
                                   int(covered_tokens), (), mamba_state, step=int(covered_tokens))
-        self._entries[key] = SessionEntry(block_hashes, orchestrator, covered_tokens,
-                                          page_tokens, mamba_state, session_id, checkpoint=ck)
+        self._entries[key] = SessionEntry(hashes, orchestrator, covered_tokens,
+                                          page_tokens, mamba_state, session_id, checkpoint=ck,
+                                          owner_session_id=owner_session_id,
+                                          prefix_digest=prefix_digest,
+                                          source_request=source_request,
+                                          capacity_pages=capacity_pages)
         self._entries.move_to_end(key)
         while len(self._entries) > self._max_sessions:
             # Evict whole sessions only: a half session would leave a resume length that no longer
@@ -105,29 +110,56 @@ class SessionStore:
 
     def _drop(self, entry) -> None:
         if self.catalog is not None and getattr(entry, "checkpoint", None) is not None:
-            self.catalog.drop(self._key(entry.block_hashes))
+            self.catalog.drop(self._key(entry.block_hashes, entry.owner_session_id))
         if self._on_evict is not None:
             try:
                 self._on_evict(entry)
             except Exception:
                 pass
 
-    def lookup(self, block_hashes) -> tuple["SessionEntry", int] | None:
-        """Longest parked prefix of `block_hashes`, as (entry, matched_block_count)."""
+    def lookup(self, block_hashes, owner_session_id=None,
+               prefix_digest=None) -> tuple["SessionEntry", int] | None:
+        """Longest exact-content prefix within the requested native session namespace."""
         incoming = tuple(block_hashes)
         best: tuple["SessionEntry", int] | None = None
+        best_key = None
         for key, entry in self._entries.items():
-            n = len(key)
-            if n and n <= len(incoming) and incoming[:n] == key:
+            if owner_session_id is not None and entry.owner_session_id != owner_session_id:
+                continue
+            prefix = entry.block_hashes
+            n = len(prefix)
+            if n and n <= len(incoming) and incoming[:n] == prefix:
+                if (prefix_digest is not None and entry.prefix_digest
+                        and entry.prefix_digest != prefix_digest(entry.covered_tokens)):
+                    continue
                 if best is None or n > best[1]:
                     best = (entry, n)
-        if best is not None:
-            self._entries.move_to_end(best[0].block_hashes)
+                    best_key = key
+        if best_key is not None:
+            self._entries.move_to_end(best_key)
         return best
+
+    def evict_oldest(self):
+        """Release one idle checkpoint and its H share before a cold request is admitted."""
+        if not self._entries:
+            return False
+        _, entry = self._entries.popitem(last=False)
+        self._drop(entry)
+        return True
+
+    def discard_requests(self, request_ids):
+        request_ids = set(request_ids)
+        removed = 0
+        for key, entry in list(self._entries.items()):
+            if entry.source_request in request_ids:
+                self._entries.pop(key, None)
+                self._drop(entry)
+                removed += 1
+        return removed
 
     def take(self, entry) -> "SessionEntry | None":
         """Remove and return an entry (the orchestrator is adopted by a live request)."""
-        key = entry.block_hashes
+        key = (entry.owner_session_id, entry.block_hashes)
         if key in self._entries:
             self._entries.pop(key, None)
             return entry
@@ -197,20 +229,23 @@ class MetaEntry:
     """
 
     __slots__ = ("block_hashes", "covered_tokens", "page_tokens", "pages_per_block",
-                 "capacity_pages", "has_state", "prefix_digest")
+                 "capacity_pages", "has_state", "prefix_digest", "owner_session_id",
+                 "source_request")
 
     def __init__(self, block_hashes, covered_tokens, page_tokens, pages_per_block,
-                 capacity_pages, has_state, prefix_digest=""):
+                 capacity_pages, has_state, prefix_digest="", owner_session_id=None,
+                 source_request=""):
         self.block_hashes = tuple(block_hashes)
         self.covered_tokens = int(covered_tokens)
         self.page_tokens = int(page_tokens)
         self.pages_per_block = max(1, int(pages_per_block))
         self.capacity_pages = int(capacity_pages)
         self.has_state = bool(has_state)
-        # sha256 of the exact covered token prefix. A hash match alone is not proof that the same
-        # TEXT is being resumed (block hashes are truncated and chain state can be recycled), so
-        # the engine re-hashes its own prompt prefix and refuses a mismatch.
+        # SHA256 of the block-aligned prompt prefix, recomputed by EngineCore on a hit.
+        # This independently checks the worker's published token identity.
         self.prefix_digest = str(prefix_digest or "")
+        self.owner_session_id = owner_session_id
+        self.source_request = str(source_request or "")
 
 
 class MetaStore:
@@ -224,40 +259,121 @@ class MetaStore:
         return len(self._entries)
 
     def park(self, block_hashes, covered_tokens, page_tokens, pages_per_block,
-             capacity_pages, has_state, prefix_digest="") -> None:
-        key = tuple(block_hashes)
-        if not key:
+             capacity_pages, has_state, prefix_digest="", owner_session_id=None,
+             source_request="") -> None:
+        hashes = tuple(block_hashes)
+        if not hashes:
             return
-        self._entries[key] = MetaEntry(block_hashes, covered_tokens, page_tokens,
+        key = (owner_session_id, hashes)
+        self._entries[key] = MetaEntry(hashes, covered_tokens, page_tokens,
                                        pages_per_block, capacity_pages, has_state,
-                                       prefix_digest)
+                                       prefix_digest, owner_session_id, source_request)
         self._entries.move_to_end(key)
         while len(self._entries) > self._max:
             self._entries.popitem(last=False)
 
-    def lookup(self, block_hashes, prefix_digest=None) -> tuple["MetaEntry", int] | None:
+    def discard_requests(self, request_ids):
+        request_ids = set(request_ids)
+        for key, entry in list(self._entries.items()):
+            if entry.source_request in request_ids:
+                self._entries.pop(key, None)
+
+    def lookup(self, block_hashes, prefix_digest=None,
+               owner_session_id=None) -> tuple["MetaEntry", int] | None:
         incoming = tuple(block_hashes)
         best = None
+        best_key = None
         for key, entry in self._entries.items():
-            n = len(key)
-            if n and n <= len(incoming) and incoming[:n] == key:
-                if (prefix_digest is not None and entry.prefix_digest):
-                    if entry.prefix_digest != prefix_digest(n):
-                        # ADVISORY for now: the two sides hash different lengths in some
-                        # configurations (block-aligned park vs partial last block), and blocking
-                        # on that silently disabled every resume. Record and continue; the token
-                        # counter still has to fit the parked capacity.
-                        _MISMATCHES.append((key, n))
+            if owner_session_id is not None and entry.owner_session_id != owner_session_id:
+                continue
+            prefix = entry.block_hashes
+            n = len(prefix)
+            if n and n <= len(incoming) and incoming[:n] == prefix:
+                if (prefix_digest is not None and entry.prefix_digest
+                        and entry.prefix_digest != prefix_digest(n)):
+                    continue
                 if best is None or n > best[1]:
                     best = (entry, n)
-        if best is not None:
-            self._entries.move_to_end(best[0].block_hashes)
+                    best_key = key
+        if best_key is not None:
+            self._entries.move_to_end(best_key)
         return best
 
 
+def session_checkpoint_frontier(prompt_tokens, block_tokens, budget_tokens,
+                                select_block_tokens=0):
+    """Pre-pressure frontier aligned to both native KV and retrieval selection blocks."""
+    from math import lcm
+    prompt, block, budget = int(prompt_tokens), int(block_tokens), int(budget_tokens)
+    selected = int(select_block_tokens or block)
+    if block <= 0 or selected <= 0 or budget <= 0 or prompt <= block:
+        return 0
+    quantum = lcm(block, selected)
+    # Leave one native KV block of headroom. The old B-aligned boundary triggered physical
+    # compaction before the checkpoint could be captured at 36064 tokens in the MTP-off geometry.
+    limit = max(0, budget - block)
+    return max(0, min(((prompt - 1) // quantum) * quantum,
+                      (limit // quantum) * quantum))
+
+
+def clip_session_checkpoint_chunk(start, count, prompt, block, budget,
+                                  select_block_tokens=0):
+    """Stop a prefill step at its planned checkpoint without changing later chunks."""
+    target = session_checkpoint_frontier(prompt, block, budget,
+                                         select_block_tokens)
+    if target and int(start) < target < int(start) + int(count):
+        return target - int(start)
+    return count
+
+
+def terminal_checkpoint_requests(output_map, allowed_reasons):
+    """Only normal terminal outputs may publish checkpoints; errors and aborts cannot."""
+    return sorted({
+        output.request_id
+        for batch in (output_map or {}).values()
+        for output in (getattr(batch, "outputs", None) or ())
+        if getattr(output, "finish_reason", None) in allowed_reasons
+    })
+
+
+def verify_tp_checkpoint_records(records, tp_size, request_id):
+    """Return one agreed checkpoint record, or refuse publication for all TP ranks."""
+    if len(records) != tp_size or any(not isinstance(p, dict) for p in records):
+        raise ValueError("TP workers did not all prepare a checkpoint")
+    first = records[0]
+    keys = ("hashes", "covered", "prefix_digest", "kv_block_size", "page_tokens",
+            "pages_per_block", "capacity_pages", "has_state", "session_id",
+            "expected_ranks", "request")
+    if any(any(p.get(key) != first.get(key) for key in keys) for p in records):
+        raise ValueError("TP checkpoint metadata differs")
+    if {int(p.get("rank", -1)) for p in records} != set(range(tp_size)):
+        raise ValueError("TP checkpoint rank set is incomplete")
+    if first.get("request") != request_id or int(first.get("expected_ranks", 0)) != tp_size:
+        raise ValueError("checkpoint request or TP size mismatch")
+    namespace = first.get("session_id")
+    if (not isinstance(namespace, (list, tuple)) or len(namespace) != 2
+            or any(not isinstance(v, str) for v in namespace) or not namespace[1]):
+        raise ValueError("checkpoint has no native session namespace")
+    hashes = first.get("hashes")
+    covered = int(first.get("covered", 0) or 0)
+    block = int(first.get("kv_block_size", 0) or 0)
+    page = int(first.get("page_tokens", 0) or 0)
+    pages_per_block = int(first.get("pages_per_block", 0) or 0)
+    capacity = int(first.get("capacity_pages", 0) or 0)
+    if (not isinstance(hashes, list) or not hashes or block <= 0 or page <= 0
+            or pages_per_block <= 0 or covered != len(hashes) * block
+            or block != page * pages_per_block
+            or capacity <= 0 or capacity % pages_per_block
+            or capacity * page != covered):
+        raise ValueError("checkpoint frontier or KV geometry is invalid")
+    digest = first.get("prefix_digest")
+    if not isinstance(digest, str) or len(digest) != 64 or any(
+            c not in "0123456789abcdef" for c in digest):
+        raise ValueError("checkpoint token identity is missing")
+    return first
+
+
 _META_STORE: MetaStore | None = None
-# (block_hashes, blocks) whose published digest did not match at lookup time.
-_MISMATCHES: list = []
 
 
 def get_meta_store() -> MetaStore:

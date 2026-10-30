@@ -6,7 +6,8 @@ import torch
 sys.path.insert(0, "build/python")
 sys.path.insert(0, "src")
 import vllm_kvmem_ext as ext
-from kvmem_session_budget import SessionBudgetPool
+from kvmem_session_budget import BudgetError, SessionBudgetPool
+from kvmem_session_store import SessionStore
 from kvmem_sparse_runtime import VllmSparseRuntime
 
 PAGE, BLOCK, PAGES = 16, 128, 13329
@@ -66,9 +67,30 @@ def main():
     rt.state("req-c"); rt.orchestrator("req-c")
     check(rt.budget_pool.unassigned_bytes() <= 4096 * 1024 * 1024 - 2 * (4096 * 1024 * 1024 // 4),
           "two live sessions hold two shares")
+    id_b = rt.orchestrator("req-b").session_id
+    id_c = rt.orchestrator("req-c").session_id
+    check(id_b != id_c and id_b != 1 and id_c != 1,
+          "new requests never alias earlier or concurrent H identities")
     rt.release("req-b"); rt.release("req-c")
     check(rt.budget_pool.unassigned_bytes() == 4096 * 1024 * 1024,
           "closing both returns the whole budget")
+
+    # An unrelated cold request must evict one idle session before it can take the sole H share;
+    # it must not reuse the parked session's grant ID or silently open an unbounded host store.
+    single = VllmSparseRuntime.__new__(VllmSparseRuntime)
+    single.sessions = 1
+    single.budget_pool = SessionBudgetPool(host_bytes=1024 * 1024, sessions=1)
+    single.session_store = SessionStore(max_sessions=1, on_evict=single._release_parked)
+    old_id, share = single._open_host_share()
+    single.session_store.park((b"hash",), object(), 16, 16, session_id=old_id)
+    new_id, new_share = single._open_host_share()
+    check(new_id != old_id and share == new_share and len(single.session_store) == 0,
+          "cold admission evicts idle checkpoint and transfers its H capacity")
+    try:
+        single._open_host_share()
+        check(False, "an active request must not be evicted to open a second H share")
+    except BudgetError:
+        check(True, "an occupied active share fails closed")
 
     print("PASS session_lifecycle_test" if not failed else "FAILED session_lifecycle_test")
     sys.exit(0 if not failed else 1)

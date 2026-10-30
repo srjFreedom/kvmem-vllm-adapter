@@ -13,13 +13,8 @@ def select_tokens(prompt_token_ids, logical_pages, page_tokens):
     return [token for p in pages for token in ids[p * width:(p + 1) * width]]
 
 
-def adopt_attention_blocks(kv_cache_manager, request_id, physical_pages, block_pages):
-    """Keep packed attention blocks only; recurrent groups retain their own state slots.
-
-    The worker packs into its existing native blocks. A partial last block stays allocated;
-    all page IDs must describe the same contiguous expansion the engine will publish later.
-    Validate before freeing anything, so a bad row cannot partially mutate the allocator.
-    """
+def plan_attention_blocks(kv_cache_manager, request_id, physical_pages, block_pages):
+    """Validate a packed row against this request's blocks without changing ownership."""
     pages = [int(p) for p in physical_pages]
     width = int(block_pages)
     if not pages or width <= 0 or len(pages) != len(set(pages)):
@@ -39,8 +34,72 @@ def adopt_attention_blocks(kv_cache_manager, request_id, physical_pages, block_p
         raise ValueError("compaction cannot adopt blocks owned by another request")
     keep = set(blocks)
     freed = [b for b in old if int(b.block_id) not in keep]
-    manager.req_to_blocks[request_id] = [by_id[b] for b in blocks]
+    return manager, [by_id[b] for b in blocks], freed
+
+
+def adopt_attention_blocks(kv_cache_manager, request_id, physical_pages, block_pages):
+    """Keep packed attention blocks only; recurrent groups retain their own state slots."""
+    manager, kept, freed = plan_attention_blocks(
+        kv_cache_manager, request_id, physical_pages, block_pages)
+    manager.req_to_blocks[request_id] = kept
     if freed:
         kv_cache_manager.block_pool.free_blocks(freed)
-    return {"blocks": len(blocks), "freed": len(freed),
+    return {"blocks": len(kept), "freed": len(freed),
             "free_blocks": kv_cache_manager.block_pool.get_num_free_blocks()}
+
+
+def validate_quiescent_compaction(request, records, tp_size, epoch, kv_cache_manager):
+    """Validate TP proposals on Core's idle boundary without touching GPU or allocator.
+
+    Acceptance is not a commit: staged GPU moves and all-rank acknowledgment must follow before
+    EngineCore changes ownership or its resident book.
+    """
+    if (int(getattr(request, "num_in_flight_tokens", -1)) != 0
+            or int(getattr(request, "num_output_placeholders", 0)) != 0):
+        raise ValueError("compaction requires a quiescent draft-free request")
+    if not isinstance(records, (tuple, list)) or len(records) != int(tp_size) or tp_size <= 0:
+        raise ValueError("compaction needs one proposal from every TP rank")
+    try:
+        req_id = request.request_id
+        logical = int(request.num_logical_tokens)
+        resident = int(request.num_computed_tokens)
+        offset = int(getattr(request, "num_kvmem_offset", 0))
+        if logical - resident != offset or resident <= 0:
+            raise ValueError("EngineCore served/resident books disagree")
+        ranks = set()
+        proposal = None
+        for record in records:
+            if not isinstance(record, dict):
+                raise ValueError("missing TP compaction proposal")
+            rank = int(record["rank"])
+            ranks.add(rank)
+            page = int(record["page_tokens"])
+            block = int(record["block_pages"])
+            selected = tuple(int(p) for p in record["selected_pages"])
+            physical = tuple(int(p) for p in record["physical_pages"])
+            visible = int(record["visible_tokens"])
+            if (record["request"] != req_id or int(record["epoch"]) != int(epoch)
+                    or int(record["logical_frontier"]) != logical
+                    or int(record["resident_frontier"]) != resident):
+                raise ValueError("TP compaction frontier/epoch differs from EngineCore")
+            if (page <= 0 or block <= 0 or logical % page or resident % page
+                    or not selected or selected[0] < 0 or selected[-1] * page >= logical
+                    or selected != tuple(sorted(set(selected)))
+                    or len(physical) != len(selected)
+                    or visible != len(selected) * page or visible >= resident):
+                raise ValueError("unaligned or non-shrinking TP compaction proposal")
+            candidate = (selected, physical, visible, page, block)
+            if proposal is not None and candidate != proposal:
+                raise ValueError("TP ranks proposed different working sets or physical rows")
+            proposal = candidate
+        if ranks != set(range(int(tp_size))):
+            raise ValueError("duplicate or missing TP rank in compaction proposal")
+        if proposal is None:
+            raise ValueError("missing TP compaction proposal")
+        plan_attention_blocks(kv_cache_manager, req_id, proposal[1], proposal[4])
+        return {"request": req_id, "epoch": int(epoch), "logical_frontier": logical,
+                "resident_frontier": resident, "selected_pages": proposal[0],
+                "physical_pages": proposal[1], "visible_tokens": proposal[2],
+                "page_tokens": proposal[3], "block_pages": proposal[4]}
+    except (KeyError, TypeError, IndexError) as exc:
+        raise ValueError("incomplete TP compaction proposal") from exc

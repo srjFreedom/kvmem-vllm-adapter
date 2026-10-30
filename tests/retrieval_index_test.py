@@ -45,6 +45,21 @@ def main():
     check(idx.bytes_used() > 0, "the index reports its footprint")
     check(idx.covered_blocks() == sorted(idx.covered_blocks()), "covered blocks are ordered")
 
+    # A session checkpoint retains only sealed-prefix key sums; the next turn starts with a fresh Q.
+    checkpoint = idx.checkpoint_prefix(10 * 32)
+    check(checkpoint.covered_blocks() == list(range(10)),
+          "checkpoint copies only blocks before its executed frontier")
+    check(checkpoint._query is None, "checkpoint does not inherit the prior turn's query")
+    before = checkpoint._sums[0].clone()
+    idx.add(20, 0, torch.ones(16, 8) * 9)
+    check(torch.equal(checkpoint._sums[0], before),
+          "later suffix writes cannot mutate the sealed checkpoint statistics")
+    try:
+        idx.checkpoint_prefix(10 * 32 + 1)
+        check(False, "unaligned retrieval checkpoint frontier must reject")
+    except ValueError:
+        check(True, "unaligned retrieval checkpoint frontier rejects")
+
     # No query -> a clear error rather than silently falling back inside the index.
     bare = KvmemRetrievalIndex(32, 16, 8, 2)
     bare.add(0, 0, torch.ones(16, 8))

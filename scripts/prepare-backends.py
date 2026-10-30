@@ -34,7 +34,9 @@ def ensure_checkout(path: Path, url: str, commit: str) -> None:
     if (path / ".git").exists():
         head = run("git", "-C", str(path), "rev-parse", "HEAD", check=False).stdout.strip()
         dirt = run("git", "-C", str(path), "status", "--porcelain", check=False).stdout.strip()
-        if head != commit:
+        resolved = run("git", "-C", str(path), "rev-parse", "--verify",
+                       f"{commit}^{{commit}}", check=False).stdout.strip()
+        if head not in (commit, resolved) or not head:
             raise SystemExit(
                 f"{path} is at {head[:12]}, not the pinned {commit[:12]}; refusing to check it out. "
                 "Remove the directory (or point --engine at a fresh one) and re-run.")
@@ -92,7 +94,10 @@ def main() -> int:
     entry = VERSIONS["engines"] if args.engine == "vllm" else VERSIONS["engines_kvmem"]
     if args.engine == "kvmem":
         print(f"[prepare] kvmem: {entry['upstream']} @ {entry['base_commit']}")
-        ensure_checkout(ROOT / entry["path"], entry["upstream"], entry["base_commit"])
+        native = ROOT / entry["path"]
+        ensure_checkout(native, entry["upstream"], entry["base_commit"])
+        if run("git", "-C", str(native), "status", "--porcelain", check=False).stdout.strip():
+            raise SystemExit(f"{native} has local source changes; refusing to build outside the pin")
         print(f"  ready: {entry['path']}")
         return 0
     path = ROOT / entry["path"]

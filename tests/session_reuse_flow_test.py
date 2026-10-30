@@ -1,17 +1,8 @@
-"""Offline end-to-end check of park -> resume (no engine, no ext build).
+"""CPU-only exact-frontier checkpoint -> acknowledged park -> full-prefix restore.
 
-Turn 1 fills a session's KV into the host store and is RELEASED; with session reuse on, release
-must PARK it (KV pages + the request's host share kept alive) under the prompt's block-hash
-sequence instead of dropping it.
-
-Turn 2 is the same conversation plus new tokens. EngineCore has already turned the hit into the two
-books (`num_logical_tokens` = hit, `num_computed_tokens` = |sel| pages), and the engine allocated
-that many pages. `before_step` must therefore:
-  * adopt the parked orchestrator (not build a new one),
-  * restore exactly |sel| pages from the store into the engine's own row, at their compacted ranks,
-  * leave the served/resident books consistent with what the scheduler decided.
-
-Run: python tests/session_reuse_flow_test.py
+A release discovered by the next request must not create a checkpoint. EngineCore prepares one
+sealed block-aligned prefix before publishing metadata, and both worker books start at that same
+frontier. A compressed resident book is refused until Mamba's cursor contract is qualified.
 """
 
 import os
@@ -24,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
 from kvmem_session_store import SessionStore  # noqa: E402
 from kvmem_sparse_orchestrator import SparseOrchestrator  # noqa: E402
 from kvmem_sparse_rope import _quantize  # noqa: E402
-from kvmem_sparse_runtime import RunnerView, VllmSparseRuntime  # noqa: E402
+from kvmem_sparse_runtime import RunnerView, SparseViewCapacityError, VllmSparseRuntime  # noqa: E402
 
 PAGE, HEADS, HD, ROT, CONTENT, PAGES = 16, 2, 256, 64, 512, 4096
 BLOCK = 32          # hash block size for the test (the engine uses 1616)
@@ -97,14 +88,23 @@ def main():
         budget_tokens=2048, gen_reserve=256, sink_tokens=256, recent_tokens=128,
         sessions=2, host_mib=4096, pages_per_block=1, no_prefill_compact=True)
     rt.inrequest_compaction = True          # the view is only installed in this mode
+    rt.stats_core = False
+    rt.retrieval_enabled = False
     store = SessionStore(max_sessions=2)
     rt.enable_session_reuse(store, BLOCK)
+    rt.has_recurrent = True
+    rt.capture_state = lambda req, frontier=None: {0: "GDN@128"}
+    rt.restore_state = lambda req, image: bool(image)
+    rt.session_checkpoint_speculative_tokens = 0
+    rt.session_checkpoint_executed_frontier = lambda req: 128
 
     # --- turn 1: a 256-token prompt prefilled at TRUE positions ---------------------------
     ids1 = list(range(1000, 1256))
     total1 = len(ids1)
     pages1 = total1 // PAGE
     rt.note_prompt_ids("turn1", ids1)
+    rt.note_session_id("turn1", "conversation", "tenant")
+    rt.note_prompt_len("turn1", total1)
     rt._ensure("turn1")
     orch = rt._orch["turn1"]
     orch.session_id = 1
@@ -112,37 +112,49 @@ def main():
         orch.write_page(p, canon(p), p + 101, baked=0)   # engine ids start at 101
     orch.note_tokens(total1)
     rt._state["turn1"].row_index = 0
-
+    rt._state["turn1"].tokens = 128
+    check(rt._maybe_capture_session_checkpoint("turn1", rt._state["turn1"]),
+          "exact 128-token prefill checkpoint captured")
+    check(rt.prepare_session_checkpoint("turn1")["covered"] == 128,
+          "terminal barrier prepares only the sealed executed prefix")
     check(rt.release("turn1") is True, "turn 1 is released")
-    check(len(store) == 1, f"the session is parked, not dropped (len={len(store)})")
-    entry, blocks = store.lookup(__import__("kvmem_session_store").block_hash_sequence(ids1, BLOCK))
-    check(blocks == len(ids1) // BLOCK, f"the parked key covers the whole prompt ({blocks} blocks)")
-    check(entry.orchestrator is orch, "the parked entry IS the turn-1 orchestrator")
+    check(len(store) == 1, f"the acknowledged session remains parked (len={len(store)})")
+    hashes = __import__("kvmem_session_store").block_hash_sequence(ids1[:128], BLOCK)
+    entry, blocks = store.lookup(hashes, owner_session_id=("tenant", "conversation"))
+    check(blocks == 4 and entry.orchestrator is orch,
+          "the checkpoint is the exact 128-token prefix, not the final prompt")
 
     # --- turn 2: same conversation + 64 new tokens ---------------------------------------
     ids2 = ids1 + list(range(5000, 5064))
-    hit = (len(ids1) // BLOCK) * BLOCK          # EngineCore's hit length
-    selected = 8                                # |sel| pages the resident book was set to
-    visible = selected * PAGE
-    check(visible < hit, "the resident book is SHORTER than the served count (compression)")
+    hit = 128
+    selected = hit // PAGE
+    visible = hit
+    check(visible == hit, "Mamba state and resident KV use one exact frontier")
 
-    for i in range(selected):
+    for i in range(selected + 1):
         view._rows[0][0, i] = 0
-    view.allocate(selected, 700)                # the engine's fresh pages for this request
+    # The engine allocates for the resident prefix AND this step's scheduled query token, then
+    # the plugin mirrors the written block-table prefix into the runtime before prepare_inputs.
+    view.allocate(selected + 1, 700)
 
     rt.note_prompt_ids("turn2", ids2)
+    rt.note_session_id("turn2", "conversation", "tenant")
     rt.note_resume("turn2", hit, visible)
     rt._ensure("turn2")
     check(rt._orch.get("turn2") is orch, "turn 2 ADOPTS the parked orchestrator")
     check(len(store) == 0, "the parked entry is taken out of the store (no double use)")
+    rt.state("turn2").row_index = 0
+    rt.sync_row_from_engine("turn2", selected + 1, 1)
 
     st = rt.before_step("turn2", n_query_tokens=1, row_index=0, position_slots=[0])
     check(st is not None, "before_step installs a view on the resumed request")
-    check(len(st.row) == selected, f"the row holds exactly |sel| pages (n={len(st.row)})")
+    check(len(st.row) == selected + 1,
+          f"the row keeps this step's scheduled page too (n={len(st.row)})")
     check(st.seq_len == visible, f"seq_len is the resident book ({st.seq_len} == {visible})")
     check(st.tokens == hit, f"the served book is the hit length ({st.tokens} == {hit})")
-    check(st.row == tuple(range(700, 700 + selected)),
-          "the row is the engine's own freshly allocated pages")
+    check(st.row[:selected] == tuple(range(700, 700 + selected)),
+          "the resident prefix uses the engine's own freshly allocated pages")
+    check(st.row[selected] == 700 + selected, "the scheduled chunk page is preserved")
     restored = sum(1 for p in orch.store.pages if orch.slot_of.get(p) is not None)
     check(restored >= selected, f"at least |sel| pages are back on the device (n={restored})")
     ok_needle = all(orch.needle(p) is True for p in orch.slot_of)
@@ -153,6 +165,16 @@ def main():
     rank = list(st.row).index(orch.slot_of[p])
     check(orch.baked_delta[p] == (rank - p) * PAGE,
           f"page {p} carries (rank-page)*page_tokens = {(rank - p) * PAGE}")
+
+    # Fail closed if the runtime's row is one page short of the attention length it would install:
+    # a resumed prefix alone cannot address the next scheduled token.
+    st.row = st.row[:selected]
+    refused = False
+    try:
+        rt.before_step("turn2", n_query_tokens=1, row_index=0, position_slots=[0])
+    except SparseViewCapacityError:
+        refused = True
+    check(refused, "a row one page short of the scheduled step is refused, not clamped")
 
     print("session_reuse_flow_test: OK" if not failed else "session_reuse_flow_test: FAILED")
     return 1 if failed else 0

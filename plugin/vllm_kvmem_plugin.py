@@ -289,30 +289,43 @@ def _has_recurrent_groups(runner):
     return bool(_state_groups(runner))
 
 
-def _state_slot(runner, row, group):
+def _state_slot(runner, row, group, frontier):
+    """Resolve the recurrent slot for the completed token frontier, not block-table column 0."""
     try:
-        return int(runner.block_tables.block_tables[int(group)].gpu[int(row), 0].item())
+        column = 0
+        if getattr(getattr(runner, "model_state", None), "_align_mode", False):
+            block = int(runner.vllm_config.cache_config.block_size)
+            if block <= 0:
+                return None
+            # V2 align postprocess places state at the last evaluated native block. A fresh
+            # reconstruction with frontier zero starts from its first state slot.
+            column = max(0, (int(frontier) - 1) // block)
+        table = runner.block_tables.block_tables[int(group)].gpu
+        if column >= table.shape[1]:
+            return None
+        return int(table[int(row), column].item())
     except Exception:
         return None
 
 
-def _capture_state_snapshot(runner, runtime, req):
+def _capture_state_snapshot(runner, runtime, req, frontier=None):
     """Copy this request's recurrent state to RAM (the parked session's RAM tier)."""
     groups = _state_groups(runner)
     st = runtime._state.get(req)
     row = getattr(st, "row_index", None) if st is not None else None
     if not groups or row is None:
         return None
+    frontier = int(getattr(st, "tokens", 0) if frontier is None else frontier)
     snap = {}
     for group, tensors in groups.items():
-        slot = _state_slot(runner, row, group)
+        slot = _state_slot(runner, row, group, frontier)
         if slot is None or slot < 0:
-            continue
+            return None
         try:
             snap[int(group)] = (slot, [t[slot].detach().to("cpu").clone() for t in tensors])
         except Exception:
-            continue
-    return snap or None
+            return None
+    return snap if len(snap) == len(groups) else None
 
 
 def _restore_state_snapshot(runner, runtime, req, snapshot):
@@ -324,21 +337,28 @@ def _restore_state_snapshot(runner, runtime, req, snapshot):
     row = getattr(st, "row_index", None) if st is not None else None
     if not groups or row is None:
         return False
-    restored = False
+    if set(int(k) for k in snapshot) != set(groups):
+        return False
+    frontier = (int(st.resume[1]) if getattr(st, "resume", None) is not None
+                else int(getattr(st, "tokens", 0) or 0))
     for group, (_src_slot, saved) in snapshot.items():
         tensors = groups.get(int(group))
         if not tensors or len(tensors) != len(saved):
-            continue
-        dst = _state_slot(runner, row, group)
+            return False
+        dst = _state_slot(runner, row, group, frontier)
         if dst is None or dst < 0:
-            continue
-        for tensor, value in zip(tensors, saved):
-            try:
+            return False
+        try:
+            for tensor, value in zip(tensors, saved):
                 tensor[dst].copy_(value.to(tensor.device, non_blocking=False))
-                restored = True
-            except Exception:
-                pass
-    return restored
+        except Exception:
+            return False
+    return bool(snapshot)
+
+
+def _bind_state_capture(runner, runtime):
+    runtime.capture_state = lambda req, frontier=None: _capture_state_snapshot(
+        runner, runtime, req, frontier)
 
 
 def _probe_runner(runner, log_path):
@@ -554,7 +574,7 @@ def _attach_sparse(runner, log_path):
 
         import vllm_kvmem_ext as ext
         from kvmem_live_view import resolve_live_view
-        from kvmem_sparse_runtime import VllmSparseRuntime
+        from kvmem_sparse_runtime import VllmSparseRuntime, pool_prefill_high_watermark
     except Exception:
         _append(log_path, {"kind": "sparse_attach_error", "pid": os.getpid(),
                            "error": traceback.format_exc()})
@@ -666,7 +686,7 @@ def _attach_sparse(runner, log_path):
 
     runtime.set_block_cursor = _set_block_cursor
     if runtime.has_recurrent:
-        runtime.capture_state = lambda req: _capture_state_snapshot(runner, runtime, req)
+        _bind_state_capture(runner, runtime)
         runtime.restore_state = lambda req, snap: _restore_state_snapshot(runner, runtime, req, snap)
 
         def _reset_state(req):
@@ -678,7 +698,7 @@ def _attach_sparse(runner, log_path):
                 return False
             done = False
             for group, tensors in groups.items():
-                slot = _state_slot(runner, row, group)
+                slot = _state_slot(runner, row, group, 0)
                 if slot is None or slot < 0:
                     continue
                 for tensor in tensors:
@@ -701,15 +721,27 @@ def _attach_sparse(runner, log_path):
             if getattr(runtime, "checkpoints", None) is not None:
                 _store.catalog = runtime.checkpoints
             runtime.enable_session_reuse(_store, _bs)
-            runtime.capture_state = (
-                lambda req: _capture_state_snapshot(runner, runtime, req))
+            runtime.session_checkpoint_chunk_tokens = int(getattr(
+                getattr(getattr(runner, "vllm_config", None), "scheduler_config", None),
+                "max_num_batched_tokens", 0) or 0)
+            runtime.session_checkpoint_speculative_tokens = int(getattr(
+                getattr(getattr(runner, "vllm_config", None), "speculative_config", None),
+                "num_spec_tokens", 0) or 0)
+
+            def _executed_frontier(req):
+                idx = runner.req_states.req_id_to_index.get(req)
+                if idx is None:
+                    return -1
+                # The GPU counter, not the optimistic host mirror, names evaluated input tokens.
+                return int(runner.req_states.num_computed_tokens.gpu[idx].item())
+
+            runtime.session_checkpoint_executed_frontier = _executed_frontier
+            _bind_state_capture(runner, runtime)
             runtime.restore_state = (
                 lambda req, snap: _restore_state_snapshot(runner, runtime, req, snap))
-            _ch = getattr(runtime, "compact_channel", None)
-            runtime.session_park = getattr(_ch, "session_park", None)
             _append(log_path, {"kind": "session_reuse_on", "pid": os.getpid(),
                                "block_size": _bs, "recurrent": runtime.has_recurrent,
-                               "channel": runtime.session_park is not None})
+                               "terminal_rpc": True})
         except Exception:
             _append(log_path, {"kind": "session_reuse_error", "pid": os.getpid(),
                                "error": traceback.format_exc()})
@@ -750,9 +782,11 @@ def _attach_sparse(runner, log_path):
                 # Leave room for the NEXT chunk plus a margin: the ceiling itself is where the
                 # allocator already fails (measured: the row stops exactly at the cap, free_blocks=9,
                 # and `row > high` never becomes true because the row cannot grow to high+1).
-                _chunk = 4096 + 2048
-                _cap = max(64, max(0, int(runtime.pool_ceiling_tokens) - _chunk) // max(1, _pt))
-                if int(getattr(runtime, "prefill_high_watermark", 0) or 0) > _cap:
+                _cap = pool_prefill_high_watermark(runtime.pool_ceiling_tokens, _pt)
+                # Resident prefill borrows the physical pool for its first pass. The old B-derived
+                # watermark compacted repeatedly inside a 161K pool and faulted near token 81K;
+                # after the first physical-pressure compaction, R still drives later selections.
+                if not runtime.no_prefill_compact:
                     runtime.prefill_high_watermark = _cap
             except Exception:
                 pass
@@ -786,6 +820,8 @@ def _attach_sparse(runner, log_path):
     # rank, but only rank zero in the TP group publishes the selected token sequence.
     from vllm.distributed.parallel_state import get_tp_group
     runtime.tp_rank = int(get_tp_group().rank_in_group)
+    _parallel_cfg = getattr(getattr(runner, "vllm_config", None), "parallel_config", None)
+    runtime.tp_size = int(getattr(_parallel_cfg, "tensor_parallel_size", 1) or 1)
     # Experimental switches arrive through the plugin config (env does not reach the workers).
     try:
         if cfg.get("prompt_end_reselect"):
@@ -1086,9 +1122,13 @@ def _attach_sparse(runner, log_path):
                         continue
                     runtime.before_step(req, row_index=view.row_index(req),
                                         position_slots=view.query_position_slots(req))
-            except Exception:
+            except Exception as exc:
                 _append(log_path, {"kind": "sparse_step_error", "pid": os.getpid(),
                                    "error": traceback.format_exc()})
+                from kvmem_session_budget import BudgetError
+                from kvmem_sparse_runtime import SparseViewCapacityError
+                if isinstance(exc, (BudgetError, SparseViewCapacityError)):
+                    raise
 
         prepare_pos_seq_lens._kvmem_patched = True
         mr.prepare_pos_seq_lens = prepare_pos_seq_lens
@@ -1337,6 +1377,43 @@ def register():
             _boot(f"import {module_name} failed: " + traceback.format_exc())
     if not runners:
         return
+    # EngineCore calls these at a terminal-output barrier. Each TP worker prepares only an exact
+    # sealed checkpoint; EngineCore publishes the routing metadata after comparing every rank.
+    try:
+        from vllm.v1.worker.gpu_worker import Worker as _GPUWorker
+
+        if not hasattr(_GPUWorker, "prepare_kvmem_session_checkpoints"):
+            def _prepare_kvmem_session_checkpoints(worker, request_ids):
+                runner = getattr(worker, "model_runner", None)
+                runtime = getattr(runner, "kvmem_runtime", None)
+                if runtime is None:
+                    return {}
+                return {str(req): runtime.prepare_session_checkpoint(req)
+                        for req in request_ids}
+
+            def _abort_kvmem_session_checkpoints(worker, request_ids):
+                runner = getattr(worker, "model_runner", None)
+                runtime = getattr(runner, "kvmem_runtime", None)
+                if runtime is None:
+                    return {}
+                return {str(req): runtime.abort_session_checkpoint(req)
+                        for req in request_ids}
+
+            def _check_kvmem_session_checkpoint(worker, owner, hashes, frontier, digest,
+                                                capacity_pages):
+                runner = getattr(worker, "model_runner", None)
+                runtime = getattr(runner, "kvmem_runtime", None)
+                if runtime is None:
+                    return False
+                return runtime.check_session_checkpoint(owner, hashes, frontier, digest,
+                                                        capacity_pages)
+
+            _GPUWorker.prepare_kvmem_session_checkpoints = _prepare_kvmem_session_checkpoints
+            _GPUWorker.abort_kvmem_session_checkpoints = _abort_kvmem_session_checkpoints
+            _GPUWorker.check_kvmem_session_checkpoint = _check_kvmem_session_checkpoint
+    except Exception:
+        _boot("session checkpoint worker RPC install failed: " + traceback.format_exc())
+    _ensure_import_path()
     # Block channel (Route A). The settings are NOT visible at register() time in EngineCore (no
     # runner exists there), so the hook is installed unconditionally and the socket server starts
     # lazily on the first schedule whose vllm_config carries `block_channel`.
@@ -1472,7 +1549,7 @@ def register():
             _append(_sched_cfg(scheduler).get("probe_log") or "/tmp/kvmem_sparse.jsonl", entry)
             return {"ok": True, "truncated": True, "visible": visible}
 
-        _channel_state = {"scheduler": None, "server": None}
+        _channel_state = {"scheduler": None, "server": None, "executor": None}
         # request_id -> visible length of the last applied compaction (TP-rank idempotency).
         _compact_state = {}
         _replay_state = {}       # request_id -> visible length of the last applied replay
@@ -1500,30 +1577,6 @@ def register():
                     cfg.get("inrequest_compaction", False))
             except Exception:
                 return False
-
-        def _session_park_payload(payload):
-            """EngineCore side of a park: keep the routing geometry, never the KV."""
-            try:
-                from kvmem_session_store import get_meta_store
-                hashes = [bytes.fromhex(str(h)) for h in payload.get("hashes", [])]
-                get_meta_store().park(
-                    hashes,
-                    covered_tokens=int(payload.get("covered", 0) or 0),
-                    page_tokens=int(payload.get("page_tokens", 0) or 0),
-                    pages_per_block=int(payload.get("pages_per_block", 1) or 1),
-                    capacity_pages=int(payload.get("capacity_pages", 0) or 0),
-                    has_state=bool(payload.get("has_state", False)),
-                    prefix_digest=str(payload.get("prefix_digest", "") or ""))
-                _append(_sched_cfg(_channel_state.get("scheduler")).get("probe_log")
-                        or "/tmp/kvmem_sparse.jsonl",
-                        {"kind": "session_meta_parked", "pid": os.getpid(),
-                         "blocks": len(hashes),
-                         "covered": int(payload.get("covered", 0) or 0),
-                         "capacity": int(payload.get("capacity_pages", 0) or 0)})
-            except Exception:
-                _append(_sched_cfg(_channel_state.get("scheduler")).get("probe_log")
-                        or "/tmp/kvmem_sparse.jsonl",
-                        {"kind": "session_meta_error", "error": traceback.format_exc()})
 
         def _maybe_resume(scheduler):
             """Point a fresh request at a parked session: only the two books move, nothing else.
@@ -1570,6 +1623,18 @@ def register():
                     _resume_decided.add(rid)
                     if int(getattr(request, "num_computed_tokens", 0) or 0) > 0:
                         continue
+                    _session_id = getattr(request, "session_id", None)
+                    _cache_salt = getattr(request, "cache_salt", None)
+                    if (not isinstance(_session_id, str) or not _session_id
+                            or len(_session_id) > 1024
+                            or (_cache_salt is not None and not isinstance(_cache_salt, str))
+                            or len(_cache_salt or "") > 1024):
+                        _append(_sched_cfg(scheduler).get("probe_log")
+                                or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "resume_skip", "req": rid,
+                                 "why": "native session_id missing", "pid": os.getpid()})
+                        continue
+                    owner_session_id = (_cache_salt or "", _session_id)
                     ids = list(getattr(request, "prompt_token_ids", None) or ())
                     if len(ids) < block_size:
                         _append(_sched_cfg(scheduler).get("probe_log")
@@ -1586,7 +1651,8 @@ def register():
                             int(t).to_bytes(4, "little", signed=False)
                             for t in _ids[:upto])).hexdigest()
 
-                    found = store.lookup(_hashes, prefix_digest=_digest)
+                    found = store.lookup(_hashes, prefix_digest=_digest,
+                                         owner_session_id=owner_session_id)
                     if found is None:
                         _append(_sched_cfg(scheduler).get("probe_log")
                                 or "/tmp/kvmem_sparse.jsonl",
@@ -1605,12 +1671,35 @@ def register():
                         continue
                     pages = min(int(meta.capacity_pages or 0), hit // pt)
                     pages = (pages // ppb) * ppb
-                    if pages <= 0:
+                    if pages <= 0 or pages * pt != hit:
+                        # V2 Mamba seeds its state cursor from the resident counter. A shortened
+                        # resident prefix would read a different recurrent block than the saved
+                        # logical-frontier StateImage.
+                        continue
+                    executor = _channel_state.get("executor")
+                    if executor is None:
+                        continue
+                    try:
+                        proofs = executor.collective_rpc(
+                            "check_kvmem_session_checkpoint", timeout=15,
+                            args=(owner_session_id, tuple(meta.block_hashes), hit,
+                                  meta.prefix_digest, meta.capacity_pages))
+                    except Exception:
+                        proofs = None
+                    if (not isinstance(proofs, (tuple, list))
+                            or len(proofs) != int(scheduler.vllm_config.parallel_config.tensor_parallel_size)
+                            or not all(proof is True for proof in proofs)):
+                        store.discard_requests((meta.source_request,))
+                        _append(_sched_cfg(scheduler).get("probe_log")
+                                or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "resume_skip", "req": rid,
+                                 "why": "TP worker checkpoint unavailable", "pid": os.getpid()})
                         continue
                     visible = pages * pt
                     request.num_computed_tokens = visible
                     request.num_logical_tokens = hit
                     request.num_kvmem_offset = hit - visible
+                    request.kvmem_session_resume = True
                     _append(_sched_cfg(scheduler).get("probe_log")
                             or "/tmp/kvmem_sparse.jsonl",
                             {"kind": "resume_decided", "pid": os.getpid(), "req": rid,
@@ -1651,14 +1740,58 @@ def register():
                         _channel_state["server"] = BlockChannelScheduler(
                             _alloc, path=scfg.get("block_channel_path",
                                                   "/tmp/kvmem_block_channel.sock"),
-                            compactor=_compact, session_sink=_session_park_payload,
-                            replayer=_replay).start()
+                            compactor=_compact, replayer=_replay).start()
                         _append(scfg.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
                                 {"kind": "block_channel_attached", "pid": os.getpid()})
                 _maybe_resume(self)
                 return original(self, *args, **kwargs)
             schedule._kvmem_channel_patched = True
             Scheduler.schedule = schedule
+
+        # A worker release discovered by the next prepare_inputs() is too late: EngineCore has
+        # already admitted that next request. Prepare candidate StateImage/KV on every TP worker
+        # after update_from_output has determined a terminal request, then publish one metadata entry
+        # only when all rank payloads match, still before the response leaves EngineCore.step.
+        try:
+            from vllm.v1.engine.core import EngineCore
+
+            original_step = EngineCore.step
+            if not getattr(original_step, "_kvmem_session_retire_patched", False):
+                def _publish_terminal_sessions(core, output_map):
+                    cfg = _sched_cfg(getattr(core, "scheduler", None))
+                    if not (cfg.get("session_reuse") and cfg.get("inrequest_compaction")):
+                        return
+                    from vllm.v1.engine import FinishReason
+                    from kvmem_session_store import get_meta_store
+                    from kvmem_session_retirement import retire_terminal_sessions
+                    retire_terminal_sessions(
+                        output_map, (FinishReason.STOP, FinishReason.LENGTH),
+                        getattr(core, "model_executor", None),
+                        int(core.vllm_config.parallel_config.tensor_parallel_size),
+                        get_meta_store(),
+                        report=lambda event: _append(
+                            _sched_cfg(core.scheduler).get("probe_log")
+                            or "/tmp/kvmem_sparse.jsonl",
+                            {"pid": os.getpid(), **event}))
+
+                def step(self, *args, **kwargs):
+                    _channel_state["executor"] = self.model_executor
+                    result = original_step(self, *args, **kwargs)
+                    try:
+                        outputs = result[0] if isinstance(result, tuple) and result else {}
+                        _publish_terminal_sessions(self, outputs)
+                    except Exception:
+                        _append("/tmp/kvmem_sparse.jsonl",
+                                {"kind": "session_checkpoint_retire_error",
+                                 "pid": os.getpid(), "error": traceback.format_exc()[-600:]})
+                    return result
+
+                step._kvmem_session_retire_patched = True
+                EngineCore.step = step
+        except Exception:
+            _append("/tmp/kvmem_sparse.jsonl",
+                    {"kind": "session_checkpoint_engine_hook_error",
+                     "error": traceback.format_exc()[-600:]})
     except Exception:
         _append(cfg.get("probe_log") or "/tmp/kvmem_sparse.jsonl",
                 {"kind": "block_channel_error", "error": traceback.format_exc()})
@@ -1686,6 +1819,10 @@ def _install(cls, module_name, probe, smoke, state):
         # opened for the resumed request and the engine then read an empty row.
         _rt0 = state.get("sparse")
         if _rt0 is not None:
+            from kvmem_session_retirement import retire_finished_worker_requests
+            for _gone in retire_finished_worker_requests(_rt0, scheduler_output):
+                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "released", "req": _gone, "pid": os.getpid()})
             try:
                 for _nr in (getattr(scheduler_output, "scheduled_new_reqs", None)
                             or getattr(scheduler_output, "new_reqs", None) or ()):
@@ -1699,9 +1836,11 @@ def _install(cls, module_name, probe, smoke, state):
                         continue
                     _ids = getattr(_nr, "prompt_token_ids", None)
                     _rt0.note_prompt_ids(_rid, _ids)
+                    _rt0.note_session_id(_rid, getattr(_nr, "session_id", None),
+                                         getattr(_nr, "cache_salt", None))
                     _nlg = int(getattr(_nr, "num_logical_tokens", 0) or 0)
                     _npc = int(getattr(_nr, "num_computed_tokens", 0) or 0)
-                    if _nlg > _npc:
+                    if bool(getattr(_nr, "kvmem_session_resume", False)):
                         _rt0.note_resume(_rid, _nlg, _npc)
                     if bool(_config().get("session_reuse", False)):
                         _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
@@ -2039,19 +2178,28 @@ def _install(cls, module_name, probe, smoke, state):
                             try:
                                 _ids = getattr(_nr, "prompt_token_ids", None)
                                 rt.note_prompt_ids(_rid, _ids)
+                                rt.note_session_id(_rid, getattr(_nr, "session_id", None),
+                                                   getattr(_nr, "cache_salt", None))
                                 if bool(_config().get("session_reuse", False)):
                                     _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                                             {"kind": "note_prompt_ids", "req": str(_rid),
                                              "n": len(_ids or ()), "pid": os.getpid()})
                                 _nlg = int(getattr(_nr, "num_logical_tokens", 0) or 0)
                                 _npc = int(getattr(_nr, "num_computed_tokens", 0) or 0)
-                                if _nlg > _npc:
+                                if bool(getattr(_nr, "kvmem_session_resume", False)):
                                     rt.note_resume(_rid, _nlg, _npc)
                             except Exception:
                                 pass
                         reqs = list(getattr(batch_req_state, "req_ids", None) or [])
                         counts = getattr(batch_req_state, "num_scheduled_tokens", None)
                         if reqs and counts is not None:
+                            # Retire absent requests before opening H shares for the new batch.
+                            # With SESSIONS=1 the old share must be closed/evicted first; doing
+                            # this after rt.state(new_req) reused the old budget identity.
+                            for gone in [r for r in rt.live_requests() if r not in reqs]:
+                                rt.release(gone)
+                                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                        {"kind": "released", "req": gone, "pid": os.getpid()})
                             import numpy as _np
                             counts_np = _np.asarray(counts, dtype=_np.int64)
                             csl = _np.concatenate(([0], _np.cumsum(counts_np)))
@@ -2072,10 +2220,6 @@ def _install(cls, module_name, probe, smoke, state):
                                             req, int(bt.num_blocks.np[group, row]),
                                             int(counts_np[pos]))
                                     break
-                            for gone in [r for r in rt.live_requests() if r not in reqs]:
-                                rt.release(gone)
-                                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
-                                        {"kind": "released", "req": gone, "pid": os.getpid()})
                             if _env_flag("KVMEM_PREINSTALL_ROW"):
                                 # Opt-in: install the row before the gather. With compaction limited
                                 # to decode (the shipped default) the row is stable across a step,
@@ -2088,9 +2232,13 @@ def _install(cls, module_name, probe, smoke, state):
                                     rt.before_step(req, row_index=row,
                                                    position_slots=rt.view.query_position_slots(req),
                                                    rows_only=True)
-                except Exception:
+                except Exception as exc:
                     _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                             {"kind": "sparse_pre_install_error", "error": traceback.format_exc()})
+                    from kvmem_session_budget import BudgetError
+                    from kvmem_sparse_runtime import SparseViewCapacityError
+                    if isinstance(exc, (BudgetError, SparseViewCapacityError)):
+                        raise
                 out = _orig_prepare_inputs(self, scheduler_output, batch_req_state,
                                            batch_desc, *args, **kwargs)
                 if os.environ.get("KVMEM_DEBUG_POS", "").strip().lower() in (
@@ -2186,9 +2334,19 @@ def _install(cls, module_name, probe, smoke, state):
                                 # the resident length and the compacted positions win.
                                 rt.before_step(req, row_index=row,
                                                position_slots=rt.view.query_position_slots(req))
-                except Exception:
+                except Exception as exc:
                     _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                             {"kind": "sparse_step_error", "error": traceback.format_exc()})
+                    from kvmem_session_budget import BudgetError
+                    from kvmem_sparse_runtime import SparseViewCapacityError
+                    if isinstance(exc, (BudgetError, SparseViewCapacityError)):
+                        raise
+                    if any(bool(getattr(nr, "kvmem_session_resume", False))
+                           for nr in (getattr(scheduler_output, "scheduled_new_reqs", None)
+                                      or ())):
+                        # The scheduler has already skipped the restored prompt prefix. Continuing
+                        # a failed worker restore would evaluate a suffix against empty/wrong KV.
+                        raise
                 return out
             prepare_inputs._kvmem_v2_patched = True
             cls.prepare_inputs = prepare_inputs

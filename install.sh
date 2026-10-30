@@ -17,7 +17,7 @@
 set -euo pipefail
 ROOT=$(cd "$(dirname "$0")" && pwd)
 VLLM_ROOT=${VLLM_ROOT:-$ROOT/engines/vllm}
-KVMA_SRC=${KVMA_SRC:-$HOME/src/kvmem-v018rc1}
+KVMA_SRC=${KVMA_SRC:-$ROOT/engines/kvmem}
 PY=${PY:-"$VLLM_ROOT/.venv/bin/python"}
 PATCH="$ROOT/patches/qwen3-next-capture-q.patch"
 TARGET="$VLLM_ROOT/vllm/model_executor/models/qwen3_next.py"
@@ -80,13 +80,11 @@ fi
 echo "  -> $(cat "$VLLM_ROOT"/.venv/lib/python3.12/site-packages/vllm_kvmem_plugin-*.dist-info/entry_points.txt | grep -c '=') 个入口点"
 
 say "4/5 编译原生扩展"
-if [ -f "$ROOT/build/python/vllm_kvmem_ext.cpython-312-x86_64-linux-gnu.so" ]; then
-  echo "  已有构建产物，跳过（要重编先删 build/）"
-else
-  cmake -S "$ROOT" -B "$ROOT/build" -DKVMEM_BASE="$KVMA_SRC" -DCMAKE_BUILD_TYPE=RelWithDebInfo >/dev/null
-  cmake --build "$ROOT/build" -j "$(nproc)" >/dev/null
-  echo "  -> build/python/"
-fi
+# The pinned native tag can change while an old .so remains on disk. Always reconfigure and
+# incrementally build so a stale extension is never mistaken for a matching checkpoint ABI.
+cmake -S "$ROOT" -B "$ROOT/build" -DKVMEM_BASE="$KVMA_SRC" -DCMAKE_BUILD_TYPE=RelWithDebInfo >/dev/null
+cmake --build "$ROOT/build" -j "$(nproc)" >/dev/null
+echo "  -> build/python/"
 
 say "5/5 自检"
 PYTHONPATH="$ROOT/build/python:$ROOT/src:$ROOT/plugin" "$PY" - <<'PYCHECK'

@@ -23,6 +23,49 @@ class PositionBooksTest(unittest.TestCase):
         self.assertEqual(scheduled_position_offset(output, "fresh"), 0)
         self.assertIsNone(scheduled_position_offset(output, "missing"))
 
+    def test_compacted_prefill_refuses_row_shorter_than_scheduled_step(self):
+        import torch
+        from kvmem_sparse_runtime import (SparseViewCapacityError, VllmSparseRuntime,
+                                           _ReqState)
+
+        rt = VllmSparseRuntime.__new__(VllmSparseRuntime)
+        st = _ReqState()
+        st.row_index = 0
+        st.tokens = 145088      # logical history
+        st.seq_len = 36864      # resident after the first pressure compaction
+        st.row = tuple(range(101, 101 + 1176))
+        table = torch.arange(101, 101 + 1274, dtype=torch.int32).reshape(1, 1274)
+        seq = torch.zeros(1, dtype=torch.int32)
+        rt.view = NS(block_table_rows=lambda: [table], seq_lens=lambda: seq,
+                     positions=lambda: torch.zeros(4096, dtype=torch.int64))
+        rt._orch = {"r": NS()}
+        rt._state = {"r": st}
+        rt._engine_computed = {"r": 36864}
+        rt._seq_override = {}
+        rt.page_tokens = 32
+        rt.inrequest_compaction = True
+        rt.install = True
+        rt.install_row = False
+        rt.install_seq = True
+        rt.install_pos = False
+        rt.log = lambda record: None
+        rt.sync_row_from_engine("r", 1274, n_tokens=4096)
+        self.assertEqual(st.seq_len, 40768)
+        with self.assertRaisesRegex(SparseViewCapacityError, "44864.*40768"):
+            rt.before_step("r", row_index=0, position_slots=range(4096))
+        self.assertEqual(rt._seq_override, {})
+        self.assertEqual(int(seq[0]), 0)
+        with self.assertRaises(SparseViewCapacityError):
+            rt.before_step("r", row_index=0, position_slots=range(4096), rows_only=True)
+
+        # A completed, resident 36,864-token prefix plus a 4,096-token chunk needs exactly
+        # 1,280 pages; the same check must accept that correctly allocated row.
+        st.seq_len = 36864
+        st.row = tuple(range(101, 101 + 1280))
+        rt.before_step("r", row_index=0, position_slots=range(4096))
+        self.assertEqual(int(seq[0]), 40960)
+        self.assertEqual(rt._seq_override, {0: 40960})
+
 
 if __name__ == "__main__":
     unittest.main()

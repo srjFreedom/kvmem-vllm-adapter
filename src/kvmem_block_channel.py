@@ -105,10 +105,9 @@ class BlockChannelScheduler:
                             conn.sendall(json.dumps({"ok": bool(ok),
                                                     "truncated": bool(ok)}).encode())
                     elif kind == "session_park":
-                        if self._session_sink is not None:
-                            self._session_sink(req)
-                        self.sessions_parked += 1
-                        conn.sendall(json.dumps({"ok": True}).encode())
+                        # Legacy worker announcements cannot publish an unfenced TP checkpoint.
+                        # EngineCore.step now waits for every worker before exposing metadata.
+                        raise RuntimeError("session park requires EngineCore terminal acknowledgment")
                     else:
                         blocks = self._allocator(req.get("request"), int(req.get("count", 1)))
                         self.requests_served += 1

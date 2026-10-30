@@ -1361,7 +1361,7 @@ index 81bd6eb..891d194 100644
      if kv_cache_spec:
          # Reserve the null block BlockPool permanently holds back, so the check
 diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
-index 87fdbfb..0f73e6c 100644
+index 87fdbfb..7e8be2f 100644
 --- a/vllm/v1/core/sched/output.py
 +++ b/vllm/v1/core/sched/output.py
 @@ -2,7 +2,7 @@
@@ -1373,7 +1373,7 @@ index 87fdbfb..0f73e6c 100644
  from functools import cached_property
  from typing import TYPE_CHECKING
  
-@@ -43,11 +43,15 @@ class NewRequestData:
+@@ -43,11 +43,22 @@ class NewRequestData:
      block_ids: tuple[list[int], ...]
      num_computed_tokens: int
      lora_request: LoRARequest | None
@@ -1386,10 +1386,17 @@ index 87fdbfb..0f73e6c 100644
      prefill_token_ids: list[int] | None = None
 +    # Fresh admission following KVMem reconstruction, reset on every TP worker.
 +    kvmem_rebuilt: bool = False
++    # Native conversation namespace for KVMem prompt checkpoints. The worker still verifies the
++    # exact token prefix; these fields prevent unrelated conversations sharing a candidate.
++    session_id: str | None = None
++    cache_salt: str | None = None
++    # Explicit adoption signal: a full-resident checkpoint has logical == computed, so comparing
++    # the two books cannot tell a cache hit from an ordinary cold request.
++    kvmem_session_resume: bool = False
  
      @classmethod
      def from_request(
-@@ -69,10 +73,12 @@ class NewRequestData:
+@@ -69,10 +80,15 @@ class NewRequestData:
              pooling_params=request.pooling_params,
              block_ids=block_ids,
              num_computed_tokens=request.num_computed_tokens,
@@ -1399,10 +1406,13 @@ index 87fdbfb..0f73e6c 100644
              prompt_is_token_ids=request.prompt_is_token_ids,
              prefill_token_ids=prefill_token_ids,
 +            kvmem_rebuilt=getattr(request, "kvmem_rebuilt", False),
++            session_id=getattr(request, "session_id", None),
++            cache_salt=getattr(request, "cache_salt", None),
++            kvmem_session_resume=bool(getattr(request, "kvmem_session_resume", False)),
          )
  
      @property
-@@ -143,6 +149,8 @@ class CachedRequestData:
+@@ -143,6 +159,8 @@ class CachedRequestData:
      new_block_ids: list[tuple[list[int], ...] | None]
      num_computed_tokens: list[int]
      num_output_tokens: list[int]
@@ -1412,7 +1422,7 @@ index 87fdbfb..0f73e6c 100644
      # Version of dataclass repr with token IDs obfuscated.
      def anon_repr(self) -> str:
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 253ea9d..bfd1111 100644
+index 253ea9d..6935c40 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -1,6 +1,7 @@
@@ -1423,7 +1433,7 @@ index 253ea9d..bfd1111 100644
  import time
  from collections import defaultdict, deque
  from collections.abc import Iterable
-@@ -129,6 +130,23 @@ class Scheduler(SchedulerInterface):
+@@ -129,6 +130,26 @@ class Scheduler(SchedulerInterface):
              else self.scheduler_config.max_num_batched_tokens
          )
          self.max_model_len = vllm_config.model_config.max_model_len
@@ -1435,6 +1445,9 @@ index 253ea9d..bfd1111 100644
 +        _kvmem = _kvmem if isinstance(_kvmem, dict) else {}
 +        self.kvmem_resident = bool(_kvmem.get("inrequest_compaction"))
 +        self.kvmem_reconstruction_enabled = bool(_kvmem.get("compact_rebuild"))
++        self.kvmem_session_reuse = bool(_kvmem.get("session_reuse"))
++        self.kvmem_session_checkpoint_budget = int(_kvmem.get("budget_tokens") or 0)
++        self.kvmem_select_block_tokens = int(_kvmem.get("select_block_tokens") or 0)
 +        self.kvmem_ctx = int(_kvmem.get("ctx") or 0) or None
 +        if self.kvmem_resident:
 +            # KVMem exists precisely so the FULL sequence does not have to fit the pool: the
@@ -1447,7 +1460,7 @@ index 253ea9d..bfd1111 100644
          self.enable_kv_cache_events = (
              self.kv_events_config is not None
              and self.kv_events_config.enable_kv_cache_events
-@@ -213,6 +231,10 @@ class Scheduler(SchedulerInterface):
+@@ -213,6 +234,10 @@ class Scheduler(SchedulerInterface):
  
          # IDs of requests preempted since the last call to schedule().
          self.reset_preempted_req_ids: set[str] = set()
@@ -1458,7 +1471,7 @@ index 253ea9d..bfd1111 100644
  
          # Counter for requests waiting for streaming input. Used to calculate
          # number of unfinished requests
-@@ -332,6 +354,11 @@ class Scheduler(SchedulerInterface):
+@@ -332,6 +357,11 @@ class Scheduler(SchedulerInterface):
          self.scheduler_reserve_full_isl = (
              self.scheduler_config.scheduler_reserve_full_isl
          )
@@ -1470,7 +1483,7 @@ index 253ea9d..bfd1111 100644
          additional_config = vllm_config.additional_config
          self.prefill_batch_barrier = bool(
              isinstance(additional_config, dict)
-@@ -650,7 +677,7 @@ class Scheduler(SchedulerInterface):
+@@ -650,7 +680,7 @@ class Scheduler(SchedulerInterface):
              prefill_candidates = [
                  request
                  for request in self.running
@@ -1479,7 +1492,7 @@ index 253ea9d..bfd1111 100644
              ]
              # A newly arriving prefill must not pause an already decoding-only
              # batch. The barrier is for aligning an in-flight prefill cohort;
-@@ -668,7 +695,7 @@ class Scheduler(SchedulerInterface):
+@@ -668,7 +698,7 @@ class Scheduler(SchedulerInterface):
                  waiting_candidates = (
                      request
                      for request in self.waiting
@@ -1488,7 +1501,7 @@ index 253ea9d..bfd1111 100644
                      and request.request_id
                      not in self._prefill_barrier_admission_blocked
                  )
-@@ -677,7 +704,7 @@ class Scheduler(SchedulerInterface):
+@@ -677,7 +707,7 @@ class Scheduler(SchedulerInterface):
                  )
  
              remaining_prompts = [
@@ -1497,7 +1510,7 @@ index 253ea9d..bfd1111 100644
                  for request in prefill_candidates
              ]
              if remaining_prompts and barrier_has_running_prefill:
-@@ -740,7 +767,7 @@ class Scheduler(SchedulerInterface):
+@@ -740,7 +770,7 @@ class Scheduler(SchedulerInterface):
                  continue
  
              request_prefill_remaining = max(
@@ -1506,7 +1519,7 @@ index 253ea9d..bfd1111 100644
              )
              if (
                  prefill_frontier is not None
-@@ -789,10 +816,14 @@ class Scheduler(SchedulerInterface):
+@@ -789,10 +819,14 @@ class Scheduler(SchedulerInterface):
                  req_index += 1
                  continue
  
@@ -1522,7 +1535,7 @@ index 253ea9d..bfd1111 100644
              )
              if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                  num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-@@ -804,11 +835,16 @@ class Scheduler(SchedulerInterface):
+@@ -804,11 +838,16 @@ class Scheduler(SchedulerInterface):
  
              # Make sure the input position does not exceed the max model len.
              # This is necessary when using spec decoding.
@@ -1542,8 +1555,18 @@ index 253ea9d..bfd1111 100644
              )
  
              # Apply Mamba alignment before encoder caps.
-@@ -842,6 +878,21 @@ class Scheduler(SchedulerInterface):
+@@ -840,8 +879,31 @@ class Scheduler(SchedulerInterface):
+             num_new_tokens = self._reserve_prefill_lookahead(
+                 request, request.num_computed_tokens, num_new_tokens
              )
++            if (self.kvmem_session_reuse and self.num_spec_tokens == 0
++                    and request.session_id and num_new_tokens > 0):
++                from kvmem_session_store import clip_session_checkpoint_chunk
++                num_new_tokens = clip_session_checkpoint_chunk(
++                    request.num_logical_tokens, num_new_tokens,
++                    request.num_prompt_tokens, self.cache_config.block_size,
++                    self.kvmem_session_checkpoint_budget,
++                    getattr(self, "kvmem_select_block_tokens", 0))
  
              if num_new_tokens == 0:
 +                if self.kvmem_resident:
@@ -1564,7 +1587,7 @@ index 253ea9d..bfd1111 100644
                  # The request cannot be scheduled because one of the following
                  # reasons:
                  # 1. No new tokens to schedule. This may happen when
-@@ -881,6 +932,15 @@ class Scheduler(SchedulerInterface):
+@@ -881,6 +943,15 @@ class Scheduler(SchedulerInterface):
                          break
  
                      # The request cannot be scheduled.
@@ -1580,7 +1603,7 @@ index 253ea9d..bfd1111 100644
                      # Preempt the lowest-priority request.
                      if self.policy == SchedulingPolicy.PRIORITY:
                          preempted_req = max(
-@@ -947,6 +1007,17 @@ class Scheduler(SchedulerInterface):
+@@ -947,6 +1018,17 @@ class Scheduler(SchedulerInterface):
              req_index += 1
  
              # Speculative decode related.
@@ -1598,7 +1621,7 @@ index 253ea9d..bfd1111 100644
              if request.spec_token_ids:
                  num_scheduled_spec_tokens = (
                      num_new_tokens
-@@ -1009,7 +1080,7 @@ class Scheduler(SchedulerInterface):
+@@ -1009,7 +1091,7 @@ class Scheduler(SchedulerInterface):
                  request_id = request.request_id
  
                  request_prefill_remaining = max(
@@ -1607,7 +1630,7 @@ index 253ea9d..bfd1111 100644
                  )
                  if (
                      prefill_frontier is not None
-@@ -1187,7 +1258,9 @@ class Scheduler(SchedulerInterface):
+@@ -1187,7 +1269,9 @@ class Scheduler(SchedulerInterface):
                      # We use `request.num_tokens` instead of
                      # `request.num_prompt_tokens` to consider the resumed
                      # requests, which have output tokens.
@@ -1618,7 +1641,7 @@ index 253ea9d..bfd1111 100644
  
                      # Pad new decode requests to uniform spec decoding size to
                      # preserve full cudagraph for this step.
-@@ -1217,7 +1290,7 @@ class Scheduler(SchedulerInterface):
+@@ -1217,7 +1301,7 @@ class Scheduler(SchedulerInterface):
                      if 0 < threshold < num_new_tokens:
                          num_new_tokens = threshold
                      if (
@@ -1627,7 +1650,7 @@ index 253ea9d..bfd1111 100644
                          and prefill_frontier_step is not None
                      ):
                          num_new_tokens = min(num_new_tokens, prefill_frontier_step)
-@@ -1679,6 +1752,111 @@ class Scheduler(SchedulerInterface):
+@@ -1679,6 +1763,111 @@ class Scheduler(SchedulerInterface):
  
          return new_block_ids_to_zero or None
  
@@ -1739,7 +1762,7 @@ index 253ea9d..bfd1111 100644
      def _preempt_request(
          self, request: Request, timestamp: float, drop_stale_output: bool = False
      ) -> None:
-@@ -1700,6 +1878,10 @@ class Scheduler(SchedulerInterface):
+@@ -1700,6 +1889,10 @@ class Scheduler(SchedulerInterface):
          self._inflight_prefills.discard(request)
          request.status = RequestStatus.PREEMPTED
          request.num_computed_tokens = 0
@@ -1750,7 +1773,7 @@ index 253ea9d..bfd1111 100644
          if request.spec_token_ids:
              request.spec_token_ids = []
          # Async scheduling: mark all in-flight output as stale. Its tokens are
-@@ -1736,11 +1918,33 @@ class Scheduler(SchedulerInterface):
+@@ -1736,11 +1929,33 @@ class Scheduler(SchedulerInterface):
          for req_id, num_scheduled_token in num_scheduled_tokens.items():
              request = self.requests[req_id]
              request.num_computed_tokens += num_scheduled_token
@@ -1785,7 +1808,7 @@ index 253ea9d..bfd1111 100644
                  request.num_tokens + request.num_output_placeholders
              )
              scheduler_output.has_structured_output_requests |= (
-@@ -1828,6 +2032,7 @@ class Scheduler(SchedulerInterface):
+@@ -1828,6 +2043,7 @@ class Scheduler(SchedulerInterface):
          new_block_ids: list[tuple[list[int], ...] | None] = []
          all_token_ids: dict[str, list[int]] = {}
          num_computed_tokens: list[int] = []
@@ -1793,7 +1816,7 @@ index 253ea9d..bfd1111 100644
          num_output_tokens: list[int] = []
          resumed_req_ids = set()
  
-@@ -1860,6 +2065,7 @@ class Scheduler(SchedulerInterface):
+@@ -1860,6 +2076,7 @@ class Scheduler(SchedulerInterface):
                  req_to_new_blocks[req_id].get_block_ids(allow_none=True)
              )
              num_computed_tokens.append(req.num_computed_tokens)
@@ -1801,7 +1824,7 @@ index 253ea9d..bfd1111 100644
              num_output_tokens.append(
                  req.num_output_tokens + req.num_output_placeholders
              )
-@@ -1871,6 +2077,7 @@ class Scheduler(SchedulerInterface):
+@@ -1871,6 +2088,7 @@ class Scheduler(SchedulerInterface):
              all_token_ids=all_token_ids,
              new_block_ids=new_block_ids,
              num_computed_tokens=num_computed_tokens,
@@ -1809,7 +1832,7 @@ index 253ea9d..bfd1111 100644
              num_output_tokens=num_output_tokens,
          )
  
-@@ -2170,6 +2377,14 @@ class Scheduler(SchedulerInterface):
+@@ -2170,6 +2388,14 @@ class Scheduler(SchedulerInterface):
                  # In this case, we use is_finished() to check.
                  continue
  
@@ -1824,7 +1847,7 @@ index 253ea9d..bfd1111 100644
              # Drop-mode stale output (same-step resume) is discarded entirely.
              if output_is_stale and request.drop_stale_output:
                  continue
-@@ -2179,6 +2394,28 @@ class Scheduler(SchedulerInterface):
+@@ -2179,6 +2405,28 @@ class Scheduler(SchedulerInterface):
                  sampled_token_ids[req_index] if sampled_token_ids else []
              )
  
@@ -1853,7 +1876,7 @@ index 253ea9d..bfd1111 100644
              scheduled_spec_token_ids = (
                  scheduler_output.scheduled_spec_decode_tokens.get(req_id)
              )
-@@ -2196,6 +2433,11 @@ class Scheduler(SchedulerInterface):
+@@ -2196,6 +2444,11 @@ class Scheduler(SchedulerInterface):
                  if not output_is_stale:
                      if request.num_computed_tokens > 0:
                          request.num_computed_tokens -= num_rejected
@@ -1865,7 +1888,7 @@ index 253ea9d..bfd1111 100644
                      if request.num_output_placeholders > 0:
                          request.num_output_placeholders -= num_rejected
                  spec_decoding_stats = self.make_spec_decoding_stats(
-@@ -2246,7 +2488,7 @@ class Scheduler(SchedulerInterface):
+@@ -2246,7 +2499,7 @@ class Scheduler(SchedulerInterface):
                  stopped = True
              elif (
                  self.is_mm_encoder_only
@@ -1874,7 +1897,7 @@ index 253ea9d..bfd1111 100644
              ):
                  # An encoder instance runs the encoder and publishes the
                  # embeddings instead of sampling, so it stops as soon as the
-@@ -2577,7 +2819,13 @@ class Scheduler(SchedulerInterface):
+@@ -2577,7 +2830,13 @@ class Scheduler(SchedulerInterface):
  
              # Check for stop and update request state.
              # This must be called before we make the EngineCoreOutput.
@@ -1889,7 +1912,7 @@ index 253ea9d..bfd1111 100644
              if stopped:
                  del new_token_ids[num_new:]  # Trim new tokens if needed.
                  break
-@@ -2637,6 +2885,17 @@ class Scheduler(SchedulerInterface):
+@@ -2637,6 +2896,17 @@ class Scheduler(SchedulerInterface):
                      request.spec_token_ids = []
                  continue
  
@@ -1907,7 +1930,7 @@ index 253ea9d..bfd1111 100644
              # Add newly generated spec token ids to the request.
              if self.structured_output_manager.should_advance(request):
                  metadata = request.structured_output_request
-@@ -2800,6 +3059,8 @@ class Scheduler(SchedulerInterface):
+@@ -2800,6 +3070,8 @@ class Scheduler(SchedulerInterface):
  
          self.encoder_cache_manager.free(request)
          request_id = request.request_id
@@ -1916,7 +1939,7 @@ index 253ea9d..bfd1111 100644
          self._prefill_barrier_admission_blocked.discard(request_id)
          self.finished_req_ids.add(request_id)
          if self.finished_req_ids_dict is not None:
-@@ -3005,6 +3266,16 @@ class Scheduler(SchedulerInterface):
+@@ -3005,6 +3277,16 @@ class Scheduler(SchedulerInterface):
          connector_stats_payload = (
              kv_connector_stats.to_dict() if kv_connector_stats else None
          )
@@ -1933,7 +1956,7 @@ index 253ea9d..bfd1111 100644
          return SchedulerStats(
              num_running_reqs=len(self.running),
              num_waiting_reqs=len(self.waiting),
-@@ -3017,6 +3288,8 @@ class Scheduler(SchedulerInterface):
+@@ -3017,6 +3299,8 @@ class Scheduler(SchedulerInterface):
              kv_connector_stats=connector_stats_payload,
              cudagraph_stats=cudagraph_stats,
              perf_stats=perf_stats,
@@ -1942,7 +1965,7 @@ index 253ea9d..bfd1111 100644
          )
  
      def make_spec_decoding_stats(
-@@ -3322,6 +3595,7 @@ class Scheduler(SchedulerInterface):
+@@ -3322,6 +3606,7 @@ class Scheduler(SchedulerInterface):
                      marked_invalid_block_ids |= request_invalid_block_ids
                      total_affected_tokens += req_num_computed_tokens
                      request.num_computed_tokens = 0

@@ -45,6 +45,8 @@ class SessionBudgetPool:
         session = int(session)
         if session in self._grants:
             return self._grants[session]
+        if len(self._grants) >= self.sessions:
+            raise BudgetError(f"all {self.sessions} host session shares are assigned")
         share = self.host_bytes // self.sessions
         self._grants[session] = SessionGrant(session, share)
         return self._grants[session]
@@ -55,6 +57,9 @@ class SessionBudgetPool:
 
     def grant(self, session):
         return self._grants[int(session)]
+
+    def active_sessions(self):
+        return len(self._grants)
 
     # --- accounting -------------------------------------------------------------------
     def charge(self, session, nbytes):

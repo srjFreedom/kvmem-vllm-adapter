@@ -1,8 +1,14 @@
 # KVMem owns the CLI: --kvmem-* must be the authority and translate exactly into the backend's
 # plugin configuration (same names/meanings as the llama.cpp and NInfer workers).
+import contextlib
+import io
 import json
+import os
 import subprocess
 import sys
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
 
 PY = sys.executable
 WORKER = "scripts/kvmem-vllm-worker.py"
@@ -60,6 +66,9 @@ def main():
     # Multi-sequence is a backend choice; the worker maps it to the 4-way launcher.
     plan, _ = run("--max-num-seqs", "4", "--max-model-len", "32768")
     check(plan["backend_args"]["max_num_seqs"] == 4, "concurrency is a backend argument")
+    _, err = run("--max-num-seqs", "2", "--kvmem-sessions", "1")
+    check("must be >= --max-num-seqs" in err,
+          "H-tier shares must cover simultaneous active requests")
 
     # In-request compaction rewrites the block table mid-request, so it must outweigh an explicit
     # async request; with compaction off the caller's choice stands and async stays the default.
@@ -85,6 +94,56 @@ def main():
           "engine compaction off forces the entry ceiling back to R")
     check(backend_worker.entry_compaction_env({"inrequest_compaction": False}, {}) == ("0", None),
           "without compaction the entry flag is off and silent")
+
+    # Session reuse is opt-in and MTP is refused until draft StateImage is checkpointed.
+    for value, expected in (("0", False), ("1", True)):
+        out = io.StringIO()
+        with patch.dict(os.environ, {"KVMEM_SESSION_REUSE": value}), \
+                contextlib.redirect_stdout(out):
+            rc = backend_worker.main(["--model", "/tmp/unused-model",
+                                     "--kvmem-inrequest-compaction",
+                                     "--speculative-tokens", "0", "--dry-run"])
+        dry = json.loads(out.getvalue())
+        check(rc == 0 and bool(dry["plugin_config"].get("session_reuse", False)) is expected,
+              f"KVMEM_SESSION_REUSE={value} maps to session_reuse={expected}")
+    with patch.dict(os.environ, {"KVMEM_SESSION_REUSE": "1"}):
+        try:
+            backend_worker.main(["--model", "/tmp/unused-model",
+                                 "--kvmem-inrequest-compaction", "--dry-run"])
+        except SystemExit as exc:
+            check("requires explicit --speculative-tokens 0" in str(exc),
+                  "MTP and session checkpointing fail closed at startup")
+        else:
+            check(False, "MTP and session checkpointing must not start together")
+
+    # The site script passes 0 explicitly: never let Python's `0 or -1` fall back to the
+    # MTP-enabled launcher profile. Mock only the final subprocess, not argument parsing.
+    with patch.object(backend_worker.subprocess, "call", return_value=0) as launch:
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = backend_worker.main(["--model", "/tmp/unused-model",
+                                      "--speculative-tokens", "0"])
+    args = launch.call_args.args[0]
+    check(rc == 0 and "SPECULATIVE_TOKENS=0" in args and "SPECULATIVE_METHOD=none" in args,
+          "zero speculative tokens disables the launcher profile's MTP method")
+    check(launch.call_args.kwargs["env"]["SPECULATIVE_TOKENS"] == "0",
+          "zero speculative tokens survives the worker environment")
+
+    # Exercise the actual shell -> worker boundary without starting an engine. FOREGROUND avoids
+    # the legacy launcher cleanup path; a stub worker only writes its received CLI arguments.
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        backend = root / "backends" / "vllm"
+        backend.mkdir(parents=True)
+        (backend / "worker.py").write_text(
+            "import json, sys\nprint(json.dumps(sys.argv[1:]))\n")
+        env = {**os.environ, "ADAPTER": temp, "MODEL": temp,
+               "VLLM_PY": sys.executable, "FOREGROUND": "1", "SPECULATIVE_TOKENS": "0",
+               "LOG": str(root / "launch.log"), "PARAMS_FILE": str(root / "params.env")}
+        out = subprocess.run(["bash", "deploy/run-kvmem-vllm.sh"], env=env,
+                             text=True, capture_output=True, timeout=10)
+        args = json.loads((root / "launch.log").read_text().splitlines()[-1])
+        check(out.returncode == 0 and args[-2:] == ["--speculative-tokens", "0"],
+              "shell entrypoint forwards explicit zero to the backend worker")
 
     print("PASS worker_cli_test" if not failed else "FAILED worker_cli_test")
     sys.exit(0 if not failed else 1)

@@ -216,7 +216,7 @@ INTEGRATION-SURFACE.md      vLLM 接触点清单与源码改动登记
 - **in-request compaction 是默认路径**，但比朴素路径更精细：会强制关闭前缀缓存；工作集必须留在池内
   （超池 prompt 依赖 prefill 期压缩）；新生成块没有检索分数（运行时强制保留 recent 尾部）；
   带投机 draft 的步不做压缩。目前只验证了单条长文本请求，并发未验证
-- `SESSIONS` 的语义是**把 H 平分给活请求**；请求结束即释放，不等同于参考后端的"保留 N 个非活跃历史"
+- `SESSIONS` 是 H 层同时占用的份额数，须不小于并发数 `N`。默认请求结束就释放；显式开启尚未验收的会话停放时，空闲 checkpoint 继续占用一份，新的冷请求会先淘汰旧 checkpoint
 - 未实现参考后端的三级磁盘/会话冷存（`nvme-gb`、`session-cache-dir`）与 NVMe 页级存储
 - UI 的"停止生成"等用法依赖 llama.cpp/ninfer 的服务端扩展接口（`/v1/chat/completions/control`、
   `/v1/stream`、`/slots`），vLLM 没有，会 404
