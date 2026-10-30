@@ -2780,11 +2780,12 @@ class VllmSparseRuntime:
                 _r0 = [int(x) for x in (rank or ())]
                 _nb = -(-int(getattr(orch, "needle_page", 0) or 0) // bp) if hasattr(orch, "needle_page") else None
                 self.log({"kind": "rebuild_select_diag", "req": req,
-                          "rank_n": len(_r0), "rank_head": _r0[:40],
+                          "rank_n": len(_r0), "rank_head": _r0[:12], "rank_tail": _r0[-24:],
                           "scored_blocks": len(scored_blocks),
-                          "scored_sample": sorted(scored_blocks)[:30],
+                          "scored_top": sorted(scored_blocks)[-40:],
                           "tail_blocks": sorted(tail_blocks),
-                          "chosen": len(chosen), "chosen_head": chosen[:30],
+                          "chosen": len(chosen), "chosen_head": chosen[:12],
+                          "chosen_tail": chosen[-24:],
                           "want": len(logical_pages),
                           "packed": int(done), "store_missing": int(missing)})
         except Exception as exc:
