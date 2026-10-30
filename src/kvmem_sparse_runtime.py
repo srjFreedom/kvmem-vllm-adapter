@@ -3038,6 +3038,24 @@ class VllmSparseRuntime:
                           "tokens": int(st.tokens), "seq_len": int(st.seq_len),
                           "page": int(self.page_tokens)})
             return st
+        if (bool(getattr(self, "blockwise_view", False)) is False
+                and (getattr(self, "compact_mode", None) or "") == "prefix"
+                and int(st.tokens) > int(st.seq_len) > 0):
+            # prefix mode is retirement REPORTING only; while a request is decoding, every
+            # step would re-enter this blocking collective_rpc (the trigger re-fires because
+            # pressure never clears). Report once and leave - the next prompt-complete or a
+            # new epoch re-enters through the final path. (Measured: decode crawled on
+            # per-step 120s-timeout RPC + mirror traffic.)
+            if self.log is not None and int(getattr(st, "tokens", 0)) != getattr(
+                    self, "_last_report_tokens", {}).get(req, -1):
+                self._last_report_tokens = getattr(self, "_last_report_tokens", {})
+                self._last_report_tokens[req] = int(st.tokens)
+                self.log({"kind": "prefix_report", "req": req,
+                          "resident": int(st.seq_len), "tokens": int(st.tokens),
+                          "budget": int(self.budget_tokens),
+                          "pages": len(st.row or ()), "decoding": True})
+            self._last_proposal = None
+            return st
         cap = getattr(self, "capture", None)
         if cap is not None and getattr(self, "retrieval_enabled", False):
             try:

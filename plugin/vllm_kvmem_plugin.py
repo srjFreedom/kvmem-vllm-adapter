@@ -1136,6 +1136,35 @@ def _attach_sparse(runner, log_path):
                 _reqs = list(getattr(_b, "req_ids", None) or [])
                 if rs is not None and _reqs:
                     _fix_book_for_view(rs, _b, _reqs)
+                _rt0 = state.get("sparse")
+                if (_rt0 is not None and bool(getattr(_rt0, "sched_compact", False))
+                        and rs is not None and _reqs):
+                    # Keep the device book pair aligned to `st.seq_len` for any rewound/compacted
+                    # request. Measured drift (decode probe): the scheduler feed pushes np back to
+                    # the LOGICAL count while the GPU tensor self-accumulates from the sampler -
+                    # positions, seq_lens and slot mappings all read np, so after a compaction the
+                    # model gets logical positions against a view-ranked table (write page 1298
+                    # with a 1,274-page row; the phase gap equals the compacted length). The two
+                    # books must read the RESIDENT length here; `st.seq_len` is the single source
+                    # the boundary protocol maintains.
+                    try:
+                        _stt = getattr(_rt0, "_state", {})
+                        for _rq in _reqs:
+                            _st1 = _stt.get(_rq) if _stt else None
+                            if _st1 is None:
+                                continue
+                            if not bool(getattr(_st1, "applied_view_coord", False)):
+                                continue
+                            _v = int(getattr(_st1, "seq_len", 0) or 0)
+                            _idx = rs.req_id_to_index.get(_rq)
+                            if _idx is None or _v <= 0:
+                                continue
+                            if int(rs.num_computed_tokens_np[_idx]) != _v:
+                                rs.num_computed_tokens_np[_idx] = _v
+                            if int(rs.num_computed_tokens.gpu[_idx].item()) != _v:
+                                rs.num_computed_tokens.gpu[_idx] = _v
+                    except Exception:
+                        pass
             except Exception:
                 pass
             original_prepare(idx_mapping, query_start_loc, num_computed_tokens, positions,
@@ -2479,7 +2508,20 @@ def _install(cls, module_name, probe, smoke, state):
                             # point. Reading at its entry used the NEW cursor with OLD GPU pages;
                             # before_step then wrote that stale prefix over the valid new blocks.
                             bt = self.block_tables
-                            for group, pages_per_block in enumerate(bt.blocks_per_kv_block):
+                            # prefix (retirement) mode needs NO per-step row mirror: the engine
+                            # reads its own dense table and the worker books only audit it. The
+                            # mirror issued a 6,272-column PCIe `tolist()` per request per step -
+                            # the dominant decode-step cost (measured: ~88K request, every step).
+                            _prefix_mode = (bool(getattr(rt, "sched_compact", False))
+                                            and (getattr(rt, "compact_mode", None) or "")
+                                                .startswith("prefix"))
+                            if _prefix_mode:
+                                _sync_iter = ()
+                            else:
+                                _sync_iter = ((g, ppb) for g, ppb
+                                              in enumerate(bt.blocks_per_kv_block)
+                                              if int(ppb) > 1)
+                            for group, pages_per_block in _sync_iter:
                                 if int(pages_per_block) > 1:
                                     for pos, req in enumerate(reqs):
                                         if rt.is_rebuilt(req):
