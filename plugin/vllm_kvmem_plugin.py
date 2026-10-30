@@ -2515,6 +2515,17 @@ def _install(cls, module_name, probe, smoke, state):
                         # the worker has with the final chunk already committed to the store.
                         _rq = getattr(runtime, "_rebuild_queue", None)
                         if _rq and req in _rq:
+                            # act only when the WHOLE prompt is resident (the frozen question is
+                            # then in the captured window and the store has every page); re-arm
+                            # otherwise - a pressure queue during a long prefill must never
+                            # rebuild over a partial prompt.
+                            _pl0 = int(runtime._prompt_len.get(req, 0) or 0)
+                            _st0 = runtime._state.get(req)
+                            _tk0 = int(getattr(_st0, "tokens", 0) or 0) if _st0 else 0
+                            if _pl0 and 0 < _tk0 < _pl0 - 2 * int(runtime.page_tokens):
+                                _rq.pop(req, None)
+                                _rq[req] = _tk0
+                            else:
                                 try:
                                     _ok, _det = runtime._rebuild_select(req)
                                     if _ok:
