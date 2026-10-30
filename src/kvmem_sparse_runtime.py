@@ -1805,6 +1805,7 @@ class VllmSparseRuntime:
             # Absorb the engine's row ONCE per step, not per token: `row.tolist()` inside the loop
             # made a long prefill quadratic (53K tokens x a 3.4K-entry row).
             self._absorb_engine_row(req)
+            refused = []
             for i in range(n_new_tokens):
                 logical = (st.tokens + i) // self.page_tokens
                 if logical in orch.store.pages:
@@ -1816,7 +1817,12 @@ class VllmSparseRuntime:
                     continue
                 # No view is installed yet, so the engine wrote these tokens at their TRUE
                 # positions: the page's bytes carry no offset from its logical start.
-                orch.commit_written_page(logical, slot, baked=0)
+                if not orch.commit_written_page(logical, slot, baked=0):
+                    refused.append((int(logical), int(slot)))
+            if refused and self.log is not None:
+                self.log({"kind": "commit_refused_zero", "req": req, "dense": True,
+                          "count": len(refused), "sample": refused[:8],
+                          "tokens": int(st.tokens), "seq_len": int(st.seq_len)})
             st.tokens += n_new_tokens
             orch.note_tokens(st.tokens)
         elif st.row and n_new_tokens:
@@ -1825,6 +1831,7 @@ class VllmSparseRuntime:
             # compacted positions starting at st.seq_len. A newly crossed page needs a fresh slot
             # appended to the row; the spare slot taken at reselect is the first of those.
             start = st.seq_len
+            refused = []
             # A newly crossed page needs a slot appended to the row. This is correct for BOTH
             # prefill and decode (a decode step normally consumes the spare slot, so it is a
             # no-op there); gating it on the prefill flag broke streaming after a pressure
@@ -1930,11 +1937,33 @@ class VllmSparseRuntime:
                 # baked `(rank - logical) * page_tokens` away from its logical start. Recording the
                 # rank (not the engine page id) is what lets a later resume, or a second request
                 # whose pool pages start at another base, restore the page to the right position.
-                orch.commit_written_page(
-                    logical, slot,
-                    baked=0 if self._pure_copy() else (rank - logical) * self.page_tokens)
+                if not orch.commit_written_page(
+                        logical, slot,
+                        baked=0 if self._pure_copy() else (rank - logical) * self.page_tokens):
+                    refused.append((int(logical), int(slot), int(rank)))
                 if st.spare == slot:
                     st.spare = None
+            if refused and self.log is not None:
+                # The zero guard converted store poisoning into MISSING pages: the page is absent,
+                # the selection cannot offer it, and Core (rightly) refuses a view without the
+                # tail. This is the live signature of "commit reads a page the engine wrote
+                # elsewhere" - the sample gives logical/slot/rank to compare with the map probe.
+                entry = {"kind": "commit_refused_zero", "req": req, "dense": False,
+                         "count": len(refused), "sample": refused[:8],
+                         "tokens": int(st.tokens), "seq_len": int(st.seq_len)}
+                try:
+                    import torch as _t
+                    dev0 = list(self._orch[req].kvs)[0]
+                    sums = dev0.view(_t.uint8).to(_t.int32).sum(dim=(1, 2, 3)).to("cpu").tolist()
+                    entry["nonzero_pages"] = int(sum(1 for v in sums if v > 1000))
+                    want = {}
+                    for lg_, sl_, rk_ in refused[:4]:
+                        want[f"slot_{lg_}"] = sums[sl_] if sl_ < len(sums) else None
+                        want[f"rank_{lg_}"] = sums[rk_] if rk_ < len(sums) else None
+                    entry["sums_at_refused"] = want
+                except Exception:
+                    pass
+                self.log(entry)
             st.tokens += n_new_tokens
             st.seq_len += n_new_tokens
             orch.note_tokens(st.tokens)
