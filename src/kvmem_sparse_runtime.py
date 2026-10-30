@@ -2726,11 +2726,13 @@ class VllmSparseRuntime:
                                        for p in range(2500, 2506)],
                           "store_head": [int(orch.store.has(p)) for p in range(6)],
                           "store_mid": [int(orch.store.has(p)) for p in range(2500, 2506)]})
-            scored_blocks = set()
+            ppb_sel = int(orch.selector.pages_per_selection_block())
+            rank_blocks = []
             if rank is not None:
-                ppb_sel = int(orch.selector.pages_per_selection_block())
                 for p in rank:
-                    scored_blocks.add(int(p) // ppb_sel)
+                    b = int(p) // ppb_sel
+                    if b not in rank_blocks:
+                        rank_blocks.append(b)          # RANK ORDER, not page order
             tail_blocks = {p // bp for p in forced_tail}
             # a block enters the pack ONLY when every page inside it is complete AND has
             # canonical store bytes (or is the engine-resident tail): a hole would shift
@@ -2742,11 +2744,10 @@ class VllmSparseRuntime:
                     if not (orch.store.has(p) or p >= tail_first):
                         return False
                 return True
-            good = {b for b in scored_blocks if block_ok(b)}
-            good |= {b for b in tail_blocks if block_ok(b)}
-            middle = sorted(good - tail_blocks)
-            middle = middle[:max(0, cap_engine_blocks - len(tail_blocks))]
-            chosen = sorted(middle + list(tail_blocks))
+            room = max(0, cap_engine_blocks - len(tail_blocks))
+            middle = [b for b in rank_blocks
+                      if b not in tail_blocks and block_ok(b)][:room]
+            chosen = sorted(set(middle) | tail_blocks)
             logical_pages = sorted({p for b in chosen for p in
                                     range(b * bp, (b + 1) * bp) if p < n_pages})
             missing = 0
