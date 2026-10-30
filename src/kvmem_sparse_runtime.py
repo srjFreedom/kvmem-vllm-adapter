@@ -1889,6 +1889,15 @@ class VllmSparseRuntime:
                 # its pages are committed to the host store, so `_reselect` selects only pages that
                 # really carry bytes.
                 _plen = int(self._prompt_len.get(req, 0) or 0)
+                # Byte probe at prompt completion, independent of any shrink decision: this is the
+                # one moment both the baseline run and the compaction run have the FULL prompt
+                # committed, so the same logical page can be fingerprinted and compared.
+                if (_plen and int(st.tokens) >= _plen
+                        and list(getattr(self, "trace_pages", ()) or ())
+                        and req not in getattr(self, "_prompt_end_traced", set())):
+                    self._prompt_end_traced = getattr(self, "_prompt_end_traced", set())
+                    self._prompt_end_traced.add(req)
+                    self._trace_pages(req, list(self.trace_pages))
                 if (_plen and int(st.tokens) >= _plen and not st.query_reselected
                         and not bool(getattr(self, "sched_compact", False))):
                     # Socket shrink is disabled in Core-boundary mode: the step wrapper's final
@@ -2015,6 +2024,22 @@ class VllmSparseRuntime:
             return result
         return st
 
+    def _page_fingerprint(self, tensors):
+        """Digest of a page's raw bytes (sha256 over all layers). Cross-run byte equality is the
+        only way to validate the CANONICAL store bytes: the device-vs-store check in `needle()` is
+        self-consistent (both sides come from the same wrong slot if the capture read one), so it
+        cannot prove the capture was right. A baseline run (no compaction, correct answer) and the
+        compaction run must fingerprint the same logical pages identically."""
+        try:
+            import hashlib
+            import torch
+            h = hashlib.sha256()
+            for t in tensors:
+                h.update(t.detach().to("cpu").contiguous().view(torch.uint8).numpy().tobytes())
+            return h.hexdigest()[:16]
+        except Exception:
+            return None
+
     def _trace_pages(self, req, pages):
         """Diagnostic: for a few pages, show every number the needle depends on."""
         orch = self._orch.get(req)
@@ -2022,13 +2047,23 @@ class VllmSparseRuntime:
         if orch is None or st is None or self.log is None:
             return
         rows = []
-        for page in pages[:4]:
+        for page in pages[:8]:
+            slot = orch.slot_of.get(page)
+            dig_store = dig_dev = None
+            try:
+                if orch.store.has(page):
+                    dig_store = self._page_fingerprint(orch.store.get(page))
+                if slot is not None:
+                    dig_dev = self._page_fingerprint([kv[int(slot)] for kv in orch.kvs])
+            except Exception:
+                pass
             rows.append({"page": int(page),
                          "engine_page": int(self._page_map.get(req, {}).get(page, 0)),
                          "compacted_slot": (int(st.row.index(page)) if page in st.row else None),
                          "slot_of": int(orch.slot_of.get(page, -1)),
                          "store_delta": int(orch.store_delta.get(page, 0)),
                          "baked_delta": int(orch.baked_delta.get(page, 0)),
+                         "store_sha": dig_store, "device_sha": dig_dev,
                          "needle": orch.needle(page)})
         self.log({"kind": "needle_trace", "req": req, "tokens": st.tokens, "rows": rows})
 
@@ -2120,6 +2155,14 @@ class VllmSparseRuntime:
         finally:
             self._in_quiescent = False
         proposal = getattr(self, "_last_proposal", None)
+        if proposal is not None:
+            # Byte probe (KVMEM_TRACE_PAGES): fingerprint the canonical store bytes and the device
+            # bytes at the slot the proposal just installed. The store-vs-device `needle` check is
+            # self-consistent, so a WRONG-SLOT capture would pass it; the sha lets the same page be
+            # compared between the baseline (correct) run and the compaction run.
+            _tp = list(getattr(self, "trace_pages", ()) or ())
+            if _tp and self.log is not None:
+                self._trace_pages(req, _tp)
         if proposal is None:
             # Diagnostic: Core saw "incomplete TP compaction proposal" with no field saying why
             # (alignment deferral, empty selection and a refused planner all looked alike).

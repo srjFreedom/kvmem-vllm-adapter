@@ -1035,6 +1035,12 @@ def _attach_sparse(runner, log_path):
         _append(log_path, {"kind": "capture_attach_error", "error": traceback.format_exc()})
     runtime.sessions = int(cfg.get("sessions", 4))
     runtime.needle_trace = int(cfg.get("needle_trace", 0))
+    # Byte probe (env-only, cross-run comparison): comma-separated LOGICAL page numbers whose
+    # store/device fingerprints are logged at prompt completion and after every quiescent
+    # proposal. A wrong-slot commit capture is invisible to the self-consistent device==store
+    # needle check; equal shas between the baseline run and the compaction run are not.
+    runtime.trace_pages = [int(x) for x in (os.environ.get("KVMEM_TRACE_PAGES", "")
+                                            .replace(",", " ").split()) if x.isdigit()]
     for _orch in ():  # placeholder: configured per request when the orchestrator is created
         pass
     # Bisect switches (env-only, for live diagnosis): turn one piece of the view install off at a
