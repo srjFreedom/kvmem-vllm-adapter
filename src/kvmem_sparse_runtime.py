@@ -2707,21 +2707,11 @@ class VllmSparseRuntime:
             cap_pages = max(bp * 2, cap_pages)
             orch.max_select_pages_override = cap_pages
             try:
-                stats_ = orch.reselect(mandatory_pages=forced_tail,
-                                       forced_pages=forced_tail,
-                                       prefill_pressure=False, rebake=False)
+                orch.reselect(slots=lambda count: pool_pages[:count],
+                              mandatory_pages=forced_tail, forced_pages=forced_tail,
+                              prefill_pressure=False, rebake=True)
                 selected = [int(p) for p in
                             (orch.last_view.row_pages if orch.last_view else ())]
-                if self.log is not None:
-                    self.log({"kind": "picker_probe", "req": req, "cap": int(cap_pages),
-                              "sel_n": len(selected), "stats": str(stats_)[:120],
-                              "blocks": int(getattr(orch.selector, "selection_blocks", lambda: -1)()),
-                              "budget_pages": int(getattr(
-                                  orch.selector, "budget_pages", lambda: -1)()),
-                              "ppb": int(getattr(orch.selector, "pages_per_selection_block",
-                                                 lambda: -1)()),
-                              "total_tokens": int(orch.total_tokens)})
-                return False, "picker probe only"
             finally:
                 orch.max_select_pages_override = None
         except Exception as exc:
