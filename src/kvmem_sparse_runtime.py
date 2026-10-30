@@ -2710,6 +2710,17 @@ class VllmSparseRuntime:
                 rank = orch.selector.select_pages(forced_tail)
             except Exception:
                 rank = None
+            if self.log is not None:
+                _r0 = [int(x) for x in (rank or ())]
+                self.log({"kind": "rebuild_ns_probe", "req": req,
+                          "rank_len": len(_r0), "rank_head": _r0[:6], "rank_tail": _r0[-6:],
+                          "ppb_sel": int(orch.selector.pages_per_selection_block()),
+                          "row_head": [int(p) for p in (st.row or ())[:6]],
+                          "slot_head": [int(orch.slot_of.get(p, -1)) for p in range(6)],
+                          "slot_mid": [int(orch.slot_of.get(p, -1))
+                                       for p in range(2500, 2506)],
+                          "store_head": [int(orch.store.has(p)) for p in range(6)],
+                          "store_mid": [int(orch.store.has(p)) for p in range(2500, 2506)]})
             scored_blocks = set()
             if rank is not None:
                 ppb_sel = int(orch.selector.pages_per_selection_block())
