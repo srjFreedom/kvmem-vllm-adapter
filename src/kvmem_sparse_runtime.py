@@ -152,6 +152,8 @@ class VllmSparseRuntime:
         # post-block must not add the same tokens again.
         self._advance_owns_accounting = True
         self._prev_n = {}
+        self._slot_span = {}
+        self._slot_span_prev = {}
         self._pending_frontier = {}
         self._pending_new = {}
         # Tokens scheduled for the step that is executing right now (0 outside a step). A
@@ -321,6 +323,29 @@ class VllmSparseRuntime:
         return True
 
     # --- state -------------------------------------------------------------------------
+    def slot_pages_for(self, req):
+        """Physical page ids the LAST forward wrote, per query token, from the attention
+        kernels' own slot mapping (the ONLY address that is by construction where the bytes
+        landed - the block-table tensor this plugin reads is a staging copy that the engine
+        rewrites from its own bookkeeping each step). Returns {qpos: page} over the span the
+        runtime recorded at the previous step, or None."""
+        try:
+            span = self._slot_span_prev.get(req)
+            if not span:
+                return None
+            sm = self.view.runner.block_tables.slot_mappings
+            g = self.view.attn_groups[0]
+            row = sm[g]
+            out = {}
+            for q in range(int(span[0]), int(span[1])):
+                if q < int(row.shape[0]):
+                    slot = int(row[q])
+                    if slot >= 0:
+                        out[q] = slot // self.page_tokens
+            return out or None
+        except Exception:
+            return None
+
     def _absorb_engine_row(self, req):
         """Record which engine page holds each logical page (index = logical page)."""
         st = self._state[req]
@@ -1276,6 +1301,14 @@ class VllmSparseRuntime:
             # Bind the ROW even before a view exists: the first reselect must know which block
             # table row is the request's own (it compacts inside the request's own pages).
             st.row_index = int(row_index)
+        # Slot-mapping history: remember THIS step's query-token range so the LAGGED commit
+        # (which runs at the start of the NEXT step, while the device slot mapping still holds
+        # this step's values) can ask the kernel where it wrote each page.
+        try:
+            if position_slots:
+                self._slot_span[req] = (int(min(position_slots)), int(max(position_slots)) + 1)
+        except Exception:
+            pass
         # Without in-request compaction the sparse view must NOT be installed: the block table is
         # vLLM's own, and overriding seq_lens/positions on top of an uncompacted row is exactly the
         # half-initialised state that produced gibberish answers (measured with
@@ -1597,6 +1630,10 @@ class VllmSparseRuntime:
         n_new = int(n_new or 0)
         if n_new <= 0:
             return None
+        try:
+            self._slot_span_prev[req] = self._slot_span.get(req)
+        except Exception:
+            pass
         st = self.state(req)
         orch = self._orch[req]
         prev = self._prev_n.get(req, 0)
@@ -1874,13 +1911,32 @@ class VllmSparseRuntime:
                 # "rest" pages) is a mirror that can be stale exactly where the engine appended
                 # (measured: bytes at physical 1176 while st.row[1176]=1372 was all zero).
                 tb_val = None
+                slot_src = "row"
+                page = None
+                # Priority: the KERNEL's slot mapping for this step's tokens (authoritative),
+                # then the engine table mirror at rank, then the request row.
                 try:
-                    _tbl = self.view.block_table_rows()[0]
-                    tb_val = int(_tbl[st.row_index][rank])
-                    slot = tb_val if tb_val > 0 else int(st.row[rank])
+                    _span = getattr(self, "_slot_span_prev", {}).get(req)
+                    if _span:
+                        _p0, _p1 = int(_span[0]), int(_span[1])
+                        _q = _p0 + max(0, logical * self.page_tokens - int(st.tokens))
+                        if _p0 <= _q < _p1:
+                            _smap = self.slot_pages_for(req)
+                            if _smap and _q in _smap:
+                                page = _smap[_q]
+                                slot_src = "slotmap"
                 except Exception:
-                    slot = int(st.row[rank])
-                touched[logical] = (slot, rank, tb_val)
+                    page = None
+                if page is None:
+                    try:
+                        _tbl = self.view.block_table_rows()[0]
+                        tb_val = int(_tbl[st.row_index][rank])
+                        page = tb_val if tb_val > 0 else int(st.row[rank])
+                        slot_src = "stage1" if (tb_val and tb_val > 0) else "row"
+                    except Exception:
+                        page = int(st.row[rank])
+                slot = int(page)
+                touched[logical] = (slot, rank, tb_val, slot_src)
             _tp = getattr(self, "trace_pages", None)
             if _tp and self.log is not None and any(lp in _tp for lp in touched):
                 # Decisive commit-time probe: does the device page we are about to capture carry
@@ -1901,6 +1957,8 @@ class VllmSparseRuntime:
                             return int(dev[0][int(page)].view(
                                 __import__("torch").uint8).to("cpu").numpy().astype("int64").sum())
                         rows.append({"logical": int(lp), "rank": int(r), "slot": int(s),
+                                     "slot_src": (str(touched[lp][3])
+                                                  if len(touched[lp]) > 3 else "row"),
                                      "start": int(start), "tokens": int(st.tokens),
                                      "seq_len": int(st.seq_len),
                                      "d_pages": (int(st.tokens) - int(st.seq_len)) // self.page_tokens,
@@ -1944,7 +2002,8 @@ class VllmSparseRuntime:
                     import traceback as _tb
                     self.log({"kind": "commit_probe_error", "req": req,
                               "error": _tb.format_exc()[-300:]})
-            for logical, (slot, rank, _tbv) in touched.items():
+            for logical, tup in touched.items():
+                slot, rank = int(tup[0]), int(tup[1])
                 # The engine wrote these tokens into COMPACTED positions, so the page's bytes are
                 # baked `(rank - logical) * page_tokens` away from its logical start. Recording the
                 # rank (not the engine page id) is what lets a later resume, or a second request

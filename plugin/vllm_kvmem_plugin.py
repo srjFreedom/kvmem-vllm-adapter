@@ -778,6 +778,8 @@ def _attach_sparse(runner, log_path):
             # Opt-in: EngineCore compacts at its step boundary; the worker must not also reselect
             # inside the next step's forward, or both paths rewrite the same row.
             runtime.sched_compact = bool(cfg.get("sched_compact", False))
+            print(f"[kvmem] sched_compact install-gate = {runtime.sched_compact} "
+                  f"(cfg keys: {sorted(cfg)[:8]})", flush=True)
             # The runtime computed its watermark in __init__, BEFORE this number existed, so apply
             # the cap here as well (otherwise the pool-driven threshold is published and ignored).
             try:

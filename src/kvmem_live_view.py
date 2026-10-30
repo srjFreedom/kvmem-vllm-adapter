@@ -64,6 +64,10 @@ class LiveRunnerView:
             self._groups = [tables[g].gpu for g in self.attn_groups]
         return self._groups
 
+    def input_block_table_rows(self):
+        """The stage-2 tables the attention kernels actually read (gather output)."""
+        return list(self.runner.block_tables.input_block_tables)
+
     def seq_lens(self):
         return self.runner.input_buffers.seq_lens
 
