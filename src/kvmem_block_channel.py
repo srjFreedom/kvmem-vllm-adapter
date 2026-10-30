@@ -95,7 +95,8 @@ class BlockChannelScheduler:
                                                   int(req.get("visible_tokens", 0) or 0),
                                                   bool(req.get("rebuild", False)),
                                                   int(req.get("block_pages", 0) or 0),
-                                                  req.get("physical_pages", []))
+                                                  req.get("physical_pages", []),
+                                                  int(req.get("tail_tokens", 0) or 0))
                         self.compacts_applied += 1
                         # `ok` = the engine's book is now consistent with the worker's view;
                         # `truncated` = it actually shortened (so installing the view is needed).
@@ -184,7 +185,7 @@ class BlockChannel:
         return reply
 
     def compact(self, request_id, pages, page_tokens, visible_tokens=0, rebuild=False,
-                block_pages=0, physical_pages=None):
+                block_pages=0, physical_pages=None, tail_tokens=0):
         """Tell EngineCore that `request_id` compacted to `pages` (in compacted order).
 
         Logical ``pages`` select original tokens; ``physical_pages`` identifies allocator slots.
@@ -200,7 +201,8 @@ class BlockChannel:
                                       "visible_tokens": int(visible_tokens or 0),
                                       "rebuild": bool(rebuild),
                                       "block_pages": int(block_pages or 0),
-                                       "physical_pages": list(physical_pages or [])}).encode())
+                                      "physical_pages": list(physical_pages or []),
+                                      "tail_tokens": int(tail_tokens or 0)}).encode())
             data = sock.recv(4096)
         reply = json.loads(data.decode())
         if "error" in reply:

@@ -2630,22 +2630,28 @@ class VllmSparseRuntime:
         return proposal
 
     def _rebuild_select(self, req):
-        """Stage 2 (flow steps 2-3): select the working set with the frozen question, rebuild
-        the prompt, and let the engine re-prefill it DENSE.
+        """Stage 2 (v6): official selection+pack, then hand Core the rebuilt token list.
 
-        The selection runs the orchestrator's own picker (mandatory sink bands + core scores);
-        the selected LOGICAL pages select ORIGINAL prompt tokens on the Core side
-        (`select_tokens`), and the fresh admission re-prefills them at positions 0..N. That is
-        the only shape this fork executes correctly: append-only table, logical book,
-        contiguous prefix read - and NO re-RoPE, because the rebuilt stream's book positions
-        are its real positions. The GDN state rebuilds from the same re-prefill.
+        The picker scores the store over the frozen question (the only moment the real query
+        exists) and, given REAL destination slots, moves the selection with the official data
+        plane: device copies for pages that keep their rotation, one-hop host rebuilds from
+        canonical bytes for the rest (rebake ON - this fork has no rope-offset consumer, so
+        the view frame must be baked into the bytes). `forced_pages` guarantees the question
+        tail is in the set; the whole selection must fit inside the pool the detached request
+        just freed, so the rebuilt prompt never outruns the engine.
 
-        The question itself is NOT part of the rebuilt prompt: Core appends it verbatim after
-        the selected tokens (`tail_tokens`), so the model always reads its own ask.
+        Core's rebuild branch turns the logical pages into the rebuilt prompt via
+        `select_tokens` (original tokens, ascending = compact order: the engine re-prefills
+        exactly the retrieved stream) and re-queues the SAME request id fresh - dense
+        coordinates again, every fork law satisfied by construction, the answer already
+        generated carried over in the rebuilt stream's decode.
+
+        Returns (ok, detail).
         """
         st = self._state[req]
         orch = self._orch[req]
         pt = int(self.page_tokens)
+        bp = max(1, int(getattr(self, "block_pages", 1) or 1))
         ch = getattr(self, "compact_channel", None)
         if ch is None:
             return False, "no block channel"
@@ -2653,58 +2659,81 @@ class VllmSparseRuntime:
         if not ids:
             return False, "no prompt ids recorded"
         prompt_tokens = len(ids)
-        budget = int(self.budget_tokens)
-        tail_tokens = max(pt, int(getattr(self, "rebuild_tail_tokens", 0) or 4096))
         n_pages = -(-prompt_tokens // pt)
-        head_pages = max(1, n_pages - max(1, tail_tokens // pt))
-        select_budget_pages = max(1, (budget - tail_tokens) // pt)
+        tail_tokens = max(pt, int(getattr(self, "rebuild_tail_tokens", 0) or 4096))
+        tail_pages_n = max(1, tail_tokens // pt)
+        tail_first = max(0, n_pages - tail_pages_n)
+        forced_tail = list(range(tail_first, n_pages))
+        # destination slots: every pool page the engine can hand the rebuilt admission after
+        # its blocks are freed, page-ascending; the picker packs 0..k-1 (complete blocks first
+        # in `selected` ascending order, exactly what adopt_attention_blocks validates).
+        try:
+            n_blocks = int(self.view.num_blocks())
+        except Exception:
+            n_blocks = 0
+        if n_blocks <= 0:
+            return False, "pool size unavailable"
+        pool_pages = list(range(self.first_page, n_blocks * pt))
+        resident = int(st.tokens)
+        pool_pages = [p for p in pool_pages if p < resident][:max(bp, (resident // pt) // bp * bp)]
+        if len(pool_pages) < tail_pages_n + bp:
+            return False, f"pool window too small ({len(pool_pages)})"
+        # 1) official selection + device pack into the pool window
         self._in_rebuild_select = True
         selected = None
         try:
-            saved_budget = self.budget_tokens
-            self.budget_tokens = min(saved_budget, (select_budget_pages + head_pages) * pt)
-            try:
-                orch.reselect(mandatory_pages=[], forced_pages=[],
-                              prefill_pressure=False, rebake=False)
-                selected = [int(p) for p in
-                            (orch.last_view.row_pages if orch.last_view else ())]
-            finally:
-                self.budget_tokens = saved_budget
+            orch.reselect(slots=lambda count: pool_pages[:count],
+                          mandatory_pages=forced_tail, forced_pages=forced_tail,
+                          prefill_pressure=False, rebake=True)
+            selected = [int(p) for p in
+                        (orch.last_view.row_pages if orch.last_view else ())]
         except Exception as exc:
             self._in_rebuild_select = False
             return False, f"picker error: {type(exc).__name__}: {exc}"
         self._in_rebuild_select = False
         if not selected:
             return False, "picker returned nothing"
-        # store keys are LOGICAL page ids (commit recorded them in the prompt's own frame) -
-        # test the ids, never the physical row entries `last_view.row_pages` carries.
-        usable = [p for p in selected if p < head_pages and orch.store.has(p)]
-        # the budget the MIDDLE may use = B minus the question tail (which is FORCED in,
-        # not scored away: a rebuild without the question is a rebuild that cannot answer)
-        tail_pages = [p for p in range(head_pages, n_pages) if p * pt < prompt_tokens]
-        middle_budget = max(1, select_budget_pages - len(tail_pages))
-        usable = sorted(set(usable)[:middle_budget])
-        if not usable:
-            return False, f"no canonical middle pages selected ({len(selected)})"
-        # `select_tokens` on the Core side turns these ascending pages into the rebuilt
-        # prompt; the question tail rides at its END (global ascending preserved:
-        # usable < head_pages <= tail).
-        full_pages = usable + tail_pages
+        if max(selected) < n_pages - 1:
+            return False, "selection lost the question tail"
+        # 2) the packed physical row (view order) - validate completeness before Core sees it
+        phys = [int(orch.slot_of.get(p, 0) or 0) for p in selected]
+        if len(phys) != len(selected) or min(phys) <= 0 or len(set(phys)) != len(phys):
+            return False, f"packed slots incomplete (selected={len(selected)}, phys={len(set(phys))})"
+        pages = [p // bp for p in phys]
+        blocks = list(dict.fromkeys(pages))
+        expanded = [b * bp + o for b in blocks for o in range(bp)]
+        if pages != expanded[:len(pages)]:
+            # the picker kept whole blocks in ascending order normally; a partial tail block
+            # is legal only for the LAST page (the prompt's final page) - anything else means
+            # the pack landed on scattered pool pages Core would reject.
+            if pages[:-1] != expanded[:len(pages) - 1]:
+                return False, "packed row is not complete-block contiguous"
+        # 3) books: the packed view IS the old generation's resident window now (it retires at
+        #    the rebuild admission, but the decode steps until then read these pages)
+        st.row = tuple(phys)
+        st.logical = tuple(selected)
+        st.seq_len = int(len(phys) * pt)
+        st.tokens = int(st.tokens)          # logical frontier untouched (prefix mode = resident)
+        st.off_pages = 0
+        st.applied_view_coord = True
+        st.compacted_in_prefill = True
+        st.window_src = {rank: int(lp) for rank, lp in enumerate(selected)}
+        self._owned_slots[req] = list(st.row)
+        # 4) hand Core the reconstruction over the channel (rebuild branch -> pending -> fresh
+        #    dense admission of `select_tokens(logical)` on the scheduler thread)
         try:
-            res = ch.compact(req, full_pages, pt, visible_tokens=0, rebuild=True,
-                             block_pages=int(getattr(self, "block_pages", 1) or 1),
-                             physical_pages=[])
+            res = ch.compact(req, selected, pt, visible_tokens=0, rebuild=True,
+                             block_pages=bp, physical_pages=phys,
+                             tail_tokens=int(tail_tokens))
         except Exception as exc:
             return False, f"channel error: {type(exc).__name__}: {exc}"
         ok = isinstance(res, dict) and bool(res.get("ok"))
         if ok:
-            # the old position space retires here (idempotent with the rebuilt admission)
             self.accept_reconstruction(req)
         if self.log is not None:
             self.log({"kind": "rebuild_select", "req": req, "ok": bool(ok),
-                      "pages": len(full_pages), "middle": len(usable),
-                      "prompt_tokens": prompt_tokens,
-                      "head_pages": int(head_pages),
+                      "pages": len(selected), "tail_forced": len(forced_tail),
+                      "row": len(phys), "prompt_tokens": prompt_tokens,
                       "detail": str(res)[:160]})
         return ok, res
 

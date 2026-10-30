@@ -1660,7 +1660,7 @@ def register():
             return {"ok": True, "replay": int(n), "computed": int(req.num_computed_tokens)}
 
         def _compact(request_id, pages, page_tokens, visible_tokens=0, rebuild=False,
-                     block_pages=0, physical_pages=None):
+                     block_pages=0, physical_pages=None, tail_tokens=0):
             """Resident-book reconciliation (Route A / resident model).
 
             The worker selected a working set and has ALREADY installed it into the block table row
@@ -1692,6 +1692,14 @@ def register():
                 # and let the patched `Scheduler.schedule` perform the detach+requeue at the
                 # start of the NEXT step - the one point where it owns the data structures.
                 token_ids = select_tokens(req.prompt_token_ids, pages, page_tokens)
+                # The question tail rides at the END of the rebuilt prompt, taken VERBATIM
+                # from Core's own full `prompt_token_ids` (the worker never sends those
+                # tokens over the channel: it only names pages). This preserves the exact
+                # token sequence the chat template produced - the model reads its own ask.
+                prompt_all = list(getattr(req, "prompt_token_ids", ()) or ())
+                tail_n = int(tail_tokens or 0)
+                if tail_n > 0 and len(prompt_all) > tail_n:
+                    token_ids = token_ids + prompt_all[-tail_n:]
                 pending = getattr(self, "kvmem_rebuild_pending", None)
                 if pending is None:
                     pending = self.kvmem_rebuild_pending = {}
