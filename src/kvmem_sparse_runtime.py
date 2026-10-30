@@ -2786,6 +2786,12 @@ class VllmSparseRuntime:
         if max(selected) < n_pages - 1:
             return False, "selection lost the question tail"
         # 3) validate the packed physical row: ascending pool pages, unique, block-aligned
+        if self.log is not None:
+            self.log({"kind": "rebuild_phys_diag", "req": req,
+                      "n": len(phys), "sel_head": selected[:4], "sel_tail": selected[-4:],
+                      "phys_head": phys[:4], "phys_tail": phys[-4:],
+                      "block_first": [p // bp for p in phys[:4]],
+                      "block_tail": [p // bp for p in phys[-4:]]})
         if len(phys) != len(selected) or min(phys) <= 0 or len(set(phys)) != len(phys):
             return False, f"packed row invalid (pages={len(selected)}, uniq={len(set(phys))})"
         pages = [p // bp for p in phys]
