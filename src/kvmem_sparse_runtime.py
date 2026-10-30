@@ -2617,13 +2617,13 @@ class VllmSparseRuntime:
         usable = sorted(set(usable)[:select_budget_pages])
         if not usable:
             return False, f"no canonical middle pages selected ({len(selected)})"
+        # the verbatim question tail rides at the END of the rebuilt prompt (ascending page
+        # ids keep it last); `select_tokens` on the Core side turns the full list into tokens.
+        full_pages = usable + [p for p in range(head_pages, n_pages)]
         try:
-            res = ch.compact(req, usable, pt, visible_tokens=0, rebuild=True,
+            res = ch.compact(req, full_pages, pt, visible_tokens=0, rebuild=True,
                              block_pages=int(getattr(self, "block_pages", 1) or 1),
-                             physical_pages=[], tail_tokens=int(tail_tokens))
-        except TypeError as exc:
-            self._last_rebuild_error = f"channel signature: {exc}"
-            return False, self._last_rebuild_error
+                             physical_pages=[])
         except Exception as exc:
             return False, f"channel error: {type(exc).__name__}: {exc}"
         ok = isinstance(res, dict) and bool(res.get("ok"))
@@ -2632,7 +2632,8 @@ class VllmSparseRuntime:
             self.accept_reconstruction(req)
         if self.log is not None:
             self.log({"kind": "rebuild_select", "req": req, "ok": bool(ok),
-                      "pages": len(usable), "prompt_tokens": prompt_tokens,
+                      "pages": len(full_pages), "middle": len(usable),
+                      "prompt_tokens": prompt_tokens,
                       "head_pages": int(head_pages),
                       "detail": str(res)[:160]})
         return ok, res

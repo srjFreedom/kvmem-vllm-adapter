@@ -1113,6 +1113,11 @@ def _attach_sparse(runner, log_path):
                     st = rt._state.get(req) if hasattr(rt, "_state") else None
                     if st is None or not bool(getattr(st, "applied_view_coord", False)):
                         continue
+                    # a request that was REBUILT (stage-2) runs in true coordinates again -
+                    # accept_reconstruction cleared the resident books; the view is the dense
+                    # prefix the fresh prefill wrote, so this step must NOT pin anything.
+                    if rt.is_rebuilt(req):
+                        continue
                     idx = rs.req_id_to_index.get(req)
                     if idx is None:
                         continue
@@ -1940,9 +1945,10 @@ def register():
                     request_id=request_id,
                     prompt_token_ids=new_prompt,
                     sampling_params=sampling,
+                    pooling_params=getattr(old, "pooling_params", None),
+                    client_index=int(getattr(old, "client_index", 0) or 0),
                     arrival_time=arrival,
                     priority=priority,
-                    qas_id=getattr(old, "qas_id", None),
                     lora_request=getattr(old, "lora_request", None),
                     cache_salt=getattr(old, "cache_salt", None),
                 )
@@ -2218,15 +2224,18 @@ def _install(cls, module_name, probe, smoke, state):
                     _rid = getattr(_nr, "req_id", None)
                     if _rid is None:
                         continue
-                    if getattr(_nr, "kvmem_rebuilt", False):
-                        _rt0.accept_reconstruction(_rid)
-                        state.get("computed_before", {}).pop(_rid, None)
-                        state.get("was_decode", {}).pop(_rid, None)
-                        continue
                     _ids = getattr(_nr, "prompt_token_ids", None)
                     _rt0.note_prompt_ids(_rid, _ids)
                     _rt0.note_session_id(_rid, getattr(_nr, "session_id", None),
                                          getattr(_nr, "cache_salt", None))
+                    if getattr(_nr, "kvmem_rebuilt", False):
+                        # stage-2 rebuilt generation: retire the old position space, then keep
+                        # the normal fresh-admission accounting (the ids above are the FULL
+                        # rebuilt prompt - the retrieval source for the NEXT round).
+                        _rt0.accept_reconstruction(_rid)
+                        state.get("computed_before", {}).pop(_rid, None)
+                        state.get("was_decode", {}).pop(_rid, None)
+                        continue
                     _nlg = int(getattr(_nr, "num_logical_tokens", 0) or 0)
                     _npc = int(getattr(_nr, "num_computed_tokens", 0) or 0)
                     if bool(getattr(_nr, "kvmem_session_resume", False)):
@@ -2455,6 +2464,36 @@ def _install(cls, module_name, probe, smoke, state):
                             _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                                     {"kind": "stats_harvest_error", "req": req,
                                      "error": traceback.format_exc()[-600:]})
+                        # Stage-2 rebuild driver: the quiescent FINAL boundary queued this
+                        # request when its prompt completed beyond the resident budget. The
+                        # queue survives the RPC (the refusal/revert loop cannot clear it), but
+                        # the channel's `compact` is answered synchronously on the EngineCore
+                        # thread, so it must be issued OUTSIDE a model forward - this point
+                        # (execute_model entry, before the new forward) is the one safe place
+                        # the worker has with the final chunk already committed to the store.
+                        _rq = getattr(runtime, "_rebuild_queue", None)
+                        if _rq and req in _rq:
+                            try:
+                                _ok, _det = runtime._rebuild_select(req)
+                                if _ok:
+                                    _rq.pop(req, None)
+                                else:
+                                    _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                            {"kind": "rebuild_select_retry", "req": req,
+                                             "detail": str(_det)[:200]})
+                                    # give up after five attempts so a doomed request cannot
+                                    # spend the whole generation in picker+channel traffic
+                                    _tr = getattr(runtime, "_rebuild_tries", None)
+                                    if _tr is None:
+                                        _tr = runtime._rebuild_tries = {}
+                                    _tr[req] = int(_tr.get(req, 0)) + 1
+                                    if _tr[req] >= 5:
+                                        _rq.pop(req, None)
+                            except Exception:
+                                _rq.pop(req, None)
+                                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                        {"kind": "rebuild_select_error", "req": req,
+                                         "error": traceback.format_exc()[-400:]})
                     if runtime.compact_rebuild:
                         _rs = self.req_states
                         _idx = _rs.req_id_to_index.get(req)
