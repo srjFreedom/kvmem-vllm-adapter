@@ -2689,9 +2689,13 @@ class VllmSparseRuntime:
             n_blocks = 0
         if n_blocks <= 0:
             return False, "pool size unavailable"
-        pool_pages = list(range(self.first_page, n_blocks * pt))
-        resident = int(st.tokens)
-        pool_pages = [p for p in pool_pages if p < resident][:max(bp, (resident // pt) // bp * bp)]
+        # BLOCK-aligned window: vLLM's pool starts with the null block at pages
+        # [0..bp-1], so the first usable page is (first_page//bp + 1)*bp and the last is
+        # whole-block truncated. A non-aligned destination window makes the packed physical
+        # row span partial blocks, which `adopt_attention_blocks` can never validate.
+        first = (-(-int(self.first_page) // bp)) * bp
+        last = (n_blocks * pt) // bp * bp
+        pool_pages = list(range(first, last))
         if len(pool_pages) < tail_pages_n + bp:
             return False, f"pool window too small ({len(pool_pages)})"
         # 1) official selection + device pack into the pool window
@@ -2701,7 +2705,7 @@ class VllmSparseRuntime:
             cap_pages = min(len(pool_pages) // bp * bp,
                             int(self.budget_tokens) // pt // bp * bp)
             cap_pages = max(bp * 2, cap_pages)
-            orch.max_select_pages_override = None
+            orch.max_select_pages_override = cap_pages
             try:
                 stats_ = orch.reselect(mandatory_pages=forced_tail,
                                        forced_pages=forced_tail,
