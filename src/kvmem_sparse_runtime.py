@@ -297,6 +297,22 @@ class VllmSparseRuntime:
                         self._inflight, self._engine_computed, self._engine_logical,
                         self._page_map, self._absorb_upto):
             mapping.pop(req, None)
+        # The rebuilt generation's LOGICAL page ids restart at 0, but the engine writes them
+        # into NEW physical pages. Seed the page-id map from the request's CURRENT live row so
+        # the very first commit after `accept` already addresses the right pages (mirroring
+        # only starts at the next `sync_row_from_engine`).
+        try:
+            row0 = [int(p) for p in (st.row or ())] if st is not None else []
+            if not row0:
+                ridx = int(getattr(st, "row_index", 0) or 0) if st is not None else 0
+                tbl = self.view.block_table_rows()[0][ridx].tolist()
+                row0 = [int(p) for p in tbl if int(p) > 0]
+            pm = self._page_map.setdefault(req, {})
+            for i, p in enumerate(row0):
+                pm[i] = int(p)
+            self._absorb_upto[req] = len(row0)
+        except Exception:
+            pass
         self.log({"kind": "reconstruction_started", "req": req,
                   "rank": int(getattr(self, "tp_rank", 0))})
 
@@ -2625,18 +2641,18 @@ class VllmSparseRuntime:
             return False, "picker returned nothing"
         # store keys are LOGICAL page ids (commit recorded them in the prompt's own frame) -
         # test the ids, never the physical row entries `last_view.row_pages` carries.
-        by_logical = {}
-        for lp, phys in zip(st.logical or (), st.row or ()):
-            if lp is not None:
-                by_logical.setdefault(int(lp), int(phys))
-        usable = [p for p in selected if p < head_pages
-                  and (orch.store.has(p) or p in by_logical)]
-        usable = sorted(set(usable)[:select_budget_pages])
+        usable = [p for p in selected if p < head_pages and orch.store.has(p)]
+        # the budget the MIDDLE may use = B minus the question tail (which is FORCED in,
+        # not scored away: a rebuild without the question is a rebuild that cannot answer)
+        tail_pages = [p for p in range(head_pages, n_pages) if p * pt < prompt_tokens]
+        middle_budget = max(1, select_budget_pages - len(tail_pages))
+        usable = sorted(set(usable)[:middle_budget])
         if not usable:
             return False, f"no canonical middle pages selected ({len(selected)})"
-        # the verbatim question tail rides at the END of the rebuilt prompt (ascending page
-        # ids keep it last); `select_tokens` on the Core side turns the full list into tokens.
-        full_pages = usable + [p for p in range(head_pages, n_pages)]
+        # `select_tokens` on the Core side turns these ascending pages into the rebuilt
+        # prompt; the question tail rides at its END (global ascending preserved:
+        # usable < head_pages <= tail).
+        full_pages = usable + tail_pages
         try:
             res = ch.compact(req, full_pages, pt, visible_tokens=0, rebuild=True,
                              block_pages=int(getattr(self, "block_pages", 1) or 1),
