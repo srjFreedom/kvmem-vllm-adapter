@@ -430,6 +430,13 @@ class SparseOrchestrator:
         if not any(bool(t.any()) for t in page_bytes):
             return False
         delta = self._baked_delta(baked, slot, page)
+        # a boundary-compacted request can hand the SAME logical page twice from DIFFERENT
+        # physical slots (adopted views recycle old slots; the prompt also wrote the page once).
+        # The FIRST capture is authoritative: re-committing a page with a different delta would
+        # silently overwrite canonical bytes with another page's content (measured class: a
+        # recycled slot produced store pages whose sha no view ever read).
+        if self.store.has(page) and int(self.store_delta.get(page, 0)) != int(delta):
+            return True
         self.store.put(page, page_bytes)
         self.store_delta[int(page)] = delta
         self._feed_retrieval(page, page_bytes)
