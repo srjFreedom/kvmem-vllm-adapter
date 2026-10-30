@@ -178,6 +178,29 @@ def main():
           f"(got {committed.get(64)},{committed.get(65)} want 700,701)")
     check(st.row[4:6] == (700, 701), f"B: row grew with the engine slots ({st.row[4:6]})")
 
+    # ---------- F) commit must follow the ENGINE table even INSIDE the row length -----
+    # The live failure (2026-10-30, 164,918-byte run): after the boundary compaction the engine
+    # appends its OWN recycled pages (bytes at physical 1176+), while the worker's row still
+    # carries the reselect's "rest" mirror ids (1372+, all-zero pages). The rank was INSIDE
+    # len(st.row), so the old `st.row[rank]` never hit the grow path and committed the stale
+    # mirror -> the zero guard refused -> the tail never entered the store.
+    rt, st, orch = make_rt()
+    st.tokens = 64 * PAGE
+    st.seq_len = 4 * PAGE
+    st.row_index = 0
+    st.row = tuple(packed) + (200, 201)          # mirror ids at ranks 4/5 (STALE, zero pages)
+    view, tbl = engine_table_setup(None)
+    for pos, p in enumerate(packed):
+        tbl[pos] = p
+    tbl[4] = 700
+    tbl[5] = 701                                 # engine's real appended pages
+    rt.view = view
+    rt.after_step("r", 64, prefill=True)
+    committed = dict(orch.commits)
+    check(committed.get(64) == 700 and committed.get(65) == 701,
+          f"F: commit reads the engine table, not the stale in-row mirror "
+          f"(got {committed.get(64)},{committed.get(65)} want 700,701)")
+
     # ---------- C) the row must not double-append the last slot past the table -------
     rt, st, orch = make_rt()
     st.tokens = 64 * PAGE

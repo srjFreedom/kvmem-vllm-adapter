@@ -1306,7 +1306,7 @@ class VllmSparseRuntime:
             # `prepare_pos_seq_lens`, because that runs with the optimistic device counter, which a
             # compaction does not rewind - writing ours first would be overwritten with a stale
             # length and the attention would read pages beyond the row.
-            if self.install_row and st.row:
+            if self.install_row and st.row and not bool(getattr(self, "sched_compact", False)):
                 import torch
                 for table in self.view.block_table_rows():
                     table[row_index, :len(st.row)] = torch.tensor(
@@ -1327,7 +1327,8 @@ class VllmSparseRuntime:
         # tokens INCLUDING the current query. Installing the previous end (what we did before)
         # made every chunk's queries blind to their own chunk — the KV was written but never
         # attended, which silently produced gibberish instead of an error.
-        self._install(row_index, st.row, step_end, list(position_slots))
+        row_to_install = (None if bool(getattr(self, "sched_compact", False)) else st.row)
+        self._install(row_index, row_to_install, step_end, list(position_slots))
         if self.install_row:
             self._absorb_upto[req] = max(int(self._absorb_upto.get(req, 0)), len(st.row))
         return st
@@ -1335,7 +1336,7 @@ class VllmSparseRuntime:
     def _install(self, row_index, row, seq_len, position_slots):
         import torch
 
-        if self.install_row:
+        if self.install_row and row is not None:
             for table in self.view.block_table_rows():
                 # Only overwrite the slots we own: vLLM reads `seq_len` tokens, so entries past it
                 # are ignored, and clobbering the whole row would disturb the engine's own
@@ -1867,7 +1868,17 @@ class VllmSparseRuntime:
                             raise RuntimeError("sparse row has no slot for the next token page")
                         grown.append(int(page))
                     st.row = tuple(grown)
-                slot = int(st.row[rank])
+                # The ENGINE's table is the authority for where the previous forward wrote:
+                # `adopt_attention_blocks` rewrote the manager list and the engine gathers it
+                # over the GPU tensor at every input prep. Our own `st.row` tail (the reselect
+                # "rest" pages) is a mirror that can be stale exactly where the engine appended
+                # (measured: bytes at physical 1176 while st.row[1176]=1372 was all zero).
+                try:
+                    slot = int(self.view.block_table_rows()[0][st.row_index][rank])
+                    if slot <= 0:
+                        slot = int(st.row[rank])
+                except Exception:
+                    slot = int(st.row[rank])
                 touched[logical] = (slot, rank)
             _tp = getattr(self, "trace_pages", None)
             if _tp and self.log is not None and any(lp in _tp for lp in touched):
