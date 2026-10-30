@@ -1879,6 +1879,96 @@ def register():
                 _append("/tmp/kvmem_sparse.jsonl",
                         {"kind": "resume_decide_error", "error": traceback.format_exc()})
 
+        def queue_kvmem_reconstruction(self, request_id, token_ids):
+            """Stage-2 rebuild admission (EngineCore thread, inside the step).
+
+            The worker selected the working set (sink+middle pages, ascending logical
+            pages -> rebuilt token ids here); re-queue the SAME request with the new
+            prompt so the engine re-prefills it DENSE over the selected sequence. This
+            is the only compaction shape the fork can execute: the rebuilt request's
+            block table is append-only-correct, its book is the logical book, positions
+            come from its own resident counter (law-2 satisfied by never leaving dense
+            coordinates), and the attention reads a contiguous prefix (law-3).
+
+            The old client stream is NOT finished: `pop_request_for_rebuild` (fork
+            extension if present) detaches scheduler bookkeeping and frees KV without
+            emitting a client-visible abort; otherwise we abort with a marker the
+            output processor can recognize and the new admission carries the SAME
+            request id, so the client sees one continuous generation.
+            """
+            try:
+                from vllm.v1.request import Request, RequestStatus
+                old = None
+                for r in list(getattr(self, "running", ()) or ()):
+                    if getattr(r, "request_id", None) == request_id:
+                        old = r
+                        break
+                if old is None:
+                    return {"ok": False, "error": "unknown request"}
+                ids = [int(t) for t in (token_ids or ())]
+                if not ids:
+                    return {"ok": False, "error": "empty rebuild token list"}
+                outs = list(getattr(old, "output_token_ids", ()) or ())
+                n_out = getattr(old, "num_output_tokens", None)
+                if n_out is not None:
+                    outs = outs[:max(0, int(n_out))]
+                new_prompt = ids + outs
+                if len(new_prompt) >= int(getattr(old, "num_prompt_tokens", 0) or 0):
+                    return {"ok": False, "error": "rebuild not shrinking",
+                            "new": len(new_prompt),
+                            "old": int(getattr(old, "num_prompt_tokens", 0) or 0)}
+                log_path = _channel_state.get("probe_log") or "/tmp/kvmem_sparse.jsonl"
+                # Detach without a client abort when the fork offers the primitive.
+                detach = getattr(self, "pop_request_for_rebuild", None)
+                if callable(detach):
+                    try:
+                        detach(request_id)
+                    except TypeError:
+                        detach(request_id, rebuild=True)
+                else:
+                    self.finish_requests([request_id], RequestStatus.FINISHED_ABORTED)
+                manager = getattr(self, "kv_cache_manager", None)
+                free = None
+                try:
+                    free = int(manager.block_pool.get_num_free_blocks())
+                except Exception:
+                    pass
+                sampling = getattr(old, "sampling_params", None)
+                arrival = int(getattr(old, "arrival_time", 0) or 0)
+                priority = int(getattr(old, "priority", 0) or 0)
+                req = Request(
+                    request_id=request_id,
+                    prompt_token_ids=new_prompt,
+                    sampling_params=sampling,
+                    arrival_time=arrival,
+                    priority=priority,
+                    qas_id=getattr(old, "qas_id", None),
+                    lora_request=getattr(old, "lora_request", None),
+                    cache_salt=getattr(old, "cache_salt", None),
+                )
+                try:
+                    req.kvmem_rebuilt = True
+                except Exception:
+                    pass
+                self.waiting.add_request(req)
+                entry = {"kind": "rebuild_queued", "pid": os.getpid(), "req": request_id,
+                         "new_prompt": len(new_prompt),
+                         "selected_pages_tokens": len(ids), "outputs": len(outs),
+                         "old_prompt": int(getattr(old, "num_prompt_tokens", 0) or 0),
+                         "free_blocks_after": free,
+                         "detach": "native" if callable(detach) else "abort"}
+                _append(log_path, entry)
+                return {"ok": True, "queued": True, "new_prompt": len(new_prompt)}
+            except Exception as exc:
+                _append(_channel_state.get("probe_log")
+                        or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "rebuild_error", "pid": os.getpid(),
+                         "req": request_id, "error": f"{type(exc).__name__}: {exc}",
+                         "tb": traceback.format_exc()[-400:]})
+                return {"ok": False, "error": str(exc)[:200]}
+
+        Scheduler.queue_kvmem_reconstruction = queue_kvmem_reconstruction
+
         original = Scheduler.schedule
         if not getattr(original, "_kvmem_channel_patched", False):
             def schedule(self, *args, **kwargs):

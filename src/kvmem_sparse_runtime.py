@@ -274,10 +274,17 @@ class VllmSparseRuntime:
         The original host archive remains owned until request cleanup. Recomputed KV uses the
         engine's native dense path; old logical-page statistics must never be overwritten by
         compacted position IDs.
+
+        Idempotent: `_rebuild_select` marks the old request retired the moment Core queues the
+        fresh admission, and the rebuilt request arrives at `execute_model` with
+        `kvmem_rebuilt` and calls this again. When the rebuilt generation is ALREADY resident
+        (row rebuilt by the fresh prefill), the second call must not wipe it.
         """
+        st = self._state.get(req)
+        if req in getattr(self, "_rebuilt_req", ()) and (st is None or not st.row):
+            return
         self._rebuilt_req = getattr(self, "_rebuilt_req", set())
         self._rebuilt_req.add(req)
-        st = self._state.get(req)
         if st is not None:
             self._seq_override.pop(st.row_index, None)
             self._release_slots(req, set())
@@ -2514,6 +2521,15 @@ class VllmSparseRuntime:
                 self._reselect_prefix(req, pressure=pressure)
                 self._prefix_active = True
                 self._last_proposal = None
+                if final and int(getattr(self, "compact_rebuild", False)):
+                    # Stage 2: the prompt completed beyond the resident budget with reporting
+                    # only - the engine read it dense and the store holds every page. Queue
+                    # the retrieval-rebuild for THIS request; the driver in the worker's
+                    # post-block fires it once the final forward's pages are committed.
+                    q = getattr(self, "_rebuild_queue", None)
+                    if q is None:
+                        q = self._rebuild_queue = {}
+                    q[req] = int(st.tokens)
             elif bool(getattr(self, "blockwise_view", False)):
                 self._reselect_blockwise(req, pressure=pressure)
             else:
@@ -2549,6 +2565,77 @@ class VllmSparseRuntime:
                       "sel_max": max(proposal.get("selected_pages") or (0,))
                       if proposal.get("selected_pages") else -1})
         return proposal
+
+    def _rebuild_select(self, req):
+        """Stage 2 (flow steps 2-3): select the working set with the frozen question, rebuild
+        the prompt, and let the engine re-prefill it DENSE.
+
+        The selection runs the orchestrator's own picker (mandatory sink bands + core scores);
+        the selected LOGICAL pages select ORIGINAL prompt tokens on the Core side
+        (`select_tokens`), and the fresh admission re-prefills them at positions 0..N. That is
+        the only shape this fork executes correctly: append-only table, logical book,
+        contiguous prefix read - and NO re-RoPE, because the rebuilt stream's book positions
+        are its real positions. The GDN state rebuilds from the same re-prefill.
+
+        The question itself is NOT part of the rebuilt prompt: Core appends it verbatim after
+        the selected tokens (`tail_tokens`), so the model always reads its own ask.
+        """
+        st = self._state[req]
+        orch = self._orch[req]
+        pt = int(self.page_tokens)
+        ch = getattr(self, "compact_channel", None)
+        if ch is None:
+            return False, "no block channel"
+        ids = self._prompt_ids.get(req)
+        if not ids:
+            return False, "no prompt ids recorded"
+        prompt_tokens = len(ids)
+        budget = int(self.budget_tokens)
+        tail_tokens = max(pt, int(getattr(self, "rebuild_tail_tokens", 0) or 4096))
+        n_pages = -(-prompt_tokens // pt)
+        head_pages = max(1, n_pages - max(1, tail_tokens // pt))
+        select_budget_pages = max(1, (budget - tail_tokens) // pt)
+        self._in_rebuild_select = True
+        selected = None
+        try:
+            saved_budget = self.budget_tokens
+            self.budget_tokens = min(saved_budget, (select_budget_pages + head_pages) * pt)
+            try:
+                orch.reselect(mandatory_pages=[], forced_pages=[],
+                              prefill_pressure=False, rebake=False)
+                selected = [int(p) for p in
+                            (orch.last_view.row_pages if orch.last_view else ())]
+            finally:
+                self.budget_tokens = saved_budget
+        except Exception as exc:
+            self._in_rebuild_select = False
+            return False, f"picker error: {type(exc).__name__}: {exc}"
+        self._in_rebuild_select = False
+        if not selected:
+            return False, "picker returned nothing"
+        usable = [p for p in selected if p < head_pages and orch.store.has(p)]
+        usable = sorted(set(usable)[:select_budget_pages])
+        if not usable:
+            return False, f"no canonical middle pages selected ({len(selected)})"
+        try:
+            res = ch.compact(req, usable, pt, visible_tokens=0, rebuild=True,
+                             block_pages=int(getattr(self, "block_pages", 1) or 1),
+                             physical_pages=[], tail_tokens=int(tail_tokens))
+        except TypeError as exc:
+            self._last_rebuild_error = f"channel signature: {exc}"
+            return False, self._last_rebuild_error
+        except Exception as exc:
+            return False, f"channel error: {type(exc).__name__}: {exc}"
+        ok = isinstance(res, dict) and bool(res.get("ok"))
+        if ok:
+            # the old position space retires here (idempotent with the rebuilt admission)
+            self.accept_reconstruction(req)
+        if self.log is not None:
+            self.log({"kind": "rebuild_select", "req": req, "ok": bool(ok),
+                      "pages": len(usable), "prompt_tokens": prompt_tokens,
+                      "head_pages": int(head_pages),
+                      "detail": str(res)[:160]})
+        return ok, res
 
     def note_applied_epoch(self, req, epoch, visible, logical):
         """Core applied a boundary compaction at this epoch. A PRESSURE apply (visible <
