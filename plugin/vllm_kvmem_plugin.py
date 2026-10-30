@@ -1700,9 +1700,11 @@ def register():
                 tail_n = int(tail_tokens or 0)
                 if tail_n > 0 and len(prompt_all) > tail_n:
                     token_ids = token_ids + prompt_all[-tail_n:]
-                pending = getattr(self, "kvmem_rebuild_pending", None)
+                # `_compact` is a plain closure, NOT a method: the scheduler object is the
+                # local `scheduler` we resolved above - never `self` (NameError, measured).
+                pending = getattr(scheduler, "kvmem_rebuild_pending", None)
                 if pending is None:
-                    pending = self.kvmem_rebuild_pending = {}
+                    pending = scheduler.kvmem_rebuild_pending = {}
                 already = request_id in pending
                 pending[request_id] = {
                     "token_ids": token_ids,
