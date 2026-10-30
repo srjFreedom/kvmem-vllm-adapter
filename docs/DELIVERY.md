@@ -148,3 +148,6 @@ needle、MTP 接受长度及跨请求回归扩展验收。所有实验开关默�
 下一步（按依赖顺序）：先修 spare 预留（压缩时保留 `visible + max_num_batched_tokens` 的整块并按块 adopt），再启用硬邻域扩张（`KVMEM_GRAPH_TOP`），最后复测 needle 选中与回答。
 
 2026-10-30 spare 预留假设**被证伪并回退**：上一轮把硬邻域扩张触发的 `SparseViewCapacityError: needs 40960 but 1274 published` 归因于"压缩后未给下一个 chunk 预留页"，实现了 `adopted_row_pages` helper 与 `prefill_chunk_tokens` 发布。但用最近一次成功运行（软传播、无硬扩张）的 `row_synced` 时间线核对：每次 `sched_compact_applied` 之后行都从 1323 自然增长到 1421→1568→…，证明 **Core 的下一次 schedule 会重新分配块并由 sync 镜像回来**，adopted row 无需预留下一个 chunk。据此删除了 helper 与调用点改动，回到干净基线（`_reselect` 的 keep_pages 恢复为仅覆盖 selected 的块对齐值）。硬扩张那次的 1274 页差异属于 mandatory 扩大改变 selected/adopt 集合的副作用，不是 spare 缺口——该方向尚未解决，needle 仍未在 recent 窗口外被选中。
+
+2026-10-30 提交 `3b18b5e` 后的 decode 字节探针（console，step 280/320，tokens 170,020/170,060）：needle 页 2654-2657 **全部 resident、槽位 580-583 在行内、rank 384-387（紧跟 sink）、`needle()` 全 true**，seq_len 覆盖之——即压缩视图在结构上完全正确，共识 degraded=0、final 压缩在 decode 前应用。回答仍是 `Based access access…`。`needle()` 是 device↔store 的自洽检查，无法证明 store 规范字节本身未被早前压缩周期的槽位复用污染（历史备忘中"检查与自身错误 delta 一致"的坑）。
+**下一步分叉实验（便宜且决定性）**：把 prompt 缩到刚过池（如 ~165K，needle 仍在中间）使压缩次数降到 1-2 次：若回答正确 → 多次压缩链在污染 store/槽位；若仍错 → restore/提交路径本身有缺陷。之后再回 169,998 全链验证。会话复用仍默认关；无 warm 对照。
