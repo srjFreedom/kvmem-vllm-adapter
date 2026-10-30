@@ -1981,6 +1981,19 @@ def register():
                             # step (measured: 105 refusals in a 2.5-minute 88K run).
                             if request in final:
                                 request.kvmem_final_reselect = True
+                            else:
+                                # Pressure idling must not become a per-step spin: under a
+                                # prompt the engine cannot satisfy (pool < prompt) the trigger
+                                # re-fires EVERY step (measured: 715,882 epochs, 3.5M log lines
+                                # and a stalled engine inside 25 minutes). Throttle to one
+                                # attempt per 64 epochs per request.
+                                idle = getattr(scheduler, "kvmem_pressure_idle", None)
+                                if idle is None:
+                                    idle = scheduler.kvmem_pressure_idle = {}
+                                last = int(idle.get(request.request_id, -10_000_000))
+                                if epoch - last < 64:
+                                    return
+                                idle[request.request_id] = epoch
                             _append(log_path, {"kind": "sched_compact_idle", "pid": os.getpid(),
                                                "req": request.request_id, "epoch": epoch})
                             return

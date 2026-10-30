@@ -157,6 +157,7 @@ class VllmSparseRuntime:
         self._advance_owns_accounting = True
         self._prev_n = {}
         self._decode_probe = {}
+        self._last_report_tokens = {}
         self._install_row_now = {}
         self._slot_span = {}
         self._slot_span_prev = {}
@@ -2765,7 +2766,12 @@ class VllmSparseRuntime:
         logical = [int(v) if v is not None else -1 for v in (st.logical or ())]
         if len(logical) != len(row):
             logical = list(range(len(row)))
-        if self.log is not None:
+        # Reports are once per request; pressure/final both re-enter this path and a per-step
+        # audit line is log spam (measured: 1.4M rows during one stalled run).
+        if self.log is not None and int(getattr(st, "tokens", 0)) != getattr(
+                self, "_last_report_tokens", {}).get(req, -1):
+            self._last_report_tokens = getattr(self, "_last_report_tokens", {})
+            self._last_report_tokens[req] = int(tokens)
             self.log({"kind": "prefix_report", "req": req, "resident": int(resident),
                       "tokens": tokens, "budget": budget, "pages": len(row)})
         return st
