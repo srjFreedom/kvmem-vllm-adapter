@@ -2698,22 +2698,49 @@ class VllmSparseRuntime:
         pool_pages = list(range(first, last))
         if len(pool_pages) < tail_pages_n + bp:
             return False, f"pool window too small ({len(pool_pages)})"
-        # 1) official selection + device pack into the pool window
+        # 1) score-ranked selection in the picker's SELECT-BLOCK grid, quantised to whole
+        #    ENGINE blocks for the packed physical row (an engine block is kept when any of
+        #    its pages scored in - a needle block can never be half-dropped). The question
+        #    tail is forced. Then the official data plane moves+rebakes the selection into
+        #    the block-aligned pool window at 0..k-1.
         self._in_rebuild_select = True
         selected = None
         try:
-            cap_pages = min(len(pool_pages) // bp * bp,
-                            int(self.budget_tokens) // pt // bp * bp)
-            cap_pages = max(bp * 2, cap_pages)
-            orch.max_select_pages_override = cap_pages
+            cap_engine_blocks = max(2, min(
+                len(pool_pages) // bp, int(self.budget_tokens) // pt // bp))
+            rank = None
+            try:
+                rank = orch.selector.select_pages([])     # budget-capped ranked pages
+            except Exception:
+                rank = None
+            scored_blocks = set()
+            if rank is not None:
+                ppb_sel = int(orch.selector.pages_per_selection_block())
+                for p in rank:
+                    scored_blocks.add((int(p) * ppb_sel) // bp)
+            tail_blocks = {p // bp for p in forced_tail}
+            middle = sorted(scored_blocks - tail_blocks)
+            middle = middle[:max(0, cap_engine_blocks - len(tail_blocks))]
+            chosen = sorted(middle + list(tail_blocks))
+            logical_pages = sorted({p for b in chosen for p in
+                                    range(b * bp, (b + 1) * bp) if p < n_pages})
+            # device pack via the orchestrator (slots=the aligned pool window)
+            orch.max_select_pages_override = len(logical_pages) + 1
             try:
                 orch.reselect(slots=lambda count: pool_pages[:count],
-                              mandatory_pages=forced_tail, forced_pages=forced_tail,
+                              mandatory_pages=logical_pages,
+                              forced_pages=logical_pages,
                               prefill_pressure=False, rebake=True)
                 selected = [int(p) for p in
                             (orch.last_view.row_pages if orch.last_view else ())]
             finally:
                 orch.max_select_pages_override = None
+            if self.log is not None:
+                self.log({"kind": "rebuild_select_diag", "req": req,
+                          "rank_n": 0 if rank is None else len(rank),
+                          "scored_blocks": len(scored_blocks),
+                          "tail_blocks": len(tail_blocks), "chosen": len(chosen),
+                          "want": len(logical_pages), "sel": len(selected)})
         except Exception as exc:
             self._in_rebuild_select = False
             return False, f"picker error: {type(exc).__name__}: {exc}"
