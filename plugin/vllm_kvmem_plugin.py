@@ -1973,6 +1973,17 @@ def register():
                             args=(request.request_id, int(request.num_logical_tokens),
                                   epoch, int(request.num_computed_tokens),
                                   request in final))
+                        if not any(rec for rec in (records or ())):
+                            # Retirement-report mode: the worker audited its books and store and
+                            # proposed NOTHING on purpose (the engine's dense window is correct by
+                            # construction here). Consume the trigger instead of looping it: a
+                            # `validate` on empty records would refuse, revert, and re-fire every
+                            # step (measured: 105 refusals in a 2.5-minute 88K run).
+                            if request in final:
+                                request.kvmem_final_reselect = True
+                            _append(log_path, {"kind": "sched_compact_idle", "pid": os.getpid(),
+                                               "req": request.request_id, "epoch": epoch})
+                            return
                         result = validate_quiescent_compaction(
                             request, records, tp_size, epoch, manager)
                         outcome = apply_compaction(
