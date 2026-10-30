@@ -1985,7 +1985,11 @@ def register():
                     req.kvmem_rebuilt = True
                 except Exception:
                     pass
-                self.waiting.add_request(req)
+                # THE fork entry point: `add_request` registers `self.requests[rid]` (which
+                # schedule() reads right back), applies the resumable/streaming bookkeeping
+                # and enqueues to `waiting` in one go. `waiting.add_request` alone leaves the
+                # dict empty and the very next schedule dies with KeyError (measured).
+                self.add_request(req)
                 entry = {"kind": "rebuild_queued", "pid": os.getpid(), "req": request_id,
                          "new_prompt": len(new_prompt),
                          "selected_pages_tokens": len(ids), "outputs": len(outs),
