@@ -9,6 +9,8 @@
 #      overrides `positions`), so commit_new_tokens() un-rotates them back to canonical once.
 #   4. Reselect never rotates a device page that already carries a rotation: it always rebuilds
 #      from canonical. This is why the fp8 re-quantization error cannot compound.
+import os
+
 import torch
 
 from kvmem_sparse_rope import FP8_DTYPE, _dequant, _quantize, delta_rotate, rotary_inv_freq
@@ -478,7 +480,24 @@ class SparseOrchestrator:
             return None
         layer_rows, rows = {}, 0
         try:
-            for layer, (q, _pos) in bridge.read_all().items():
+            source = bridge.read_all()
+            # The bridge is a TRANSIENT buffer: on a decode-step reselect it holds the decode
+            # query (or nothing), which made the core query useless for the final, question-driven
+            # reselect (measured q_norm=0.0 / wrong ranking). Once the query is frozen, the rows
+            # captured on the prompt tail ARE the question, so prefer them unconditionally.
+            saved = getattr(self.retrieval_index, "_q_rows", None) or {}
+            frozen = bool(getattr(self.retrieval_index, "_query_frozen", False))
+            if saved and (frozen or not any(
+                    q is not None and getattr(q, "numel", lambda: 0)() > 0
+                    for q, _pos in source.values())):
+                # Keep only the question tail: KVMem's query is the tail of the last-user span
+                # (ninfer query_max_tokens) with the original's "query-last 64" fallback. A single
+                # huge user message otherwise dilutes the question with hundreds of repeated lines.
+                import os as _os
+                limit = int(_os.environ.get("KVMEM_QUERY_TAIL", "0") or 0)
+                source = {int(k): (v[-limit:] if (limit > 0 and v.shape[0] > limit) else v, None)
+                          for k, v in saved.items()}
+            for layer, (q, _pos) in source.items():
                 if q is None or q.numel() == 0:
                     continue
                 q = q.detach().to("cpu", non_blocking=False).float()
@@ -627,7 +646,8 @@ class SparseOrchestrator:
 
     # --- reselect ---------------------------------------------------------------------
     def reselect(self, mandatory_pages=(), slots=None, page_to_slot=None,
-                 prefill_pressure=False, forced_pages=(), score_reducer=None):
+                 prefill_pressure=False, forced_pages=(), score_reducer=None,
+                 rebake=True):
         # The selector works on the token frontier, which can include a partially-filled last
         # selection block; only pages that already hold written tokens may be selected.
         core = None
@@ -719,6 +739,18 @@ class SparseOrchestrator:
                             nonfinite += 1
                             continue
                         full[index] = value
+                    # Graph propagation (the official 0.2 strength) over the selection chain: a
+                    # short record can straddle two statistics buckets, so its halves score
+                    # mediocre in isolation and both miss the top-k. One hop of neighbour smoothing
+                    # lets the adjacent half carry it over the cut.
+                    try:
+                        alpha = float(os.environ.get("KVMEM_GRAPH_ALPHA", "0.2") or 0.0)
+                    except Exception:
+                        alpha = 0.0
+                    if alpha > 0.0 and finite:
+                        from kvmem_recall import propagate_neighbor_scores
+                        full = propagate_neighbor_scores(full, alpha)
+
                     # If NOTHING usable came back, do not feed the core at all: a table made only of
                     # the floor is not a ranking, and an extreme floor (1e9) can overflow the core's
                     # LRFU decay the same way the original `-inf` did. Leaving the selector with no
@@ -858,8 +890,12 @@ class SparseOrchestrator:
         if selected:
             import torch
 
+            # Pure copy (KVMem's documented semantics): compaction changes ADDRESSES only, so the
+            # stored K keeps its true-position phase and the fork restores RoPE with
+            # `kvmem_rope_offset`. Re-baking to the compacted rank double-shifts the phase against
+            # the true-position read path (measured: repeated output with a valid query).
             needed = [delta for _, (_, delta) in zip(selected, rotation_deltas(
-                selected, self.page_tokens))]
+                selected, self.page_tokens))] if rebake else [0] * len(selected)
             self._needed_delta = dict(zip(selected, needed))
             moves, rebuild = self.plan_moves(selected, needed)
             ordered, cyclic = self.order_moves(moves)

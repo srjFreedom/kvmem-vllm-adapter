@@ -50,8 +50,9 @@ class PositionBooksTest(unittest.TestCase):
         rt.install_pos = False
         rt.log = lambda record: None
         rt.sync_row_from_engine("r", 1274, n_tokens=4096)
-        self.assertEqual(st.seq_len, 40768)
-        with self.assertRaisesRegex(SparseViewCapacityError, "44864.*40768"):
+        self.assertEqual(st.seq_len, 36864,
+                         "row mirroring must not count this step's query a second time")
+        with self.assertRaisesRegex(SparseViewCapacityError, "40960.*40768"):
             rt.before_step("r", row_index=0, position_slots=range(4096))
         self.assertEqual(rt._seq_override, {})
         self.assertEqual(int(seq[0]), 0)
@@ -65,6 +66,49 @@ class PositionBooksTest(unittest.TestCase):
         rt.before_step("r", row_index=0, position_slots=range(4096))
         self.assertEqual(int(seq[0]), 40960)
         self.assertEqual(rt._seq_override, {0: 40960})
+
+
+class PositionsStayTrueAfterCompaction(unittest.TestCase):
+    def _runtime(self, tokens, seq_len):
+        import torch
+        from kvmem_sparse_runtime import VllmSparseRuntime, _ReqState
+        rt = VllmSparseRuntime.__new__(VllmSparseRuntime)
+        st = _ReqState()
+        st.row_index = 0
+        st.tokens, st.seq_len = tokens, seq_len
+        st.row = tuple(range(101, 101 + 1176))
+        seq = torch.zeros(1, dtype=torch.int32)
+        pos = torch.arange(65536, dtype=torch.int64)
+        rt.view = NS(block_table_rows=lambda: [torch.zeros(1, 4096, dtype=torch.int32)],
+                     seq_lens=lambda: seq, positions=lambda: pos)
+        rt._state = {"r": st}
+        rt._orch = {"r": NS()}
+        rt._engine_computed = {}
+        rt._seq_override = {}
+        rt._absorb_upto = {}
+        rt._page_map = {"r": {}}
+        rt.page_tokens = 32
+        rt.inrequest_compaction = True
+        rt.install = True
+        rt.install_row = True
+        rt.install_seq = True
+        rt.install_pos = True
+        rt.log = lambda record: None
+        return rt, st, pos
+
+    def test_compacted_view_keeps_true_positions(self):
+        rt, st, pos = self._runtime(tokens=147456, seq_len=36864)
+        before = pos.clone()
+        rt.before_step("r", row_index=0, position_slots=range(4, 8))
+        self.assertTrue(bool(rt._positions_must_stay_true))
+        self.assertTrue(bool(pos[4:8].equal(before[4:8])),
+                        "positions must stay TRUE so prepare_attn subtracts the offset once")
+
+    def test_dense_prefix_still_installs_compacted_positions(self):
+        rt, st, pos = self._runtime(tokens=0, seq_len=0)
+        rt.before_step("r", row_index=0, position_slots=range(0, 4))
+        self.assertFalse(bool(rt._positions_must_stay_true))
+        self.assertEqual([int(v) for v in pos[:4]], [0, 1, 2, 3])
 
 
 if __name__ == "__main__":

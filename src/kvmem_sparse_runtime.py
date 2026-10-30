@@ -470,6 +470,9 @@ class VllmSparseRuntime:
                 from kvmem_retrieval_index import KvmemRetrievalIndex
                 index = KvmemRetrievalIndex(self.select_block_tokens, self.page_tokens,
                                             self.head_dim, len(kv_tensors))
+                # KVMem query policy: the tail of the last-user span (512 max), falling back to the
+                # last 64 query tokens. Averaging a whole prefill chunk diluted the question.
+                index.query_tail = max(1, int(os.environ.get("KVMEM_QUERY_TAIL", "512") or 512))
                 self._retrieval[req] = index
                 orch.retrieval_index = index
                 if orch.planner is not None:
@@ -496,6 +499,10 @@ class VllmSparseRuntime:
         store._on_evict = self._release_parked
         store._max_sessions = max(1, int(self.sessions))
         return store
+
+    def _pure_copy(self):
+        """True = compaction moves bytes without re-baking RoPE (the fork's true-position split)."""
+        return os.environ.get("KVMEM_REBAKE", "").strip().lower() not in ("1", "true", "yes", "on")
 
     def _open_host_share(self):
         """Use a fresh H identity; evict idle checkpoints before spending another share."""
@@ -1306,6 +1313,14 @@ class VllmSparseRuntime:
                         st.row, dtype=table.dtype, device=table.device)
             return st
         self._seq_override[row_index] = step_end
+        # Positions must stay TRUE once a compaction makes logical > resident: the fork adds
+        # `kvmem_rope_offset` to the engine's positions for RoPE and `prepare_attn` subtracts
+        # `kvmem_slot_offset` for the write address. Overwriting them with compacted values here
+        # made the slot index negative after the boundary compaction (measured: CUDA illegal access
+        # at 163,840 tokens; the same run completed with positions left alone).
+        self._positions_must_stay_true = (
+            int(st.tokens) > int(st.seq_len)
+            and not (os.environ.get("KVMEM_NO_ROPE_OFFSET", "").strip() in ("1", "true", "yes", "on")))
         if not self.install:
             return st
         # seq_lens must COVER the tokens of this step: vLLM expects the number of computed
@@ -1335,7 +1350,7 @@ class VllmSparseRuntime:
         # INCLUDING-query length as the base, so every step shifted positions by one (decode) or
         # by a whole chunk (prefill) - the KV was then rotated to the wrong RoPE and the output
         # degenerated into gibberish (measured live).
-        if self.install_pos:
+        if self.install_pos and not getattr(self, "_positions_must_stay_true", False):
             base = seq_len - len(position_slots)
             for j, slot in enumerate(position_slots):
                 positions[slot] = base + j
@@ -1394,10 +1409,15 @@ class VllmSparseRuntime:
             table = self.view.block_table_rows()[0]
             values = table[st.row_index].tolist()[:w]
             st.row = tuple(values)
-            # Keep the attention length consistent with what the row can address.
+            # `seq_len` is the resident length written BEFORE this step; `before_step` adds the
+            # current query exactly once. Deriving it here as `tokens + n_tokens` made the two
+            # additions double-count (live: prefill step scheduled 4,096 tokens against a 4,704-token
+            # row and installed seq_lens=8,192, then every step was clamped by one chunk).
             cap = len(st.row) * max(1, self.page_tokens)
-            want = int(getattr(st, "tokens", 0)) + int(n_tokens or 0)
-            st.seq_len = min(want, cap) if want > 0 else cap
+            if int(getattr(st, "seq_len", 0) or 0) <= 0:
+                st.seq_len = 0
+            elif int(st.seq_len) > cap:
+                st.seq_len = cap
             if self.log is not None:
                 self.log({"kind": "row_synced", "req": req, "row": len(st.row),
                           "seq_len": int(st.seq_len), "tokens": int(getattr(st, "tokens", 0)),
@@ -1509,6 +1529,11 @@ class VllmSparseRuntime:
             _finished = (not self.compact_rebuild and self.reselect_at_prompt_end
                          and _prev_n > 1 and int(n_new or 0) <= 1)
             if (not self.compact_rebuild
+                    # In Core-boundary mode the final, query-driven reselect runs on the EngineCore
+                    # step boundary (after the last chunk's output); doing it here would use the
+                    # socket path and leave the next chunk one page short (measured: 38,945 needed
+                    # vs 38,944 covered).
+                    and not bool(getattr(self, "sched_compact", False))
                     and ((_plq and int(getattr(_stq, "tokens", 0)) >= _plq) or _finished)
                     and not getattr(_stq, "query_reselected", False)
                     and getattr(_stq, "row", ())
@@ -1689,15 +1714,19 @@ class VllmSparseRuntime:
             _st.tokens = max(_st.tokens, frontier - int(n_new_tokens or 0))
         logical_c = self._engine_logical.get(req)
         if logical_c is not None and logical_c > 0:
-            # The SERVED count is the logical frontier. It is reset every step because
-            # `num_scheduled_tokens` includes speculative drafts that may be rejected; it already
-            # INCLUDES the step being committed here, so subtract it first (the commit loop adds it
-            # back). With compaction this counter keeps growing while the resident book shrinks.
-            self._state[req].tokens = max(0, int(logical_c) - int(n_new_tokens or 0))
+            # The SERVED count published by the PREVIOUS schedule describes the frontier BEFORE
+            # the chunk committed here. Treating it as if it already included this chunk and
+            # subtracting `n_new` again made the executed book lag one whole chunk (measured on
+            # the 169,998-token TP2 run: worker 145,088 vs Core resident 153,280 at the first
+            # pressure compaction). The commit below appends this chunk's tokens.
+            self._state[req].tokens = max(int(self._state[req].tokens), int(logical_c))
         engine_c = self._engine_computed.get(req)
-        if engine_c is not None and engine_c > 0:
-            # RESIDENT book length (what positions/seq_lens must agree with).
-            self._state[req].seq_len = max(0, int(engine_c) - int(n_new_tokens or 0))
+        if engine_c is not None and engine_c > 0 and not self._state[req].row:
+            # RESIDENT book for a still-dense prefix. V2's CPU `num_computed_tokens_np` is the
+            # sampler's LOGICAL mirror, not the resident KV length, so it must never overwrite a
+            # compacted `seq_len`: a compaction keeps `row`/`seq_len` and the commit step advances
+            # both together.
+            self._state[req].seq_len = max(int(self._state[req].seq_len), int(engine_c))
         pending = int(self._pending_new.get(req, 0) or 0)
         if pending > int(n_new_tokens or 0):
             n_new_tokens = pending            # prefill chunks are visible only via query_start_loc
@@ -1777,8 +1806,9 @@ class VllmSparseRuntime:
                 # baked `(rank - logical) * page_tokens` away from its logical start. Recording the
                 # rank (not the engine page id) is what lets a later resume, or a second request
                 # whose pool pages start at another base, restore the page to the right position.
-                orch.commit_written_page(logical, slot,
-                                         baked=(rank - logical) * self.page_tokens)
+                orch.commit_written_page(
+                    logical, slot,
+                    baked=0 if self._pure_copy() else (rank - logical) * self.page_tokens)
                 if st.spare == slot:
                     st.spare = None
             st.tokens += n_new_tokens
@@ -1813,6 +1843,16 @@ class VllmSparseRuntime:
             # compaction may only ever drop GENERATED tokens. Remember the prefill length here so
             # every reselect can declare the prompt pages mandatory.
             orch.prompt_tokens = max(0, st.tokens - n_new_tokens)
+        # Freeze the query once the prompt is complete: the last prefill chunk captured the
+        # question, and subsequent decode steps must not replace it (KVMem's frozen attachment).
+        try:
+            _idx = self._retrieval.get(req)
+            _pl = int(self._prompt_len.get(req, 0) or 0)
+            if (_idx is not None and _pl and not prefill and int(st.tokens) >= _pl
+                    and not getattr(_idx, "_query_frozen", False)):
+                _idx.freeze_query()
+        except Exception:
+            pass
         # Resident model: a prompt LONGER than B is the normal case now - it is prefilled in
         # chunks and the working set is compacted as it grows (the logical book keeps every token,
         # the resident book stays <= B+R). Log the shape once during diagnosis.
@@ -1882,9 +1922,10 @@ class VllmSparseRuntime:
                 self.log({"kind": "query_reselect", "req": req, "tokens": int(st.tokens),
                           "prompt": prompt_len, "n_new": int(n_new_tokens or 0)})
                 self._reselect(req, probe=True)
-            elif prefill_pressure_due(
-                    st.tokens, max(len(orch.resident), len(st.row)), high,
-                    getattr(orch, "_tokens_at_reselect", 0), self.gen_reserve):
+            elif (not bool(getattr(self, "sched_compact", False))
+                  and prefill_pressure_due(
+                      st.tokens, max(len(orch.resident), len(st.row)), high,
+                      getattr(orch, "_tokens_at_reselect", 0), self.gen_reserve)):
                 # The ROW is the true residency: pages the engine appended since the last
                 # compaction are in the row immediately (the cursor sync copies them), while
                 # `orch.resident` only knows the set the last compaction installed. Comparing
@@ -2026,8 +2067,49 @@ class VllmSparseRuntime:
                           "error": _tb.format_exc()[-400:]})
             return None
 
-    def _reselect(self, req, prefill_pressure=False, probe=False, rebuild=False):
+    def quiescent_compact(self, req, frontier=None):
+        """EngineCore-callable compaction on the scheduler thread, between steps.
+
+        The worker has completed the previous forward but not yet committed it (the commit runs at
+        the next `advance`). This flushes that chunk, checks that the executed frontier still equals
+        the one EngineCore scheduled, then moves pages and installs the compacted row WITHOUT the
+        BlockChannel call: EngineCore adopts the blocks and rewrites its own books from the returned
+        proposal, so no worker-originated scheduler mutation happens off the main thread.
+        """
+        if not req or req not in self._state:
+            return None
+        pending = int(self._prev_n.get(req, 0) or 0)
+        if pending:
+            self.after_step(req, pending, prefill=pending >= self.page_tokens)
+            self._prev_n[req] = 0
         st = self._state[req]
+        if frontier is not None and int(frontier) != int(st.tokens):
+            self.log({"kind": "quiescent_compact_stale", "req": req,
+                      "want": int(frontier), "have": int(st.tokens)})
+            return None
+        self._last_proposal = None
+        self._reselect(req, prefill_pressure=True, send=False)
+        proposal = getattr(self, "_last_proposal", None)
+        if proposal is None:
+            # Diagnostic: Core saw "incomplete TP compaction proposal" with no field saying why
+            # (alignment deferral, empty selection and a refused planner all looked alike).
+            self.log({"kind": "quiescent_compact_empty", "req": req,
+                      "tokens": int(getattr(st, "tokens", 0) or 0),
+                      "seq_len": int(getattr(st, "seq_len", 0) or 0),
+                      "row": len(getattr(st, "row", ()) or ()),
+                      "aligned": int(st.tokens) % int(self.page_tokens) == 0,
+                      "want": None if frontier is None else int(frontier)})
+        else:
+            self.log({"kind": "quiescent_compact_proposal", "req": req,
+                      "visible": proposal.get("visible_tokens"),
+                      "pages": len(proposal.get("physical_pages") or ()),
+                      "logical": proposal.get("logical_frontier"),
+                      "resident": proposal.get("resident_frontier")})
+        return proposal
+
+    def _reselect(self, req, prefill_pressure=False, probe=False, rebuild=False, send=True):
+        st = self._state[req]
+        resident_before = int(st.seq_len)
         # ALIGNMENT INVARIANT: a compaction may only run on a page boundary of the LOGICAL stream.
         # The engine writes the next tokens at compacted positions starting at `visible`. If
         # `logical - visible` is not a whole page, the tail logical page would be split across two
@@ -2218,7 +2300,7 @@ class VllmSparseRuntime:
                 scores, count, req, st.tokens, device)
         stats = orch.reselect(slots=_take, mandatory_pages=mandatory,
                               forced_pages=forced, prefill_pressure=prefill_pressure,
-                              score_reducer=score_reducer)
+                              score_reducer=score_reducer, rebake=not self._pure_copy())
         selected = list(orch.last_view.row_pages)
         used = list(orch.slots[:len(selected)])
         spare = taken["slots"][-1]
@@ -2237,6 +2319,10 @@ class VllmSparseRuntime:
         st.seq_len = sum(min(self.page_tokens, max(0, st.tokens - p * self.page_tokens))
                          for p in selected)
         # Only allocated native blocks remain in the row after EngineCore frees its tail.
+        # Verified on the live TP2 run (2026-10-30): after each boundary compaction the NEXT
+        # schedule re-appends blocks and `sync_row_from_engine` mirrors them (row 1323 -> 1421 ->
+        # 1568 ...), so the adopted row does NOT need to pre-reserve the coming chunk. An earlier
+        # spare-reservation attempt was reverted after the timeline disproved the gap here.
         quantum = max(1, int(getattr(self, "block_pages", self.pages_per_block) or 1))
         keep_pages = ((len(used) + quantum - 1) // quantum) * quantum
         if getattr(self, "compact_channel", None) is not None:
@@ -2296,7 +2382,16 @@ class VllmSparseRuntime:
                   "prompt": prompt_tokens, "mandatory_pages": len(mandatory),
                   "planner": orch.planner is not None,
                   "plan": getattr(orch, "last_plan", None),
-                  "prefill_pressure": stats["prefill_pressure"]}
+                  "prefill_pressure": stats["prefill_pressure"],
+                  # The books this compaction targeted, plus the engine's published pair. A
+                  # frontier difference here is the one-chunk lag that made the TP2 beyond-pool
+                  # run move pages the in-flight chunk still referenced.
+                  "engine_logical": self._engine_logical.get(req),
+                  "engine_computed": self._engine_computed.get(req),
+                  "prev_n": int(self._prev_n.get(req, 0) or 0),
+                  # Diagnostic: the chosen logical pages, so a known needle page can be checked
+                  # against what the compacted view actually kept.
+                  "selected_pages": [int(p) for p in selected]}
         cap = getattr(self, "capture", None)
         if cap is not None:
             record["capture"] = {"calls": cap.calls, "wants": cap.wants,
@@ -2309,7 +2404,7 @@ class VllmSparseRuntime:
         # queues a new prompt for a safe output boundary. The channel reply gates
         # whether the worker may retain the selected view.
         ch = getattr(self, "compact_channel", None)
-        if ch is not None and selected:
+        if ch is not None and selected and send:
             try:
                 # Queue reconstruction; the scheduler applies it AFTER this forward's output
                 # arrives. Both TP workers receive a fresh request event on the next schedule.
@@ -2358,6 +2453,32 @@ class VllmSparseRuntime:
                 record["compact_error"] = str(exc)[:160]
                 if rebuild:
                     raise
+        elif selected and not send:
+            # EngineCore called this on its own thread and will adopt the blocks + rewrite its
+            # books from this proposal. The worker keeps the installed view and moves the append
+            # cursor so the next block lands after the compacted row.
+            record["compact_sent"] = False
+            self._last_proposal = {
+                "request": str(req), "epoch": int(getattr(self, "epoch", 0) or 0),
+                "logical_frontier": int(st.tokens),
+                # The PRE-compaction resident length: EngineCore compares it with its own
+                # `num_computed_tokens` before the rewrite; `visible_tokens` is the new one.
+                "resident_frontier": int(resident_before),
+                "selected_pages": [int(p) for p in selected],
+                # The rows EngineCore must keep: the worker installed `st.row` (already truncated
+                # to whole native blocks), so adopting only `used` freed the block-tail pages the
+                # row still references and the next chunk wrote into recycled pages.
+                "physical_pages": [int(p) for p in (st.row or used)],
+                "visible_tokens": int(st.seq_len), "page_tokens": int(self.page_tokens),
+                "block_pages": int(getattr(self, "block_pages", 1) or 1),
+                "engine_logical": self._engine_logical.get(req),
+                "engine_computed": self._engine_computed.get(req),
+                "prepare": bool(prefill_pressure)}
+            if self.set_block_cursor is not None and st.row:
+                try:
+                    self.set_block_cursor(req, len(st.row))
+                except Exception:
+                    pass
         # Slots this request no longer references go back to the pool. On a refusal only the slots
         # taken in this round are dropped; the old sources stay because the orchestrator still
         # points at them (the engine's own row was not touched).

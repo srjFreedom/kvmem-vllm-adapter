@@ -63,9 +63,9 @@ def validate_quiescent_compaction(request, records, tp_size, epoch, kv_cache_man
         req_id = request.request_id
         logical = int(request.num_logical_tokens)
         resident = int(request.num_computed_tokens)
-        offset = int(getattr(request, "num_kvmem_offset", 0))
-        if logical - resident != offset or resident <= 0:
+        if resident <= 0 or logical < resident:
             raise ValueError("EngineCore served/resident books disagree")
+        # `num_kvmem_offset` is derived at apply time, not required to match before the rewrite.
         ranks = set()
         proposal = None
         for record in records:
@@ -85,7 +85,9 @@ def validate_quiescent_compaction(request, records, tp_size, epoch, kv_cache_man
             if (page <= 0 or block <= 0 or logical % page or resident % page
                     or not selected or selected[0] < 0 or selected[-1] * page >= logical
                     or selected != tuple(sorted(set(selected)))
-                    or len(physical) != len(selected)
+                    # Logical pages and physical slots are distinct namespaces: only require
+                    # that the adopted row covers at least the selected pages.
+                    or len(physical) < len(selected)
                     or visible != len(selected) * page or visible >= resident):
                 raise ValueError("unaligned or non-shrinking TP compaction proposal")
             candidate = (selected, physical, visible, page, block)

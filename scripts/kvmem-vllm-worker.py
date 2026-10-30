@@ -90,7 +90,7 @@ def build_config(a) -> dict:
     # 128-token blocks a single distinctive line (a key, an id, a rare term) is diluted by the
     # other ~127 tokens, and long prompts then lose exactly the needles that matter (measured:
     # a 200K prompt at 50-73% eviction answered with noise at 128 and correctly at 32).
-    block = a.kvmem_block_tokens or 32
+    block = a.kvmem_block_tokens or 64
     if block % 16:
         raise SystemExit(f"--kvmem-block-tokens {block} is not a multiple of the native page (16)")
     if a.kvmem_sink_tokens % 16 or a.kvmem_recent_tokens % 16:
@@ -125,6 +125,12 @@ def build_config(a) -> dict:
         # its own timer, so the fallback budget stays 0. With the native planner present, R drives
         # every reselect; without it, sparsity degrades gracefully instead of inventing a cadence.
         "reselect_token_budget": 0,
+        # Opt-in: compact on the EngineCore step boundary (between steps) instead of from the
+        # worker's active forward. Default off until the beyond-pool path is qualified.
+        "sched_compact": os.environ.get("KVMEM_SCHED_COMPACT", "0").strip().lower()
+        in ("1", "true", "yes", "on"),
+        "sched_compact_reserve_blocks": int(
+            os.environ.get("KVMEM_SCHED_COMPACT_RESERVE_BLOCKS", "24") or 24),
         "reselect_interval": 1_000_000,
     }
     return cfg

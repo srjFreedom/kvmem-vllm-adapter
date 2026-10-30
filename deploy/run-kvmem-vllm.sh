@@ -10,7 +10,7 @@
 #
 #   覆盖：B= R= SINK= RECENT= SESSIONS= HOST_MIB= N= CTX= PORT= ./本脚本
 #   超池相关（默认关闭/默认值，仅供实验）：
-#     SELECT_BLOCK_TOKENS=1616   选择网格 = 引擎块（默认 32 = 32 token）
+#     SELECT_BLOCK_TOKENS=1616   选择网格 = 引擎块（默认 64 = 统计桶，避免 64→32 重采样劈裂短记录）
 #     KVMEM_BLOCK_SIZE=16        请求 16-token 引擎块；混合模型会按 Mamba 对齐，
 #                                本机实测 attention 原生块仍为 1616 tokens（101 页），
 #                                回收必须按原生块所有权处理
@@ -113,7 +113,7 @@ RUN=(env MAX_NUM_SEQS="$N" \
     --kvmem-sink-tokens "$SINK" --kvmem-recent-tokens "$RECENT" \
     --kvmem-sessions "$SESSIONS" --kvmem-host-mib "$HOST_MIB" \
     --kvmem-capture-tokens "$CAPTURE_TOKENS" \
-    --kvmem-block-tokens "${SELECT_BLOCK_TOKENS:-32}" \
+    --kvmem-block-tokens "${SELECT_BLOCK_TOKENS:-64}" \
     --no-kvmem-lrfu \
     --kvmem-score-aggregation mean --kvmem-retrieval)
 if [ "$INREQUEST_COMPACTION" = "1" ]; then RUN+=(--kvmem-inrequest-compaction); fi

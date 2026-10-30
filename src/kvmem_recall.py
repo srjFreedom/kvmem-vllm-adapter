@@ -224,6 +224,42 @@ def compare_scores(core, legacy, blocks=None, top: int = 10) -> dict:
     return out
 
 
+def propagate_neighbor_scores(scores, alpha: float, floor=None):
+    """One hop of graph propagation over the 1-D selection-block chain.
+
+    KVMem's graph recall (graph_recall.hpp) propagates query scores along attention edges; without
+    the graph the official 0.2 strength degenerates to a nearest-block smoothing, which is what the
+    shipped setting needs here: a short record (19 tokens) can straddle two statistics buckets, so
+    its two halves score mediocre in isolation and BOTH would miss the top-k. Boosting each block
+    with `alpha` times the mean of its finite neighbours lets an adjacent high score carry its
+    neighbour over the cut. Non-finite entries stay untouched and never contribute.
+    """
+    values = list(scores)
+    n = len(values)
+    a = float(alpha or 0.0)
+    if a <= 0.0 or n == 0:
+        return values
+
+    def _ok(v):
+        return v == v and v not in (float("inf"), float("-inf"))
+
+    out = list(values)
+    for i, value in enumerate(values):
+        if not _ok(value):
+            continue
+        total = 0.0
+        count = 0
+        if i > 0 and _ok(values[i - 1]):
+            total += values[i - 1]
+            count += 1
+        if i + 1 < n and _ok(values[i + 1]):
+            total += values[i + 1]
+            count += 1
+        if count:
+            out[i] = value + a * (total / count)
+    return out
+
+
 def align_scores(core, core_block_tokens: int, legacy_blocks: int,
                  legacy_block_tokens: int):
     """Resample core scores onto the LEGACY block grid before comparing them.

@@ -775,6 +775,9 @@ def _attach_sparse(runner, log_path):
         if _nb and _bs:
             _reserve = (3 * (1 + _spec) + 3 + 2)      # mamba state blocks + one chunk + slack
             runtime.pool_ceiling_tokens = max(0, (_nb - _reserve) * _bs)
+            # Opt-in: EngineCore compacts at its step boundary; the worker must not also reselect
+            # inside the next step's forward, or both paths rewrite the same row.
+            runtime.sched_compact = bool(cfg.get("sched_compact", False))
             # The runtime computed its watermark in __init__, BEFORE this number existed, so apply
             # the cap here as well (otherwise the pool-driven threshold is published and ignored).
             try:
@@ -1408,9 +1411,26 @@ def register():
                 return runtime.check_session_checkpoint(owner, hashes, frontier, digest,
                                                         capacity_pages)
 
+            def _kvmem_quiescent_compact(worker, request_id, frontier, epoch):
+                """EngineCore-side compaction: flush, move pages, return the proposal.
+
+                Must not call back into EngineCore (no BlockChannel): Core applies the books.
+                `rank`/`epoch` identify the proposal so Core can require one per TP rank.
+                """
+                runner = getattr(worker, "model_runner", None)
+                runtime = getattr(runner, "kvmem_runtime", None)
+                if runtime is None:
+                    return None
+                proposal = runtime.quiescent_compact(str(request_id), int(frontier))
+                if isinstance(proposal, dict):
+                    proposal["rank"] = int(getattr(worker, "rank", 0) or 0)
+                    proposal["epoch"] = int(epoch)
+                return proposal
+
             _GPUWorker.prepare_kvmem_session_checkpoints = _prepare_kvmem_session_checkpoints
             _GPUWorker.abort_kvmem_session_checkpoints = _abort_kvmem_session_checkpoints
             _GPUWorker.check_kvmem_session_checkpoint = _check_kvmem_session_checkpoint
+            _GPUWorker.kvmem_quiescent_compact = _kvmem_quiescent_compact
     except Exception:
         _boot("session checkpoint worker RPC install failed: " + traceback.format_exc())
     _ensure_import_path()
@@ -1774,6 +1794,83 @@ def register():
                             or "/tmp/kvmem_sparse.jsonl",
                             {"pid": os.getpid(), **event}))
 
+                def _quiescent_compaction(core):
+                    """Opt-in: compact at the Core boundary, between steps, on the main thread.
+
+                    Every worker must propose the same frontier/working set; EngineCore then adopts
+                    the blocks and rewrites its books ONCE, so the next schedule is built from the
+                    compacted layout and its offset. A worker-originated compaction (the socket
+                    path) runs after that schedule and leaves the next chunk on a stale offset.
+                    """
+                    cfg = _sched_cfg(getattr(core, "scheduler", None))
+                    if not cfg.get("sched_compact"):
+                        return
+                    scheduler = getattr(core, "scheduler", None)
+                    manager = getattr(scheduler, "kv_cache_manager", None)
+                    executor = getattr(core, "model_executor", None)
+                    if (scheduler is None or manager is None or executor is None
+                            or getattr(executor, "is_failed", False)):
+                        return
+                    from kvmem_sched_compact import (apply_compaction, pick_candidate,
+                                                     pressure_due)
+                    from kvmem_reconstruction import adopt_attention_blocks, \
+                        validate_quiescent_compaction
+                    reserve = int(cfg.get("sched_compact_reserve_blocks", 24))
+                    try:
+                        free = int(manager.block_pool.get_num_free_blocks())
+                    except Exception:
+                        return
+                    # Two triggers: (a) pool pressure, and (b) the final query-driven reselect once
+                    # the prompt is complete - the only moment the real question is in the captured
+                    # query window. Without (b) the compacted view keeps a prefill-time selection
+                    # and the needle in the MIDDLE of a long prompt is never ranked (measured:
+                    # repeated "access" tail instead of the code).
+                    running = list(getattr(scheduler, "running", ()))
+                    final = [r for r in running
+                             if int(getattr(r, "num_in_flight_tokens", 0) or 0) == 0
+                             and int(getattr(r, "num_logical_tokens", 0) or 0)
+                             >= int(getattr(r, "num_prompt_tokens", 0) or 0)
+                             and not getattr(r, "kvmem_final_reselect", False)]
+                    pressure = pressure_due(free, reserve)
+                    if final:
+                        request = max(final, key=lambda r: int(r.num_logical_tokens))
+                    elif pressure:
+                        request = pick_candidate(running, reserve)
+                    else:
+                        return
+                    if request is None:
+                        return
+                    epoch = int(getattr(scheduler, "kvmem_compact_epoch", 0) or 0) + 1
+                    scheduler.kvmem_compact_epoch = epoch
+                    try:
+                        tp_size = int(core.vllm_config.parallel_config.tensor_parallel_size)
+                    except Exception:
+                        tp_size = 1
+                    log_path = _sched_cfg(scheduler).get("probe_log") or "/tmp/kvmem_sparse.jsonl"
+                    try:
+                        records = executor.collective_rpc(
+                            "kvmem_quiescent_compact", timeout=120,
+                            args=(request.request_id, int(request.num_logical_tokens),
+                                  epoch))
+                        result = validate_quiescent_compaction(
+                            request, records, tp_size, epoch, manager)
+                        outcome = apply_compaction(
+                            request, result,
+                            lambda visible, pages, block_pages: adopt_attention_blocks(
+                                manager, request.request_id, pages, block_pages))
+                    except Exception as exc:
+                        _append(log_path, {"kind": "sched_compact_refused", "pid": os.getpid(),
+                                           "req": request.request_id,
+                                           "error": f"{type(exc).__name__}: {exc}"})
+                        return
+                    if request in final:
+                        request.kvmem_final_reselect = True
+                    _append(log_path, {"kind": "sched_compact_applied", "pid": os.getpid(),
+                                       "req": request.request_id, "epoch": epoch,
+                                       "visible": outcome["visible"],
+                                       "offset": outcome["offset"], "final": bool(final),
+                                       "free_blocks": free, **outcome["adopted"]})
+
                 def step(self, *args, **kwargs):
                     _channel_state["executor"] = self.model_executor
                     result = original_step(self, *args, **kwargs)
@@ -1784,6 +1881,14 @@ def register():
                         _append("/tmp/kvmem_sparse.jsonl",
                                 {"kind": "session_checkpoint_retire_error",
                                  "pid": os.getpid(), "error": traceback.format_exc()[-600:]})
+                    try:
+                        # After update_from_output and before the next schedule: no forward is in
+                        # flight, so an RPC that moves pages cannot race a GPU step.
+                        _quiescent_compaction(self)
+                    except Exception:
+                        _append("/tmp/kvmem_sparse.jsonl",
+                                {"kind": "sched_compact_error", "pid": os.getpid(),
+                                 "error": traceback.format_exc()[-600:]})
                     return result
 
                 step._kvmem_session_retire_patched = True

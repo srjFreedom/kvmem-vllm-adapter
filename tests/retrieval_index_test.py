@@ -16,6 +16,17 @@ def check(cond, msg):
     failed |= not cond
 
 
+def test_neighbor_propagation():
+    from kvmem_recall import propagate_neighbor_scores
+    scores = [0.0, 0.0, 1.0, 0.0, 0.0, float("-inf")]
+    out = propagate_neighbor_scores(scores, 0.2)
+    check(abs(out[2] - 1.0) < 1e-9, "the peak keeps its own score (neighbours are 0)")
+    check(abs(out[1] - 0.1) < 1e-9 and abs(out[3] - 0.1) < 1e-9,
+          f"both neighbours inherit 0.2 x the MEAN of their two neighbours "
+          f"({out[1]:.3f}, {out[3]:.3f})")
+    check(out[5] == float("-inf"), "a non-finite entry never contributes or changes")
+    check(propagate_neighbor_scores(scores, 0.0) == scores, "alpha 0 is a no-op")
+
 def main():
     idx = KvmemRetrievalIndex(block_tokens=32, page_tokens=16, head_dim=8, layers=2)
     check(idx.block_of(0) == 0 and idx.block_of(1) == 0 and idx.block_of(2) == 1,
@@ -68,6 +79,22 @@ def main():
         check(False, "scoring without a query must raise")
     except RuntimeError:
         check(True, "scoring without a query raises")
+
+    # The capture runs inside a model step (InferenceMode), so _query is an inference tensor.
+    # begin_query/add_query used to raise "Inplace update to inference tensor outside InferenceMode"
+    # on every layer, leaving the query at zero and making compaction rank with no query.
+    live = KvmemRetrievalIndex(32, 16, 8, 2)
+    with torch.inference_mode():
+        live._query = torch.zeros(2, 8)
+        live._query_counts = torch.zeros(2)
+    live.begin_query(0)
+    live.add_query(0, torch.ones(8))
+    live.add_query(0, torch.ones(8))
+    check(bool(torch.allclose(live._query[0], torch.full((8,), 2.0))),
+          f"query accumulates over inference tensors (got {live._query[0].tolist()[:2]})")
+    check(float(live._query_counts[0]) == 2.0, "query count tracks the accumulation")
+
+    test_neighbor_propagation()
 
     print("PASS retrieval_index_test" if not failed else "FAILED retrieval_index_test")
     sys.exit(0 if not failed else 1)

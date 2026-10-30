@@ -30,6 +30,10 @@ class KvmemRetrievalIndex:
         self._sums: dict[int, torch.Tensor] = {}     # block -> (layers, head_dim) float32
         self._counts: dict[int, torch.Tensor] = {}   # block -> (layers,) float32
         self._query: torch.Tensor | None = None      # (layers, head_dim) float32
+        # Per-layer pre-RoPE query ROWS captured on the last prompt chunk (the question). The
+        # engine's bridge is transient (empty on decode steps), so the core scorer needs this
+        # frozen copy to rank with the question instead of a zero query.
+        self._q_rows: dict[int, torch.Tensor] = {}
 
     # --- accumulation -----------------------------------------------------------------
     def block_of(self, page):
@@ -66,8 +70,13 @@ class KvmemRetrievalIndex:
         if sums is None:
             sums = torch.zeros(self.layers, self.head_dim, dtype=self.dtype, device=device)
             self._counts[block] = torch.zeros(self.layers, dtype=self.dtype, device=device)
-        sums[layer] += vec
-        self._counts[block][layer] += 1.0
+        # The buffers were created inside a model step (InferenceMode), and PyTorch refuses an
+        # in-place update to such a tensor outside InferenceMode: begin_query/add_query raised
+        # "Inplace update to inference tensor outside InferenceMode" on every layer, so the query
+        # was never harvested and compaction ranked with a zero query (measured: repeated output).
+        with torch.inference_mode():
+            sums[layer] += vec
+            self._counts[block][layer] += 1.0
         self._sums[block] = sums
 
     def begin_query(self, layer):
@@ -77,23 +86,43 @@ class KvmemRetrievalIndex:
             self._query = torch.zeros(self.layers, self.head_dim, dtype=self.dtype,
                                       device=_dev) if _dev is not None else \
                 torch.zeros(self.layers, self.head_dim, dtype=self.dtype)
-        self._query[layer] = 0.0
+        with torch.inference_mode():
+            self._query[layer] = 0.0
         _dev = getattr(self, "device", None)
         self._query_counts = getattr(self, "_query_counts",
                                      torch.zeros(self.layers, dtype=self.dtype,
                                                  device=_dev) if _dev is not None else
                                      torch.zeros(self.layers, dtype=self.dtype))
-        self._query_counts[layer] = 0.0
+        with torch.inference_mode():
+            self._query_counts[layer] = 0.0
+
+    def freeze_query(self):
+        """Keep the query captured on the prompt tail; decode steps must not overwrite it.
+
+        KVMem freezes the query at the last-user span ("frozen query attachment"); letting each
+        decode step re-capture replaced the question with a single generated token, so the final
+        compaction ranked with the wrong query (measured: needle page 2655 never selected).
+        """
+        self._query_frozen = True
 
     def add_query(self, layer, q_pre):
-        """Accumulate one chunk's pre-RoPE query into the running per-layer sum."""
-        if q_pre.numel() == 0:
+        """Accumulate one chunk's pre-RoPE query into the running per-layer sum.
+
+        Only the TAIL of the chunk participates: KVMem's query is the tail of the actual last-user
+        span (`query_max_tokens`, ninfer engine_options.h:421), with the original's "query-last 64"
+        fallback when the last-user match is unavailable (docs/milestones/v0.12.1.md:43). Averaging
+        the whole chunk instead diluted the question with the preceding context lines and the
+        compacted view stopped ranking the mid-prompt needle (measured: needle page 2655 never
+        selected; answer repeated the tail).
+        """
+        if q_pre.numel() == 0 or getattr(self, "_query_frozen", False):
             return
         vec = q_pre.to(self.dtype)
+        tail = max(1, int(getattr(self, "query_tail", 512) or 512))
         if vec.ndim == 3:
-            vec = vec.mean(dim=1)
+            vec = vec[-tail:].mean(dim=1)
         if vec.ndim == 2:
-            vec = vec.mean(dim=0)
+            vec = vec[-tail:].mean(dim=0)
         if self._query is None:
             _dev = getattr(self, "device", None)
             self._query = torch.zeros(self.layers, self.head_dim, dtype=self.dtype,
@@ -107,18 +136,20 @@ class KvmemRetrievalIndex:
             vec = torch.where(torch.isfinite(vec), vec, torch.zeros_like(vec))
         except Exception:
             pass
-        self._query[layer] += vec
-        self._query_counts[layer] += 1.0
+        with torch.inference_mode():
+            self._query[layer] += vec
+            self._query_counts[layer] += 1.0
 
     def set_query(self, layer, q_pre):
-        """Record this step's pre-RoPE query summary for `layer` (mean over its heads/tokens)."""
-        if q_pre.numel() == 0:
+        """Record this step's pre-RoPE query summary for `layer` (mean over the question tail)."""
+        if q_pre.numel() == 0 or getattr(self, "_query_frozen", False):
             return
         vec = q_pre.to(self.dtype)
+        tail = max(1, int(getattr(self, "query_tail", 512) or 512))
         if vec.ndim == 3:
-            vec = vec.mean(dim=1)
+            vec = vec[-tail:].mean(dim=1)
         if vec.ndim == 2:
-            vec = vec.mean(dim=0)
+            vec = vec[-tail:].mean(dim=0)
         if self._query is None:
             _dev = getattr(self, "device", None)
             self._query = torch.zeros(self.layers, self.head_dim, dtype=self.dtype,
@@ -128,7 +159,8 @@ class KvmemRetrievalIndex:
             vec = torch.where(torch.isfinite(vec), vec, torch.zeros_like(vec))
         except Exception:
             pass
-        self._query[layer] = vec
+        with torch.inference_mode():
+            self._query[layer] = vec
 
     # --- scoring ----------------------------------------------------------------------
     def scores(self, blocks=None):

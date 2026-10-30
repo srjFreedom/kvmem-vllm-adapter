@@ -328,6 +328,11 @@ def harvest_from_bridge(capture):
                     capture._log({"kind": "bridge_harvest_skip_nonfinite", "layer": layer})
                 continue
             index.begin_query(layer)
+            try:
+                if not getattr(index, "_query_frozen", False):
+                    index._q_rows[layer] = q_pre.detach().to("cpu").half().clone()
+            except Exception:
+                pass
             index.add_query(layer, q_pre)
             fed += 1
         except Exception:
