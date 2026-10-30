@@ -2711,6 +2711,13 @@ class VllmSparseRuntime:
             return False, "picker returned nothing"
         if max(selected) < n_pages - 1:
             return False, "selection lost the question tail"
+        if self.log is not None:
+            self.log({"kind": "rebuild_pack_diag", "req": req,
+                      "sel_n": len(selected), "pool_pages": len(pool_pages),
+                      "slot_of": len(orch.slot_of),
+                      "first_sel": selected[:3], "last_sel": selected[-3:],
+                      "phys_first": [int(orch.slot_of.get(p, -1)) for p in selected[:3]],
+                      "phys_last": [int(orch.slot_of.get(p, -1)) for p in selected[-3:]]})
         # 2) the packed physical row (view order) - validate completeness before Core sees it
         phys = [int(orch.slot_of.get(p, 0) or 0) for p in selected]
         if len(phys) != len(selected) or min(phys) <= 0 or len(set(phys)) != len(phys):
