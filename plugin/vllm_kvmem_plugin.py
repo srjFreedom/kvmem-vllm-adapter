@@ -2558,6 +2558,13 @@ def _install(cls, module_name, probe, smoke, state):
                                             _rq.pop(req, None)
                                 except Exception:
                                     _rq.pop(req, None)
+                                    _t2 = getattr(runtime, "_rebuild_tries", None)
+                                    if _t2 is None:
+                                        _t2 = runtime._rebuild_tries = {}
+                                    _t2[req] = int(_t2.get(req, 0)) + 1
+                                    if _t2[req] < 6:
+                                        _rq[req] = int(getattr(
+                                            runtime._state.get(req), "tokens", 0) or 0)
                                     _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                                             {"kind": "rebuild_select_error", "req": req,
                                              "error": traceback.format_exc()[-400:]})
