@@ -2725,18 +2725,26 @@ class VllmSparseRuntime:
             if rank is not None:
                 ppb_sel = int(orch.selector.pages_per_selection_block())
                 for p in rank:
-                    scored_blocks.add((int(p) * ppb_sel) // bp)
+                    scored_blocks.add(int(p) // ppb_sel)
             tail_blocks = {p // bp for p in forced_tail}
-            middle = sorted(scored_blocks - tail_blocks)
+            # a block enters the pack ONLY when every page inside it is complete AND has
+            # canonical store bytes (or is the engine-resident tail): a hole would shift
+            # later pages against their assigned ranks. Filter BEFORE assigning destinations.
+            def block_ok(b):
+                for p in range(b * bp, (b + 1) * bp):
+                    if p >= prompt_tokens:
+                        continue
+                    if not (orch.store.has(p) or p >= tail_first):
+                        return False
+                return True
+            good = {b for b in scored_blocks if block_ok(b)}
+            good |= {b for b in tail_blocks if block_ok(b)}
+            middle = sorted(good - tail_blocks)
             middle = middle[:max(0, cap_engine_blocks - len(tail_blocks))]
             chosen = sorted(middle + list(tail_blocks))
             logical_pages = sorted({p for b in chosen for p in
                                     range(b * bp, (b + 1) * bp) if p < n_pages})
-            # every page must have canonical store bytes (the tail is engine-resident already;
-            # a scored-away page without bytes would silently break the row)
-            usable = [p for p in logical_pages if orch.store.has(p) or p >= tail_first]
-            missing = len(logical_pages) - len(usable)
-            logical_pages = usable
+            missing = 0
             # 2) self-contained device pack: page -> pool window slot, each written as the
             #    canonical store bytes rotated ONCE to its new rank (`restore_page_rank`:
             #    `needed - store_delta`, never a rotation of a rotation).
