@@ -2851,7 +2851,7 @@ class VllmSparseRuntime:
         st.applied_view_coord = True
         st.compacted_in_prefill = True
         st.window_src = {rank: int(lp) for rank, lp in enumerate(selected)}
-        self._owned_slots[req] = list(st.row)
+        self._owned_slots[req] = set(int(p) for p in st.row)
         # 4) hand Core the reconstruction over the channel (rebuild branch -> pending -> fresh
         #    dense admission of `select_tokens(logical)` on the scheduler thread)
         try:
@@ -3263,7 +3263,7 @@ class VllmSparseRuntime:
             orch.rebuild_index(tuple(logical_pages))
         except Exception:
             pass
-        self._owned_slots[req] = list(st.row)
+        self._owned_slots[req] = set(int(p) for p in st.row)
         self._last_proposal = {
             "request": str(req), "epoch": int(getattr(self, "epoch", 0) or 0),
             "logical_frontier": tokens,
