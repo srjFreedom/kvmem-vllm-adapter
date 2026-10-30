@@ -2710,29 +2710,36 @@ class VllmSparseRuntime:
             pool_blocks = int(self.view.num_blocks())
             cap_engine_blocks = max(2, min(
                 pool_blocks, int(self.budget_tokens) // (bp * pt)))
-            rank = None
-            try:
-                rank = orch.selector.select_pages(forced_tail)
-            except Exception:
-                rank = None
-            if self.log is not None:
-                _r0 = [int(x) for x in (rank or ())]
-                self.log({"kind": "rebuild_ns_probe", "req": req,
-                          "rank_len": len(_r0), "rank_head": _r0[:6], "rank_tail": _r0[-6:],
-                          "ppb_sel": int(orch.selector.pages_per_selection_block()),
-                          "row_head": [int(p) for p in (st.row or ())[:6]],
-                          "slot_head": [int(orch.slot_of.get(p, -1)) for p in range(6)],
-                          "slot_mid": [int(orch.slot_of.get(p, -1))
-                                       for p in range(2500, 2506)],
-                          "store_head": [int(orch.store.has(p)) for p in range(6)],
-                          "store_mid": [int(orch.store.has(p)) for p in range(2500, 2506)]})
-            ppb_sel = int(orch.selector.pages_per_selection_block())
-            rank_blocks = []
-            if rank is not None:
-                for p in rank:
-                    b = int(p) // ppb_sel
-                    if b not in rank_blocks:
-                        rank_blocks.append(b)          # RANK ORDER, not page order
+            # Rank by OUR OWN core scores, not by `select_pages` (which returns the working set
+            # ASCENDING by design - the header says so - so slicing it yielded the sink blocks).
+            # score grid = selection blocks (64 tokens); an ENGINE block (49 pages) is top-ranked
+            # by the max score over its selection blocks.
+            core = getattr(orch, "_last_core", None)
+            if core is None:
+                try:
+                    core = orch.core_selection_scores()
+                except Exception:
+                    core = None
+            if core is None:
+                return False, "no retrieval scores (query never frozen?)"
+            _rc = getattr(orch, "_recall", None)
+            bt = max(1, int(getattr(_rc, "block_tokens", 0) or 64))
+            pages_per_sel_block = max(1, bt // pt)
+            eng_scores = {}
+            for gi, v in enumerate(core):
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if fv != fv:
+                    continue
+                first_pg = gi * pages_per_sel_block
+                eng = first_pg // bp
+                if eng > cap_engine_blocks * 4 and eng * bp >= prompt_tokens:
+                    continue
+                if fv > eng_scores.get(eng, 0.0):
+                    eng_scores[eng] = fv
+            rank_blocks = sorted(eng_scores, key=lambda b: -eng_scores[b])
             tail_blocks = {p // bp for p in forced_tail}
             # a block enters the pack ONLY when every page inside it is complete AND has
             # canonical store bytes (or is the engine-resident tail): a hole would shift
@@ -2778,10 +2785,8 @@ class VllmSparseRuntime:
             phys = [int(dest[lp]) for lp in logical_pages]
             selected = [int(lp) for lp in logical_pages]
             if self.log is not None:
-                _r0 = [int(x) for x in (rank or ())]
-                _nb = -(-int(getattr(orch, "needle_page", 0) or 0) // bp) if hasattr(orch, "needle_page") else None
                 self.log({"kind": "rebuild_select_diag", "req": req,
-                          "rank_n": len(_r0), "rank_head": _r0[:12], "rank_tail": _r0[-24:],
+                          "engine_rank_head": rank_blocks[:24],
                           "rank_blocks": len(rank_blocks),
                           "rank_blocks_tail": rank_blocks[-40:],
                           "tail_blocks": sorted(tail_blocks),
