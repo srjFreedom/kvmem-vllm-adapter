@@ -160,6 +160,14 @@ def main():
     check(calls[0] == ("reselect", True, False, True),
           f"Core says not final -> pressure picker ({calls[0]})")
 
+    # ---------- rewind notify: view-coord basis flag on the state ----------
+    check(getattr(st, "applied_view_coord", False) is not True,
+          "fresh state starts in true-position coordinates")
+    rt.log = lambda record: None
+    rt.book_rewound("r", 20160)
+    check(getattr(rt._state["r"], "applied_view_coord", False) is True,
+          "book_rewound marks the request as living in VIEW coordinates")
+
     print("PASS quiescent_compact_test" if not failed else "FAILED quiescent_compact_test")
     return 0 if not failed else 1
 

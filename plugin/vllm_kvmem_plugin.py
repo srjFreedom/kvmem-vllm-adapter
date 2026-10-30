@@ -1461,8 +1461,50 @@ def register():
                 except Exception:
                     return False
 
+            def _kvmem_rewind_book(worker, request_id, visible_tokens):
+                """Rewind the WORKER's resident book after EngineCore applied a boundary
+                compaction.
+
+                `req_states.num_computed_tokens` is device-self-accumulated (sampled tokens) and
+                the CachedRequestData feed only rewrites requests that gained blocks or resumed -
+                so Core's rewritten `request.num_computed_tokens` NEVER lands here for a running
+                request. Measured on the 164,918-token run: after the final compaction the book
+                still read 164,919 while the adopted view was 36,854 tokens - decode therefore
+                wrote every generated token at its TRUE position (beyond the adopted row) and
+                the model answered blind: 'entry entry entry' repetition, forever blind to its
+                own output. With the book rewound the whole engine pipeline (positions, slot
+                mapping, attention length) runs in view coordinates - the KVMem A-mode contract
+                (page phases rebaked to the view by KVMEM_REBAKE=1, which is required here).
+                """
+                runner = getattr(worker, "model_runner", None)
+                rs = getattr(runner, "req_states", None) if runner is not None else None
+                if rs is None:
+                    return None
+                try:
+                    idx = rs.req_id_to_index.get(str(request_id))
+                    if idx is None:
+                        return None
+                    v = int(visible_tokens)
+                    np_arr = getattr(rs, "num_computed_tokens_np", None)
+                    if np_arr is not None:
+                        np_arr[int(idx)] = v
+                    book = getattr(rs, "num_computed_tokens", None)
+                    gpu = getattr(book, "gpu", None)
+                    if gpu is not None:
+                        gpu[int(idx)] = v
+                    _rt_b = getattr(runner, "kvmem_runtime", None)
+                    if _rt_b is not None:
+                        try:
+                            _rt_b.book_rewound(str(request_id), v)
+                        except Exception:
+                            pass
+                    return int(gpu[int(idx)].item()) if gpu is not None else v
+                except Exception:
+                    return None
+
             _GPUWorker.kvmem_quiescent_compact = _kvmem_quiescent_compact
             _GPUWorker.kvmem_revert_quiescent = _kvmem_revert_quiescent
+            _GPUWorker.kvmem_rewind_book = _kvmem_rewind_book
     except Exception:
         _boot("session checkpoint worker RPC install failed: " + traceback.format_exc())
     _ensure_import_path()
@@ -1907,6 +1949,17 @@ def register():
                         return
                     if request in final:
                         request.kvmem_final_reselect = True
+                    try:
+                        rewound = executor.collective_rpc(
+                            "kvmem_rewind_book", timeout=60,
+                            args=(request.request_id, int(outcome["visible"])))
+                    except Exception:
+                        rewound = None
+                    _append(log_path, {"kind": "sched_book_rewound", "pid": os.getpid(),
+                                       "req": request.request_id, "epoch": epoch,
+                                       "visible": int(outcome["visible"]),
+                                       "per_worker": [int(x) for x in (rewound or ())
+                                                      if x is not None]})
                     _append(log_path, {"kind": "sched_compact_applied", "pid": os.getpid(),
                                        "req": request.request_id, "epoch": epoch,
                                        "visible": outcome["visible"],

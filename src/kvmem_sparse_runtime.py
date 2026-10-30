@@ -63,7 +63,7 @@ class _ReqState:
     __slots__ = ("row", "logical", "seq_len", "tokens", "next_page", "steps", "spare",
                  "row_index", "prefill_done", "query_reselected", "resume", "resumed",
                  "replay_snap", "replay_n", "replay_at", "replay_at_resident", "rebuilt",
-                 "compacted_in_prefill")
+                 "compacted_in_prefill", "applied_view_coord")
 
     def __init__(self):
         self.row = ()
@@ -87,6 +87,7 @@ class _ReqState:
         # working set. Triggering it from `prompt > B` alone rebuilt a 50K prompt that fit the
         # physical pool untouched, which showed up as a second ~36K prefill after the first one.
         self.compacted_in_prefill = False
+        self.applied_view_coord = False
         # QueryReplay: recurrent state captured just before the LAST prefill chunk, plus that
         # chunk's token count. Replaying applies those tokens to the GDN state a second time unless
         # the state is restored to this boundary first (a hybrid model cannot "replay" for free).
@@ -1998,6 +1999,7 @@ class VllmSparseRuntime:
                     import traceback as _tb
                     self.log({"kind": "commit_probe_error", "req": req,
                               "error": _tb.format_exc()[-300:]})
+            _view_basis = bool(getattr(st, "applied_view_coord", False))
             for logical, tup in touched.items():
                 slot, rank = int(tup[0]), int(tup[1])
                 # The engine wrote these tokens into COMPACTED positions, so the page's bytes are
@@ -2433,6 +2435,20 @@ class VllmSparseRuntime:
                       "sel_max": max(proposal.get("selected_pages") or (0,))
                       if proposal.get("selected_pages") else -1})
         return proposal
+
+    def book_rewound(self, req, visible):
+        """EngineCore applied a boundary compaction and the engine's resident book now reads
+        `visible`: positions, slot mapping and attention length all run in VIEW coordinates from
+        here on. Recorded so the lagged commit bakes the rotation the engine actually applied
+        (required by KVMEM_REBAKE: without it the page phases keep the pre-compaction basis and
+        the model sees a view whose keys disagree with every position it generates)."""
+        st = self.state(req)
+        st.applied_view_coord = True
+        if self.log is not None:
+            self.log({"kind": "book_rewound", "req": req, "visible": int(visible),
+                      "tokens": int(getattr(st, "tokens", 0)),
+                      "seq_len": int(getattr(st, "seq_len", 0))})
+        return True
 
     def revert_quiescent(self, req):
         """EngineCore-callable rollback after it REFUSED the last quiescent proposal.
