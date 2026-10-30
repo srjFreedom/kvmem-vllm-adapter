@@ -71,6 +71,10 @@ def prefill(rt, req, row, tokens):
     rows = rt.view.block_table_rows()[0]
     for step in range(tokens // PAGE):
         rows[row, step] = 101 + step
+        # The engine's forward wrote REAL bytes into the page it just allocated; the commit path
+        # refuses zero pages (store-poisoning guard), so the simulation must model the write.
+        g = torch.Generator().manual_seed(7000 + 101 + step)
+        rt.view.kv[101 + step].copy_(torch.randn(rt.view.kv[101 + step].shape, generator=g))
         rt.after_step(req, PAGE, prefill=True)
 
 

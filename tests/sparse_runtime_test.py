@@ -79,6 +79,15 @@ def engine_write(view, row, seq_len, page_tokens, n_tokens, counter):
         counter[0] += 1
 
 
+def fill_page(view, slot):
+    """The engine's forward wrote REAL bytes into every physical page it allocated. FP8 K/V is
+    never all-zero, and the commit path refuses zero pages (store-poisoning guard), so a
+    simulation that allocates a page without filling it can no longer commit it."""
+    g = torch.Generator().manual_seed(7000 + int(slot))
+    for kv in view.kvs:
+        kv[int(slot)].copy_(torch.randint(1, 256, kv[int(slot)].shape, generator=g, dtype=torch.int64).to(torch.uint8))
+
+
 def main():
     torch.manual_seed(0)
     view = FakeView()
@@ -102,6 +111,7 @@ def main():
     prefilled = 200 * 1024
     for step in range(prefilled // PAGE):
         engine_allocate(view, [step], base=101)     # the engine owns allocation
+        fill_page(view, 101 + step)
         rt.after_step(0, PAGE, prefill=True)
     st = rt.state(0)
     check(st.tokens == prefilled, f"prefill tracked {st.tokens} tokens")
@@ -157,6 +167,7 @@ def main():
     rt2.inrequest_compaction = True
     for step in range(64):
         engine_allocate(view, [step], base=101)
+        fill_page(view, 101 + step)
         rt2.after_step(1, PAGE, prefill=True)
     rt2.after_step(1, 1)                      # the first decode step (builds the initial view)
     o2 = rt2.orchestrator(1)

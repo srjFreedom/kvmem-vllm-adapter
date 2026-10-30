@@ -415,15 +415,28 @@ class SparseOrchestrator:
         request prefills at true positions, `(rank - page) * page_tokens` once a compacted view has
         re-based its positions. The caller knows which; without it the `slot - page` fallback bakes
         the engine's page-id base into the page, which only cancels inside one request.
+
+        SAFETY NET: a page whose device bytes are ENTIRELY ZERO is not the engine's write - it is a
+        physical block the allocator has published but not filled yet, or one a boundary compaction
+        already recycled (measured: on the 164,918-byte run the resident book `seq_len` ran ~468
+        pages ahead of the device write frontier, so the lagged commit of the needle pages read a
+        zero page and the compacted view served all-zero K/V -> the repeated-garbage answer). FP8
+        attention K/V after RMSNorm is never legitimately all-zero, so refusing to store a zero
+        page keeps the CANONICAL STORE authoritative: the page is left absent, and the per-step
+        commit or the next flush re-captures it once the bytes are really there. Returns False when
+        it refused (nothing marked resident/stored), True on a normal commit.
         """
-        delta = self._baked_delta(baked, slot, page)
         page_bytes = [kv[int(slot)].clone() for kv in self.kvs]
+        if not any(bool(t.any()) for t in page_bytes):
+            return False
+        delta = self._baked_delta(baked, slot, page)
         self.store.put(page, page_bytes)
         self.store_delta[int(page)] = delta
         self._feed_retrieval(page, page_bytes)
         self.resident.add(int(page))
         self.slot_of[int(page)] = int(slot)
         self.baked_delta[int(page)] = delta
+        return True
 
     def restore_page(self, page, slot=None, channel=None, request_id=None, rank=None):
         """Bring an evicted page back into `slot`, rotated to `rank` (or to `slot`) in the view."""

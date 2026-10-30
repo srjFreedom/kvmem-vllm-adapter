@@ -129,8 +129,15 @@ def build_config(a) -> dict:
         # worker's active forward. Default off until the beyond-pool path is qualified.
         "sched_compact": os.environ.get("KVMEM_SCHED_COMPACT", "0").strip().lower()
         in ("1", "true", "yes", "on"),
+        # Pressure headroom in ENGINE BLOCKS (1568 tokens on this pool; the 161,832-token pool has
+        # only ~103). A large reserve makes the FIRST compaction fire deep inside the prompt: 64 =
+        # 62% of the pool fired it at ~61K tokens, so every later page commit raced a repack that
+        # had already recycled its physical page (measured: zero-byte store pages, needle lost).
+        # Keep it a few chunk-steps (~3 blocks/chunk) so resident prefill writes the pool densely
+        # and compaction starts only near the top - the "prefill into the whole pool, compact at
+        # the top" design.
         "sched_compact_reserve_blocks": int(
-            os.environ.get("KVMEM_SCHED_COMPACT_RESERVE_BLOCKS", "24") or 24),
+            os.environ.get("KVMEM_SCHED_COMPACT_RESERVE_BLOCKS", "8") or 8),
         "reselect_interval": 1_000_000,
     }
     return cfg

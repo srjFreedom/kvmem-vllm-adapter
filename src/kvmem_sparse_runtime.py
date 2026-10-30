@@ -1734,6 +1734,40 @@ class VllmSparseRuntime:
         d = int(getattr(st, "tokens", 0)) - int(getattr(st, "seq_len", 0))
         return int(rank) + max(0, d) // max(1, self.page_tokens)
 
+    def _sweep_missing_pages(self, req, orch, st):
+        """Re-commit prefill pages the lagged per-step commit could not map yet.
+
+        Only valid while the request is still DENSE (`st.tokens == st.seq_len`): then the page
+        map names the engine's true-position pages and their bytes have not moved. Once ANY
+        compaction has packed the row (tokens > seq_len), the map's ids point at PRE-PACK
+        physical positions - pages the boundary protocol may already have released and
+        recycled - and sweeping from them writes all-zero pages into the canonical store
+        (measured: needle pages captured as sha256-of-zeros on the 164,918-byte run). After a
+        compaction the only safe commit source is the LIVE engine table at the row position,
+        which is what the per-step commit branch does. Returns the number of pages committed.
+        """
+        if int(getattr(st, "tokens", 0)) > int(getattr(st, "seq_len", 0)):
+            return 0
+        committed = 0
+        try:
+            map_now = self._page_map.setdefault(req, {})
+            known = orch.store.pages
+            upto = -(-int(st.tokens) // self.page_tokens)
+            for lp in range(upto):
+                if lp in known:
+                    continue
+                slot = map_now.get(lp)
+                if slot is None:
+                    continue
+                try:
+                    orch.commit_written_page(lp, int(slot), baked=0)
+                    committed += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return committed
+
     def after_step(self, req, n_new_tokens, prefill=False):
         self._ensure(req)
         # A step that schedules a whole page worth of tokens is a prefill chunk, not a decode
@@ -2360,66 +2394,7 @@ class VllmSparseRuntime:
         # engine had not published their page id yet. They are then absent from the store and the
         # orchestrator drops them from the view (measured: 475 -> 331 pages, so the compact no
         # longer covered the prompt and was refused). Commit every page we can still map.
-        try:
-            map_now = self._page_map.setdefault(req, {})
-            known = orch.store.pages
-            # The in-flight chunk must NOT be added here. `advance_tokens` deliberately LAGS
-            # accounting by one step: at the entry of step k it commits step k-1 and only then
-            # reselects, so `st.tokens` is exactly the WRITTEN frontier and `_inflight` holds the
-            # count of a step whose KV has not been produced yet. Adding it made the runtime claim
-            # pages that carry no bytes - which is the very failure the lagging was introduced to
-            # fix ("selected pages without canonical bytes", see advance_tokens' docstring) - and
-            # it inflated the frontier: a step logged tokens=42352 while the engine's own
-            # num_computed_tokens for the same moment was 41149.
-            # `after_step` has already committed every page up to `st.tokens` on both the plain and
-            # the streaming branch, so there is nothing left to sweep.
-            inflight = 0
-            upto = -(-(int(st.tokens) + inflight) // self.page_tokens)
-            for lp in range(upto):
-                if lp in known:
-                    continue
-                slot = map_now.get(lp)
-                if slot is None:
-                    continue
-                try:
-                    # `page_map` entries are pre-compaction logical pages, whose bytes the engine
-                    # wrote at TRUE positions.
-                    orch.commit_written_page(lp, int(slot), baked=0)
-                except Exception:
-                    continue
-            # The IN-FLIGHT chunk is not reachable through `page_map`: after a compaction the row is
-            # rank-indexed, so those logical pages have no map entry. Their bytes ARE on the device,
-            # at the row ranks where the step wrote them - commit them from the row, otherwise the
-            # selection cannot see them and the whole chunk silently disappears from the context
-            # (this is what made a compacted prefill answer with noise).
-            if inflight:
-                # The in-flight pages ARE in the store after this sweep, so the selection frontier
-                # must cover them: the mandatory range is built from them, and a mandatory block
-                # beyond `total_tokens` is filtered out of the selection and then refused by the
-                # planner ("mandatory blocks must appear exactly once").
-                try:
-                    orch.note_tokens(int(st.tokens) + inflight)
-                except Exception:
-                    pass
-            if st.row and inflight:
-                base = int(st.seq_len)
-                first = int(st.tokens)
-                for i in range(inflight):
-                    rank = (base + i) // self.page_tokens
-                    if rank >= len(st.row):
-                        break
-                    lp = (first + i) // self.page_tokens
-                    if lp in known:
-                        continue
-                    try:
-                        # Post-compaction in-flight pages were written into COMPACTED positions.
-                        orch.commit_written_page(
-                            lp, int(st.row[rank]),
-                            baked=(rank - lp) * self.page_tokens)
-                    except Exception:
-                        continue
-        except Exception:
-            pass
+        self._sweep_missing_pages(req, orch, st)
         prompt_tokens = int(getattr(orch, "prompt_tokens", 0) or 0)
         _page = max(1, int(self.page_tokens))
         _budget_pages = max(1, int(self.budget_tokens) // _page)

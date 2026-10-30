@@ -58,6 +58,15 @@ def engine_write(view, row, seq_len, counter):
     view.kv[page_slot].copy_(_quantize(torch.cat([k, v], dim=-1).to(torch.float32)))
 
 
+def fill_page(view, slot):
+    """The engine's forward wrote REAL bytes into device page `slot`. FP8 K/V after norm is never
+    all-zero, and the commit path now refuses zero pages (store-poisoning guard), so a simulation
+    that allocates a page but skips the write can no longer commit it - exactly the production
+    failure this guard exists to catch."""
+    g = torch.Generator().manual_seed(7000 + int(slot))
+    view.kv[int(slot)].copy_(torch.randint(1, 256, view.kv[int(slot)].shape, generator=g, dtype=torch.int64).to(torch.uint8))
+
+
 def main():
     torch.manual_seed(0)
     view = FakeView()
@@ -85,9 +94,11 @@ def main():
     rt.before_step(req_b, 1, row_index=1)
     for step in range(each_tokens // PAGE):
         rows[0, step] = 101 + step
+        fill_page(view, 101 + step)
         rt.after_step(req_a, PAGE, prefill=True)
     for step in range(each_tokens // PAGE):
         rows[1, step] = 101 + 4096 + step
+        fill_page(view, 101 + 4096 + step)
         rt.after_step(req_b, PAGE, prefill=True)
 
     # Both reselect: each must shrink to the budget with its OWN slots.
