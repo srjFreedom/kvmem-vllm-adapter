@@ -2799,18 +2799,21 @@ class VllmSparseRuntime:
                       "block_tail": [p // bp for p in phys[-4:]]})
         if len(phys) != len(selected) or min(phys) <= 0 or len(set(phys)) != len(phys):
             return False, f"packed row invalid (pages={len(selected)}, uniq={len(set(phys))})"
-        pages = [p // bp for p in phys]
-        blocks = list(dict.fromkeys(pages))
-        expanded = [b * bp + o for b in blocks for o in range(bp)]
-        if pages != expanded[:len(pages)]:
+        # The packed destination runs over CONSECUTIVE pool pages starting at a block base
+        # (`first*bp`), so in the page-number space the row must equal its own first page
+        # expanded: [base, base+1, ..., base+n-1]. (Block ids would be the same arithmetic
+        # in the block namespace; the device paged-KV tensor is indexed by pages.)
+        base = phys[0]
+        if base % bp:
+            return False, f"pack start {base} is not a block base"
+        if phys != list(range(base, base + len(phys))):
             if self.log is not None:
                 self.log({"kind": "rebuild_contig_diag", "req": req,
-                          "first_bad": next((i for i in range(len(pages))
-                                            if pages[i] != expanded[i]), -1),
+                          "first_bad": next((i for i in range(len(phys))
+                                             if phys[i] != base + i), -1),
                           "phys_head": phys[:4], "phys_tail": phys[-6:],
-                          "pages_head": pages[:4], "pages_tail": pages[-6:],
                           "pool_head": pool_pages[:4]})
-            return False, "packed row is not complete-block contiguous"
+            return False, "packed row is not contiguous from its block base"
             # the picker kept whole blocks in ascending order normally; a partial tail block
             # is legal only for the LAST page (the prompt's final page) - anything else means
             # the pack landed on scattered pool pages Core would reject.
