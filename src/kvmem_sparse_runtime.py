@@ -2699,18 +2699,15 @@ class VllmSparseRuntime:
         if len(pool_pages) < tail_pages_n + bp:
             return False, f"pool window too small ({len(pool_pages)})"
         # 1) score-ranked selection in the picker's SELECT-BLOCK grid, quantised to whole
-        #    ENGINE blocks for the packed physical row (an engine block is kept when any of
-        #    its pages scored in - a needle block can never be half-dropped). The question
-        #    tail is forced. Then the official data plane moves+rebakes the selection into
-        #    the block-aligned pool window at 0..k-1.
+        #    ENGINE blocks (a block is kept when any of its pages scored in - a needle block
+        #    can never be half-dropped), question tail forced, capped to the aligned window.
         self._in_rebuild_select = True
-        selected = None
         try:
             cap_engine_blocks = max(2, min(
                 len(pool_pages) // bp, int(self.budget_tokens) // pt // bp))
             rank = None
             try:
-                rank = orch.selector.select_pages([])     # budget-capped ranked pages
+                rank = orch.selector.select_pages(forced_tail)
             except Exception:
                 rank = None
             scored_blocks = set()
@@ -2724,42 +2721,53 @@ class VllmSparseRuntime:
             chosen = sorted(middle + list(tail_blocks))
             logical_pages = sorted({p for b in chosen for p in
                                     range(b * bp, (b + 1) * bp) if p < n_pages})
-            # device pack via the orchestrator (slots=the aligned pool window)
-            orch.max_select_pages_override = len(logical_pages) + 1
-            try:
-                orch.reselect(slots=lambda count: pool_pages[:count],
-                              mandatory_pages=logical_pages,
-                              forced_pages=logical_pages,
-                              prefill_pressure=False, rebake=True)
-                selected = [int(p) for p in
-                            (orch.last_view.row_pages if orch.last_view else ())]
-            finally:
-                orch.max_select_pages_override = None
+            # every page must have canonical store bytes (the tail is engine-resident already;
+            # a scored-away page without bytes would silently break the row)
+            usable = [p for p in logical_pages if orch.store.has(p) or p >= tail_first]
+            missing = len(logical_pages) - len(usable)
+            logical_pages = usable
+            # 2) self-contained device pack: page -> pool window slot, each written as the
+            #    canonical store bytes rotated ONCE to its new rank (`restore_page_rank`:
+            #    `needed - store_delta`, never a rotation of a rotation).
+            dest = {lp: pool_pages[i] for i, lp in enumerate(logical_pages)}
+            done = 0
+            for rank_, lp in enumerate(logical_pages):
+                if orch.store.has(lp):
+                    try:
+                        orch.restore_page_rank(int(lp), int(dest[lp]), int(rank_))
+                        done += 1
+                        continue
+                    except Exception:
+                        return False, f"pack failed at page {lp} rank {rank_}"
+                # resident question page: still at its engine slot; copy the raw bytes (no
+                # rotation hop needed - it keeps its baked phase and rebakes to `rank_`)
+                src = orch.slot_of.get(int(lp))
+                if src is None:
+                    return False, f"tail page {lp} lost its slot"
+                for kv in orch.kvs:
+                    kv[int(dest[lp])].copy_(kv[int(src)])
+                baked = (rank_ - int(lp)) * pt
+                orch.baked_delta[int(lp)] = int(baked)
+                done += 1
+            phys = [int(dest[lp]) for lp in logical_pages]
+            selected = [int(lp) for lp in logical_pages]
             if self.log is not None:
                 self.log({"kind": "rebuild_select_diag", "req": req,
                           "rank_n": 0 if rank is None else len(rank),
-                          "scored_blocks": len(scored_blocks),
-                          "tail_blocks": len(tail_blocks), "chosen": len(chosen),
-                          "want": len(logical_pages), "sel": len(selected)})
+                          "scored_blocks": len(scored_blocks), "tail_blocks": len(tail_blocks),
+                          "chosen": len(chosen), "want": len(logical_pages),
+                          "packed": int(done), "store_missing": int(missing)})
         except Exception as exc:
             self._in_rebuild_select = False
-            return False, f"picker error: {type(exc).__name__}: {exc}"
+            return False, f"pack error: {type(exc).__name__}: {exc}"
         self._in_rebuild_select = False
         if not selected:
-            return False, "picker returned nothing"
+            return False, "selection packed nothing"
         if max(selected) < n_pages - 1:
             return False, "selection lost the question tail"
-        if self.log is not None:
-            self.log({"kind": "rebuild_pack_diag", "req": req,
-                      "sel_n": len(selected), "pool_pages": len(pool_pages),
-                      "slot_of": len(orch.slot_of),
-                      "first_sel": selected[:3], "last_sel": selected[-3:],
-                      "phys_first": [int(orch.slot_of.get(p, -1)) for p in selected[:3]],
-                      "phys_last": [int(orch.slot_of.get(p, -1)) for p in selected[-3:]]})
-        # 2) the packed physical row (view order) - validate completeness before Core sees it
-        phys = [int(orch.slot_of.get(p, 0) or 0) for p in selected]
+        # 3) validate the packed physical row: ascending pool pages, unique, block-aligned
         if len(phys) != len(selected) or min(phys) <= 0 or len(set(phys)) != len(phys):
-            return False, f"packed slots incomplete (selected={len(selected)}, phys={len(set(phys))})"
+            return False, f"packed row invalid (pages={len(selected)}, uniq={len(set(phys))})"
         pages = [p // bp for p in phys]
         blocks = list(dict.fromkeys(pages))
         expanded = [b * bp + o for b in blocks for o in range(bp)]
