@@ -1697,17 +1697,42 @@ class VllmSparseRuntime:
         return pages
 
     def _grow_from_engine(self, req, grown, logical):
-        """Map a page for `logical` from the engine's own allocation (best effort)."""
+        """Publish the slot the ENGINE holds at the row position being built.
+
+        The block table is the only authority for which physical page the next token writes
+        into: below the installed prefix it carries OUR packed ids, beyond it the engine's own
+        appends. The stale `_page_map` (dense ids for positions the cursor already passed) must
+        never answer for a post-compaction rank - measured on the 164,918-byte cold run, that
+        is how released (zero) pages were committed into the store and the compacted view read
+        back all-zero K/V. Returns the page id, or None when the engine has not published it.
+        """
         try:
             rows = self.view.block_table_rows()[0]
             st = self._state[req]
             row = rows[st.row_index] if st.row_index < len(rows) else None
             if row is None:
-                return
-            slot = int(row[min(len(grown), len(row) - 1)])
-            self._page_map[req][logical] = slot
+                return None
+            pos = len(grown)
+            if pos >= len(row):
+                return None
+            slot = int(row[pos])
+            if slot <= 0:
+                return None
+            self._page_map.setdefault(req, {})[logical] = slot
+            return slot
         except Exception:
-            return
+            return None
+
+    def _logical_for_rank(self, st, rank):
+        """The logical page held at compact `rank` for the tokens being committed now.
+
+        A token at compact position c carries logical position c + D, where D is the executed
+        frontier minus the resident length; whole pages cancel the residue (visible keeps the
+        prompt's residue, the offset is page-aligned), so `logical = rank + D // page_tokens`
+        is exact. Before the first compaction D = 0 and rank == logical.
+        """
+        d = int(getattr(st, "tokens", 0)) - int(getattr(st, "seq_len", 0))
+        return int(rank) + max(0, d) // max(1, self.page_tokens)
 
     def after_step(self, req, n_new_tokens, prefill=False):
         self._ensure(req)
@@ -1771,17 +1796,15 @@ class VllmSparseRuntime:
             # no-op there); gating it on the prefill flag broke streaming after a pressure
             # reselect made the row non-empty.
             last_rank = (start + n_new_tokens - 1) // self.page_tokens
-            shift = int(getattr(st, "page_shift", 0) or 0)
             if len(st.row) <= last_rank:
                 self._absorb_engine_row(req)
-                page_map = self._page_map[req]
                 grown = list(st.row)
                 while len(grown) <= last_rank:
-                    # The row is PACKED after a compaction: rank r holds logical page
-                    # `r + page_shift`. Growing from `len(grown)` was only right while the shift
-                    # was zero (before the first compaction).
-                    logical = len(grown) + shift
-                    page = page_map.get(logical)
+                    # The row may be PACKED (rank != logical after a compaction): the slot must
+                    # come from the ENGINE's table at the position being built - never from the
+                    # stale dense `_page_map`, whose ids for passed positions name released pages.
+                    page = self._grow_from_engine(req, grown,
+                                                  self._logical_for_rank(st, len(grown)))
                     if page is None:
                         break
                     grown.append(page)
@@ -1791,16 +1814,14 @@ class VllmSparseRuntime:
                 logical = (st.tokens + i) // self.page_tokens
                 rank = (start + i) // self.page_tokens
                 if rank >= len(st.row):
-                    # The spare slot handed out by the last reselect is used up: grow the row from
-                    # the engine's own page map (the pages exist there, the row was just not
-                    # extended). Only if even that fails is the row genuinely out of space.
+                    # The spare slot handed out by the last reselect is used up: the engine has
+                    # appended the next page in ITS table at exactly this row position (below the
+                    # prefix the table carries our installed packed ids, so both agree). Only if
+                    # the engine has not published it is the row genuinely out of space.
                     grown = list(st.row)
                     while len(grown) <= rank:
-                        logical = len(grown) + shift
-                        page = self._page_map[req].get(logical)
-                        if page is None:
-                            self._grow_from_engine(req, grown, logical)
-                            page = self._page_map[req].get(logical)
+                        page = self._grow_from_engine(req, grown,
+                                                      self._logical_for_rank(st, len(grown)))
                         if page is None:
                             raise RuntimeError("sparse row has no slot for the next token page")
                         grown.append(int(page))
