@@ -1639,7 +1639,13 @@ class VllmSparseRuntime:
             deferred = has_drafts or prefill_step
             if deferred:
                 self._deferred = int(getattr(self, "_deferred", 0)) + 1
-            if not deferred and st.tokens > 0 and orch.should_reselect():
+            if (not deferred and not bool(getattr(self, "sched_compact", False))
+                    and st.tokens > 0 and orch.should_reselect()):
+                # Core-boundary mode owns every compaction: the step wrapper triggers
+                # `quiescent_compact` (pool pressure + final reselect). A socket compaction here
+                # would move the row without the EngineCore books, which is exactly the double
+                # path measured on the 169,998-token run (36 socket compactions while
+                # sched_compact was on).
                 self._reselect(req)
         except Exception:
             if self.log is not None:
@@ -1826,7 +1832,8 @@ class VllmSparseRuntime:
             # tokens, exactly when the pool (B history + R output) is full.
             st.prefill_done = True
             orch._tokens_at_reselect = max(0, st.tokens - n_new_tokens)
-            if (not self.compact_rebuild and st.row and not st.query_reselected
+            if (not self.compact_rebuild and not bool(getattr(self, "sched_compact", False))
+                    and st.row and not st.query_reselected
                     and getattr(orch, "retrieval_index", None) is not None):
                 # The prompt was compacted during prefill (no query existed then, so only
                 # sink+recent survived). Now the capture bridge holds the real query: reselect
@@ -1882,7 +1889,13 @@ class VllmSparseRuntime:
                 # its pages are committed to the host store, so `_reselect` selects only pages that
                 # really carry bytes.
                 _plen = int(self._prompt_len.get(req, 0) or 0)
-                if _plen and int(st.tokens) >= _plen and not st.query_reselected:
+                if (_plen and int(st.tokens) >= _plen and not st.query_reselected
+                        and not bool(getattr(self, "sched_compact", False))):
+                    # Socket shrink is disabled in Core-boundary mode: the step wrapper's final
+                    # trigger performs the same query-driven reselect with cross-rank consensus,
+                    # under the EngineCore books. Leaving this ungated produced a second,
+                    # book-free compaction path (measured: 36 applied / 12 query_reselect while
+                    # sched_compact was on).
                     try:
                         _rp = len(getattr(orch, "resident", ()) or ())
                         _bp = int(self.budget_tokens) // max(1, int(self.page_tokens))
@@ -1975,7 +1988,8 @@ class VllmSparseRuntime:
         # after writing KV at positions that overlapped the previous step. The reselect drains on
         # the next draft-free step instead.
         has_drafts = req in (getattr(self, "spec_reqs", None) or ())
-        if bool(getattr(self, "inrequest_compaction", False)) and not prefill and due:
+        if (bool(getattr(self, "inrequest_compaction", False)) and not prefill and due
+                and not bool(getattr(self, "sched_compact", False))):
             if has_drafts:
                 if req not in getattr(self, "_deferred_drafts", set()):
                     self._deferred_drafts = getattr(self, "_deferred_drafts", set())
