@@ -31,13 +31,15 @@ def main():
         st.tokens += int(n)
 
     def reselect(req, prefill_pressure=False, send=True, **kwargs):
-        calls.append(("reselect", bool(prefill_pressure), bool(send)))
+        calls.append(("reselect", bool(prefill_pressure), bool(send),
+                      bool(getattr(rt, "_in_quiescent", False))))
         rt._last_proposal = {"visible_tokens": int(st.seq_len),
                              "physical_pages": [1, 2], "logical_frontier": int(st.tokens),
                              "resident_frontier": int(st.seq_len)}
 
     rt._state = {"r": st}
     rt._prev_n = {"r": 4096}
+    rt._prompt_len = {"r": 0}
     rt.page_tokens = 32
     rt.after_step = commit
     rt._reselect = reselect
@@ -48,7 +50,7 @@ def main():
     st.tokens = 143360
     proposal = rt.quiescent_compact("r", 147456)
     check(calls[0] == ("commit", 4096, True), f"completed chunk is flushed first ({calls[0]})")
-    check(calls[1] == ("reselect", True, False), f"pages move without BlockChannel ({calls[1]})")
+    check(calls[1] == ("reselect", True, False, True), f"pages move without BlockChannel ({calls[1]})")
     check(proposal and proposal.get("visible_tokens") == 36864,
           f"proposal returned ({proposal})")
     check(rt._prev_n["r"] == 0, "the flushed chunk is not committed twice")
@@ -62,6 +64,22 @@ def main():
 
     # An unknown request (already finished) is a no-op for Core.
     check(rt.quiescent_compact("missing", 0) is None, "unknown request is a no-op")
+
+    # With the prompt complete, the reselect must use the SCORE-driven picker (pressure=False).
+    calls.clear()
+    st.tokens = 147456
+    rt._prev_n["r"] = 0
+    rt._prompt_len = {"r": 147456}
+    rt.quiescent_compact("r", 147456)
+    check(calls[0] == ("reselect", False, False, True),
+          f"final reselect routes to select_pages, not the pressure picker ({calls[0]})")
+    # Mid-prefill (prompt incomplete) keeps the pressure path.
+    calls.clear()
+    st.tokens = 61440
+    rt._prompt_len = {"r": 147456}
+    rt.quiescent_compact("r", 61440)
+    check(calls[0] == ("reselect", True, False, True),
+          f"mid-prefill keeps the pressure picker ({calls[0]})")
 
     print("PASS quiescent_compact_test" if not failed else "FAILED quiescent_compact_test")
     return 0 if not failed else 1

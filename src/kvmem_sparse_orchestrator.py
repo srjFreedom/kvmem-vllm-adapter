@@ -516,16 +516,26 @@ class SparseOrchestrator:
                 sink_blocks=int(getattr(cfg, "sink_tokens", 0) or 0) // 64,
                 recent_blocks=int(getattr(cfg, "recent_tokens", 0) or 0) // 64,
                 budget_blocks=int(getattr(cfg, "budget_tokens", 0) or 0) // 64,
-                aggregation="mean")
+                aggregation="mean",
+                # The official default is page-softmax over the raw payload; this adapter's
+                # statistics are 64-token MEAN buckets, where attention mass at long distance
+                # collapses (measured: needle 0.14 vs top 26). `meanq-cosine` is the core's own
+                # position-independent scorer for mean-K stores (mean_key_retrieval_scores).
+                scorer=os.environ.get("KVMEM_SCORER", "page-softmax"))
             self._recall = recall
         frontier = int(getattr(stats, "frontier", 0))
         if frontier <= 0:
             return None
         query_heads = int(layer_rows[next(iter(layer_rows))].shape[1])
+        # Score EVERY bucket the selector owns, including the partial tail block: the selection
+        # grid counts cdiv(frontier, block) but floor() left the last block unscored, so the TP
+        # consensus saw length 2,656 vs expected 2,657 and degraded the prompt-end reselect to
+        # "no ranking" - the needle never entered the view (measured on the 169,998-token run).
+        _bt = max(1, int(recall.block_tokens))
         core = recall.scores(layer_rows, rows, query_heads,
                              int(getattr(stats, "kv_heads", 0) or 0),
                              int(getattr(stats, "head_dim", 0) or 0),
-                             frontier // int(recall.block_tokens))
+                             (frontier + _bt - 1) // _bt)
         if core is None:
             self._core_error = recall.last_error
             return None
@@ -750,6 +760,33 @@ class SparseOrchestrator:
                     if alpha > 0.0 and finite:
                         from kvmem_recall import propagate_neighbor_scores
                         full = propagate_neighbor_scores(full, alpha)
+                        # Hard neighbourhood expansion ONLY for the score-driven (query) pass:
+                        # a 19-token record straddles two 64-token buckets, and the half holding
+                        # the phrase start ranked #1 while its neighbour (rank ~1,359) missed the
+                        # top-k - the model then saw half a code. The pressure pass keeps its
+                        # sink/recency behaviour (expanding it changed the adopted row and tripped
+                        # the capacity guard in measurement).
+                        if not prefill_pressure:
+                            try:
+                                _topn = int(os.environ.get("KVMEM_GRAPH_TOP", "16") or 16)
+                                _ppb = max(1, block_tokens // max(1, self.page_tokens))
+                                _order = sorted(range(len(full)), key=lambda i: full[i],
+                                                reverse=True)[:_topn]
+                                _extra = set()
+                                for _b in _order:
+                                    for _nb in (_b - 1, _b + 1):
+                                        if 0 <= _nb < len(full):
+                                            _extra.add(_nb)
+                                _pages = set(int(x) for x in mandatory_pages)
+                                for _nb in _extra:
+                                    for _k in range(_ppb):
+                                        _pages.add(_nb * _ppb + _k)
+                                mandatory_pages = tuple(sorted(_pages))
+                                self.last_graph_expand = {
+                                    "top": len(_order), "neighbours": len(_extra),
+                                    "mandatory": len(mandatory_pages)}
+                            except Exception:
+                                pass
 
                     # If NOTHING usable came back, do not feed the core at all: a table made only of
                     # the floor is not a ranking, and an extreme floor (1e9) can overflow the core's

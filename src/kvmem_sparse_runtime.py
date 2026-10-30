@@ -2088,7 +2088,23 @@ class VllmSparseRuntime:
                       "want": int(frontier), "have": int(st.tokens)})
             return None
         self._last_proposal = None
-        self._reselect(req, prefill_pressure=True, send=False)
+        # Two different core selections: prefill PRESSURE compaction has no usable query yet and
+        # the core's pressure picker deliberately ranks by sink/recency; the FINAL reselect (the
+        # prompt is complete, the question is the frozen query) must go through `select_pages` ->
+        # `pick_topk_blocks`, the only path that reads retrieval scores. Measured: the pressure
+        # picker ignored a #1-ranked needle block and filled the middle by recency.
+        _pl = int(self._prompt_len.get(req, 0) or 0)
+        pressure = not (_pl and int(st.tokens) >= _pl)
+        # Both TP ranks are inside this collective_rpc together: the exact boundary where the
+        # score consensus may run. Without it each rank ranked the middle by its OWN shard's
+        # scores and proposed different working sets (measured: "TP ranks proposed different
+        # working sets" refused the first prompt-end compaction, and the already-compacted local
+        # books then made every retry non-shrinking).
+        self._in_quiescent = True
+        try:
+            self._reselect(req, prefill_pressure=pressure, send=False)
+        finally:
+            self._in_quiescent = False
         proposal = getattr(self, "_last_proposal", None)
         if proposal is None:
             # Diagnostic: Core saw "incomplete TP compaction proposal" with no field saying why
@@ -2121,7 +2137,17 @@ class VllmSparseRuntime:
         # so no write continues from the compacted position that invariant protects. Blocking it
         # here made the prompt-end hook raise ("did not queue a fresh admission") and killed the
         # engine on requests whose last chunk ended mid-page.
-        if not rebuild and int(st.tokens) % int(self.page_tokens):
+        # The invariant protects the PARTIAL tail page from being split across layouts. When the
+        # recent window is non-empty it always keeps that page, and it stays last in the ascending
+        # selection, so the next token continues filling it under the new layout - alignment of the
+        # logical frontier itself is not required. Requiring it delayed the prompt-end reselect by
+        # up to 31 decode steps (measured: prompt 169,998 -> fired only at 170,016, after the
+        # garbage tokens were already conditioned on the missing needle).
+        _pt_ = int(self.page_tokens)
+        tail_partial = bool(int(st.tokens) % _pt_) and \
+            (int(st.tokens) // _pt_) == ((int(st.tokens) - 1) // _pt_)
+        if (not rebuild and int(st.tokens) % _pt_
+                and not (tail_partial and int(getattr(self, "recent_tokens", 0) or 0) > 0)):
             if self.log is not None:
                 self.log({"kind": "compact_deferred_align", "req": req,
                           "tokens": int(st.tokens), "seq_len": int(st.seq_len),
@@ -2293,11 +2319,28 @@ class VllmSparseRuntime:
         # refuses to go below the prompt).
         forced = mandatory if _prompt_fits else []
         score_reducer = None
-        if rebuild and self.compact_rebuild:
+        if (rebuild and self.compact_rebuild) or (
+                getattr(self, "_in_quiescent", False)
+                and int(getattr(self, "tp_size", 1) or 1) > 1):
             from kvmem_tp_scores import average_reconstruction_scores
             device = self.view.paged_kv()[0].device
-            score_reducer = lambda scores, count: average_reconstruction_scores(
-                scores, count, req, st.tokens, device)
+
+            def _consensus(scores, count):
+                # The collective raises SYMMETRICALLY on every rank (the availability/shape check
+                # runs after the all_reduce), so returning None here leaves all ranks with the same
+                # "no ranking" state. An escaping exception would poison the multiproc worker and
+                # kill the engine (measured: one availability mismatch -> EngineDeadError).
+                try:
+                    return average_reconstruction_scores(scores, count, req, st.tokens, device)
+                except Exception as exc:
+                    if self.log is not None:
+                        self.log({"kind": "tp_consensus_degraded", "req": req,
+                                  "local_len": None if scores is None else len(scores),
+                                  "expected": int(count),
+                                  "tokens": int(st.tokens),
+                                  "error": f"{type(exc).__name__}: {exc}"})
+                    return None
+            score_reducer = _consensus
         stats = orch.reselect(slots=_take, mandatory_pages=mandatory,
                               forced_pages=forced, prefill_pressure=prefill_pressure,
                               score_reducer=score_reducer, rebake=not self._pure_copy())

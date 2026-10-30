@@ -82,14 +82,22 @@ def validate_quiescent_compaction(request, records, tp_size, epoch, kv_cache_man
                     or int(record["logical_frontier"]) != logical
                     or int(record["resident_frontier"]) != resident):
                 raise ValueError("TP compaction frontier/epoch differs from EngineCore")
-            if (page <= 0 or block <= 0 or logical % page or resident % page
-                    or not selected or selected[0] < 0 or selected[-1] * page >= logical
+            # Partial tail pages are legal as long as the selection KEEPS the last page (the
+            # recent window always does): `visible` is then the sum of per-page token counts,
+            # not a multiple of the page. Requiring page-aligned logical/resident here refused
+            # every prompt-end reselect for a prompt whose length is not page-multiple
+            # (measured: 169,998 -> 52 refusals while the worker had already ranked the needle
+            # block #1 and both halves into the selection).
+            expected_visible = sum(min(page, max(0, logical - p * page)) for p in selected)
+            if (page <= 0 or block <= 0 or not selected
+                    or selected[0] < 0 or selected[-1] * page >= logical
                     or selected != tuple(sorted(set(selected)))
+                    or (logical - 1) // page not in selected
                     # Logical pages and physical slots are distinct namespaces: only require
                     # that the adopted row covers at least the selected pages.
                     or len(physical) < len(selected)
-                    or visible != len(selected) * page or visible >= resident):
-                raise ValueError("unaligned or non-shrinking TP compaction proposal")
+                    or visible != expected_visible or visible >= resident):
+                raise ValueError("invalid or non-shrinking TP compaction proposal")
             candidate = (selected, physical, visible, page, block)
             if proposal is not None and candidate != proposal:
                 raise ValueError("TP ranks proposed different working sets or physical rows")

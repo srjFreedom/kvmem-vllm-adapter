@@ -1421,7 +1421,11 @@ def register():
                 runtime = getattr(runner, "kvmem_runtime", None)
                 if runtime is None:
                     return None
-                proposal = runtime.quiescent_compact(str(request_id), int(frontier))
+                try:
+                    proposal = runtime.quiescent_compact(str(request_id), int(frontier))
+                except Exception:
+                    # A worker RPC must never take the engine down; Core treats None as refusal.
+                    proposal = None
                 if isinstance(proposal, dict):
                     proposal["rank"] = int(getattr(worker, "rank", 0) or 0)
                     proposal["epoch"] = int(epoch)

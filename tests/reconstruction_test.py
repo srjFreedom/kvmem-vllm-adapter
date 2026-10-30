@@ -293,7 +293,7 @@ class ReconstructionTest(unittest.TestCase):
                      num_logical_tokens=153280, num_computed_tokens=153280,
                      num_kvmem_offset=0)
         base = {"request": "r", "epoch": 9, "logical_frontier": 153280,
-                "resident_frontier": 153280, "selected_pages": [0, 1, 2, 3, 4, 4776],
+                "resident_frontier": 153280, "selected_pages": [0, 1, 2, 3, 4, 4789],
                 "physical_pages": [40, 41, 42, 43, 44, 45],
                 "page_tokens": 32, "block_pages": 4, "visible_tokens": 192}
         records = [{"rank": rank, **base} for rank in (0, 1)]
@@ -310,6 +310,23 @@ class ReconstructionTest(unittest.TestCase):
                       "resident_frontier": worker_frontier} for rank in (0, 1)]
             with self.subTest(core=core_frontier), self.assertRaises(ValueError):
                 validate_quiescent_compaction(request, stale, 2, 9, cache)
+        # The real prompt-end shape: logical 169,998 and resident 47,118 are NOT page-multiples,
+        # but the selection keeps the partial tail page 5312 (14 tokens). The validator must
+        # accept it (52 refusals of exactly this shape blocked the needle from ever being adopted).
+        partial = NS(request_id="r", num_in_flight_tokens=0, num_output_placeholders=0,
+                     num_logical_tokens=169998, num_computed_tokens=47118,
+                     num_kvmem_offset=0)
+        prows = [{"rank": rank, "request": "r", "epoch": 4,
+                  "logical_frontier": 169998, "resident_frontier": 47118,
+                  "selected_pages": [0, 1, 2, 5312], "physical_pages": [40, 41, 42, 43],
+                  "page_tokens": 32, "block_pages": 4, "visible_tokens": 110}
+                 for rank in (0, 1)]
+        result = validate_quiescent_compaction(partial, prows, 2, 4, cache)
+        self.assertEqual(result["visible_tokens"], 110)
+        # Dropping the tail page must be refused again (that is what protects the split page).
+        dropped = [{**p, "selected_pages": [0, 1, 2], "visible_tokens": 96} for p in prows]
+        with self.assertRaises(ValueError):
+            validate_quiescent_compaction(partial, dropped, 2, 4, cache)
         request.num_logical_tokens = request.num_computed_tokens = 153280
         request.num_in_flight_tokens = 4096
         with self.assertRaises(ValueError):

@@ -38,11 +38,14 @@ def main():
     attention = FullAttention(blocks)
     cache = NS(coordinator=NS(single_type_managers=[attention]),
                block_pool=NS(free_blocks=lambda b: None))
-    pages = list(range(1152))          # a packed prefix of native blocks 0..23
+    # 1,152 middle pages + the partial-tail page 4607 (recent always keeps it). Logical pages
+    # and physical slots are separate namespaces: the adopted row is a packed slot prefix.
+    pages = list(range(1152)) + [4607]
+    slots = list(range(1153))
     records = [{"rank": rank, "request": "r", "epoch": 3,
                 "logical_frontier": 147456, "resident_frontier": 147456,
-                "selected_pages": pages, "physical_pages": pages,
-                "visible_tokens": 36864, "page_tokens": 32, "block_pages": 49}
+                "selected_pages": pages, "physical_pages": slots,
+                "visible_tokens": 36896, "page_tokens": 32, "block_pages": 49}
                for rank in (0, 1)]
     result = validate_quiescent_compaction(resident, records, 2, 3, cache)
     adopted = {}
@@ -52,16 +55,17 @@ def main():
         return {"blocks": len(physical) // block_pages}
 
     out = apply_compaction(resident, result, adopt)
-    check(resident.num_computed_tokens == 36864, "resident book moves to the agreed visible length")
+    check(resident.num_computed_tokens == 36896, "resident book moves to the agreed visible length")
     check(resident.num_logical_tokens == 147456, "logical book is untouched")
-    check(resident.num_kvmem_offset == 147456 - 36864, "offset is derived once")
-    check(out["visible"] == 36864 and adopted["pages"] == 1152,
+    check(resident.num_kvmem_offset == 147456 - 36896, "offset is derived once")
+    check(out["visible"] == 36896 and adopted["pages"] == 1153,
           f"the agreed blocks are adopted ({adopted})")
 
     resident.num_computed_tokens = resident.num_logical_tokens
     with_raise = False
     try:
-        apply_compaction(resident, {**result, "visible_tokens": 147456}, adopt)
+        apply_compaction(resident, {**result, "visible_tokens": 147456,
+                                    "resident_frontier": 147456}, adopt)
     except ValueError:
         with_raise = True
     check(with_raise, "a non-shrinking compaction is refused")
