@@ -1873,13 +1873,14 @@ class VllmSparseRuntime:
                 # over the GPU tensor at every input prep. Our own `st.row` tail (the reselect
                 # "rest" pages) is a mirror that can be stale exactly where the engine appended
                 # (measured: bytes at physical 1176 while st.row[1176]=1372 was all zero).
+                tb_val = None
                 try:
-                    slot = int(self.view.block_table_rows()[0][st.row_index][rank])
-                    if slot <= 0:
-                        slot = int(st.row[rank])
+                    _tbl = self.view.block_table_rows()[0]
+                    tb_val = int(_tbl[st.row_index][rank])
+                    slot = tb_val if tb_val > 0 else int(st.row[rank])
                 except Exception:
                     slot = int(st.row[rank])
-                touched[logical] = (slot, rank)
+                touched[logical] = (slot, rank, tb_val)
             _tp = getattr(self, "trace_pages", None)
             if _tp and self.log is not None and any(lp in _tp for lp in touched):
                 # Decisive commit-time probe: does the device page we are about to capture carry
@@ -1893,7 +1894,7 @@ class VllmSparseRuntime:
                     for lp in _tp:
                         if lp not in touched:
                             continue
-                        s, r = touched[lp]
+                        s, r = touched[lp][0], touched[lp][1]
                         def dsum(page):
                             if page is None or int(page) <= 0 or int(page) >= len(dev[0]):
                                 return None
@@ -1943,7 +1944,7 @@ class VllmSparseRuntime:
                     import traceback as _tb
                     self.log({"kind": "commit_probe_error", "req": req,
                               "error": _tb.format_exc()[-300:]})
-            for logical, (slot, rank) in touched.items():
+            for logical, (slot, rank, _tbv) in touched.items():
                 # The engine wrote these tokens into COMPACTED positions, so the page's bytes are
                 # baked `(rank - logical) * page_tokens` away from its logical start. Recording the
                 # rank (not the engine page id) is what lets a later resume, or a second request
@@ -1961,7 +1962,11 @@ class VllmSparseRuntime:
                 # elsewhere" - the sample gives logical/slot/rank to compare with the map probe.
                 entry = {"kind": "commit_refused_zero", "req": req, "dense": False,
                          "count": len(refused), "sample": refused[:8],
-                         "tokens": int(st.tokens), "seq_len": int(st.seq_len)}
+                         "tokens": int(st.tokens), "seq_len": int(st.seq_len),
+                         "tb_at": [touched[lg][2] for lg, _, _ in refused[:4]
+                                   if lg in touched and len(touched[lg]) > 2],
+                         "row_at": [int(st.row[rr]) if rr < len(st.row) else None
+                                    for _, rr, _ in [tuple(x) for x in refused[:4]]]}
                 try:
                     import torch as _t
                     dev0 = list(self._orch[req].kvs)[0]
