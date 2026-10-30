@@ -293,6 +293,12 @@ class VllmSparseRuntime:
             st.spare = None
             st.rebuilt = True
             st.query_reselected = True
+        # stage-2 rebuilt generation: from here the request runs in VIEW/resident coordinates
+        # (the rebuilt prompt is the whole resident stream; the old logical stream is retired
+        # to the host store). `off_pages=0` is the transform the commit/store lookups use.
+        if st is not None:
+            st.off_pages = 0
+            st.applied_view_coord = True
         for mapping in (self._prev_n, self._pending_new, self._pending_frontier,
                         self._inflight, self._engine_computed, self._engine_logical,
                         self._page_map, self._absorb_upto):
@@ -1487,6 +1493,15 @@ class VllmSparseRuntime:
                 pass
             table = self.view.block_table_rows()[0]
             values = table[st.row_index].tolist()[:w]
+            if (bool(getattr(self, "sched_compact", False))
+                    and bool(getattr(st, "applied_view_coord", False))
+                    and w > len(st.row)):
+                # A boundary-compacted request: the ENGINE table runs in logical coordinates
+                # (the feed appends blocks for the un-trimmed book), so its entries past the
+                # adopted view are NOT the view's pages. Keep our view prefix and append the
+                # new engine entries the scheduler published for this step's growth.
+                grown = list(st.row) + values[len(st.row):w]
+                values = [int(p) for p in grown]
             st.row = tuple(values)
             if bool(getattr(self, "sched_compact", False)):
                 # Mirror `logical` alongside the row in boundary mode: entries past the old
@@ -2527,6 +2542,28 @@ class VllmSparseRuntime:
         # books then made every retry non-shrinking).
         self._in_quiescent = True
         try:
+            _pl0 = int(self._prompt_len.get(req, 0) or 0)
+            _st0 = self._state.get(req)
+            if (int(getattr(self, "compact_rebuild", False)) and _pl0
+                    and _st0 is not None and int(_st0.tokens) >= _pl0
+                    and req in getattr(self, "_rebuild_queue", {})):
+                # Stage 2 at the QUiescent (scheduler-thread) boundary: the prompt is fully
+                # resident and committed by the flush above; select over the frozen question
+                # and hand Core the rebuilt token list - right here, right thread, so the
+                # requeue lands BEFORE the next schedule (pressure would otherwise starve the
+                # request at the pool ceiling with the GPU idle, measured at 165K/161K).
+                _q = self._rebuild_queue
+                _q.pop(req, None)
+                _ok, _det = self._rebuild_select(req)
+                if not _ok and self.log is not None:
+                    _tr = getattr(self, "_rebuild_tries", None)
+                    if _tr is None:
+                        _tr = self._rebuild_tries = {}
+                    _tr[req] = int(_tr.get(req, 0)) + 1
+                    if _tr[req] < 6:
+                        _q[req] = int(_st0.tokens)   # re-arm next boundary
+                    self.log({"kind": "rebuild_select_retry", "req": req,
+                              "detail": str(_det)[:200], "tries": _tr[req]})
             mode = getattr(self, "compact_mode", None) or \
                 (__import__("os").environ.get("KVMEM_COMPACT_MODE", "") or None)
             if mode == "prefix":
