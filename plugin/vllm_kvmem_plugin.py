@@ -778,6 +778,10 @@ def _attach_sparse(runner, log_path):
             # Opt-in: EngineCore compacts at its step boundary; the worker must not also reselect
             # inside the next step's forward, or both paths rewrite the same row.
             runtime.sched_compact = bool(cfg.get("sched_compact", False))
+            import os as _os
+            runtime.blockwise_view = bool(int(_os.environ.get("KVMEM_BLOCKWISE", "0") or 0))
+            runtime.install_row_in_view = bool(int(_os.environ.get("KVMEM_INSTALL_ROW_VIEW", "0") or 0))
+            runtime.install_row_in_view = bool(int(_os.environ.get("KVMEM_INSTALL_ROW_VIEW", "0") or 0))
             print(f"[kvmem] sched_compact install-gate = {runtime.sched_compact} "
                   f"(cfg keys: {sorted(cfg)[:8]})", flush=True)
             # The runtime computed its watermark in __init__, BEFORE this number existed, so apply
@@ -1090,8 +1094,50 @@ def _attach_sparse(runner, log_path):
     # Hook 1: install the view right after the engine builds positions/seq_lens.
     original_prepare = mr.prepare_pos_seq_lens
     if not getattr(original_prepare, "_kvmem_patched", False):
+        def _fix_book_for_view(rs, batch, reqs):
+            """Feed-proof the resident book BEFORE the engine derives positions from it.
+
+            The per-step `CachedRequestData` feed rewrites `num_computed_tokens_np` to the
+            scheduler's LOGICAL count for every request that gained blocks (probe: np 39,976
+            vs gpu 35,272 right after a rewind), and the engine derives `positions`, mrope
+            slices, seq_lens and slot-mapping indices from THAT np copy. A rewound view needs
+            its resident count re-installed here once per step, before `prepare_pos_seq_lens`
+            reads it; the gpu tensor and `batch.num_computed_tokens_cpu` get the same value so
+            every downstream reader (kernel metadata included) agrees.
+            """
+            try:
+                rt = state.get("sparse")
+                if rt is None or not bool(getattr(rt, "sched_compact", False)):
+                    return
+                for req in reqs:
+                    st = rt._state.get(req) if hasattr(rt, "_state") else None
+                    if st is None or not bool(getattr(st, "applied_view_coord", False)):
+                        continue
+                    idx = rs.req_id_to_index.get(req)
+                    if idx is None:
+                        continue
+                    v = int(st.seq_len)
+                    if v <= 0:
+                        continue
+                    rs.num_computed_tokens_np[idx] = v
+                    rs.num_computed_tokens.gpu[idx] = v
+                    try:
+                        batch.num_computed_tokens_cpu[idx] = v
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
         def prepare_pos_seq_lens(idx_mapping, query_start_loc, num_computed_tokens,
                                  positions, seq_lens):
+            try:
+                rs = getattr(runner, "req_states", None)
+                _b = getattr(runner, "input_batch", None)
+                _reqs = list(getattr(_b, "req_ids", None) or [])
+                if rs is not None and _reqs:
+                    _fix_book_for_view(rs, _b, _reqs)
+            except Exception:
+                pass
             original_prepare(idx_mapping, query_start_loc, num_computed_tokens, positions,
                              seq_lens)
             try:

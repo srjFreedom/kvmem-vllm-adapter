@@ -63,11 +63,14 @@ class _ReqState:
     __slots__ = ("row", "logical", "seq_len", "tokens", "next_page", "steps", "spare",
                  "row_index", "prefill_done", "query_reselected", "resume", "resumed",
                  "replay_snap", "replay_n", "replay_at", "replay_at_resident", "rebuilt",
-                 "compacted_in_prefill", "applied_view_coord")
+                 "compacted_in_prefill", "applied_view_coord", "off_pages", "window_src")
 
     def __init__(self):
         self.row = ()
         self.logical = ()
+        # logical page = row position + off_pages (set by the last APPLIED boundary compaction).
+        self.off_pages = 0
+        self.window_src = {}
         self.seq_len = 0
         self.tokens = 0
         self.next_page = 0
@@ -153,6 +156,8 @@ class VllmSparseRuntime:
         # post-block must not add the same tokens again.
         self._advance_owns_accounting = True
         self._prev_n = {}
+        self._decode_probe = {}
+        self._install_row_now = {}
         self._slot_span = {}
         self._slot_span_prev = {}
         self._pending_frontier = {}
@@ -1361,7 +1366,17 @@ class VllmSparseRuntime:
         # tokens INCLUDING the current query. Installing the previous end (what we did before)
         # made every chunk's queries blind to their own chunk — the KV was written but never
         # attended, which silently produced gibberish instead of an error.
-        row_to_install = (None if bool(getattr(self, "sched_compact", False)) else st.row)
+        _sched_c = bool(getattr(self, "sched_compact", False))
+        _prefix = bool(getattr(self, "_prefix_active", False))
+        if _prefix and getattr(self, "compact_mode", None) == "prefix":
+            # The window IS the installed row: only the first n_keep entries describe the
+            # attention window; the row's tail entries are the engine's own pages (read never
+            # reaches them because seq_len stops inside the window).
+            row_to_install = st.row if st.row else None
+        else:
+            row_to_install = ((st.row if (_sched_c and bool(
+                                  getattr(self, "install_row_in_view", False)))
+                              else (None if _sched_c else st.row)))
         self._install(row_index, row_to_install, step_end, list(position_slots))
         if self.install_row:
             self._absorb_upto[req] = max(int(self._absorb_upto.get(req, 0)), len(st.row))
@@ -1439,11 +1454,28 @@ class VllmSparseRuntime:
         if st is None or w <= 0:
             return 0
         try:
-            if w <= len(st.row):
+            if w <= len(st.row) and not bool(getattr(self, "sched_compact", False)):
                 return 0
+            if w <= len(st.row) and bool(getattr(self, "sched_compact", False)):
+                # In boundary mode the engine's table is authoritative EVERYWHERE, not only past
+                # the row length: the adopted prefix plus its appends is what the kernels read.
+                # Mirror it (positions/slot ids for the commit come from here).
+                pass
             table = self.view.block_table_rows()[0]
             values = table[st.row_index].tolist()[:w]
             st.row = tuple(values)
+            if bool(getattr(self, "sched_compact", False)):
+                # Mirror `logical` alongside the row in boundary mode: entries past the old
+                # length are the request's APPENDED pages, whose logical page is the row
+                # position plus the offset the last applied compaction left (`st.off_pages`).
+                # Without this, commit/store lookups drift exactly when the row grows past the
+                # adopted view (measured class: post-adopt decode never committed its pages).
+                off = int(getattr(st, "off_pages", 0) or 0)
+                old_log = list(st.logical or ())
+                if len(old_log) < len(st.row):
+                    for rank in range(len(old_log), len(st.row)):
+                        old_log.append(rank + off)
+                    st.logical = tuple(old_log[:len(st.row)])
             # `seq_len` is the resident length written BEFORE this step; `before_step` adds the
             # current query exactly once. Deriving it here as `tokens + n_tokens` made the two
             # additions double-count (live: prefill step scheduled 4,096 tokens against a 4,704-token
@@ -1809,6 +1841,68 @@ class VllmSparseRuntime:
 
     def after_step(self, req, n_new_tokens, prefill=False):
         self._ensure(req)
+        if (bool(getattr(self, "sched_compact", False))
+                and bool(getattr(self._state[req], "applied_view_coord", False))
+                and int(self._decode_probe.get(req, 0) or 0) < 3):
+            # GPU truth probe (measured once per request, first three decode steps after the
+            # engine entered view coordinates): does the engine's OWN device book stay rewound,
+            # and does the kernel really write new tokens at the row tail? If the feed pushes
+            # `num_computed` back to the logical frontier, positions run in logical coordinates
+            # while our K pages were rotated to VIEW ranks - a ~52K phase gap that explains the
+            # exact observed signature (even an unrotated sink needle unreadable).
+            self._decode_probe[req] = int(self._decode_probe.get(req, 0) or 0) + 1
+            try:
+                runner = getattr(self.view, "runner", None)
+                rs = getattr(runner, "req_states", None)
+                idx = None
+                try:
+                    idx = int(rs.req_id_to_index[req])
+                except Exception:
+                    idx = None
+                book_np = book_gpu = None
+                if rs is not None and idx is not None:
+                    try:
+                        book_np = int(rs.num_computed_tokens_np[idx])
+                        book_gpu = int(rs.num_computed_tokens.gpu[idx].item())
+                    except Exception:
+                        pass
+                wslot = None
+                wcol = None
+                ncols = None
+                try:
+                    bt = runner.block_tables
+                    grp = self.view.attn_groups[0]
+                    smap = bt.slot_mappings[grp]
+                    q = int(self._slot_span_prev.get(req, (0, 0))[1]) or int(self._slot_span.get(req, (0, 0))[1])
+                    if q > 0:
+                        vals = smap[max(0, q - 4):q].tolist()
+                        wslot = [int(v) // int(self.page_tokens) for v in vals if int(v) >= 0]
+                        # THE COLUMN each write used: slot -> which entry of the table row the
+                        # kernel expanded it from (`_compute_slot_mappings_kernel` reads
+                        # row[pos // kernel_block]). A write COLUMN past the adopted row length
+                        # proves the engine table still runs on the pre-adopt geometry.
+                        idx = None
+                        try:
+                            idx = int(bt.num_blocks.np[grp, rs.req_id_to_index[req]])
+                        except Exception:
+                            idx = None
+                        ncols = idx
+                        row_t = bt.block_tables[grp].gpu[rs.req_id_to_index[req]]
+                        # col = (slot // page) % 49 within its block, block = slot//(page*49):
+                        wcol = [(int(v) // (int(self.page_tokens) * int(getattr(self, "block_pages", 49) or 49)))
+                                for v in vals if int(v) >= 0]
+                except Exception:
+                    pass
+                if self.log is not None:
+                    self.log({"kind": "decode_book_probe", "req": req,
+                              "book_np": book_np, "book_gpu": book_gpu,
+                              "seq_len": int(self._state[req].seq_len),
+                              "tokens": int(self._state[req].tokens),
+                              "row": len(self._state[req].row or ()),
+                              "num_blocks": ncols, "write_blocks": wcol,
+                              "write_pages": wslot})
+            except Exception:
+                pass
         # A step that schedules a whole page worth of tokens is a prefill chunk, not a decode
         # step (a decode step is 1 token, or a few with speculative decoding).
         frontier = int(self._pending_frontier.get(req, 0) or 0)
@@ -2409,7 +2503,20 @@ class VllmSparseRuntime:
         # books then made every retry non-shrinking).
         self._in_quiescent = True
         try:
-            self._reselect(req, prefill_pressure=pressure, send=False)
+            mode = getattr(self, "compact_mode", None) or \
+                (__import__("os").environ.get("KVMEM_COMPACT_MODE", "") or None)
+            if mode == "prefix":
+                # Prefix (retirement-report) mode: the worker re-checks its books and the store
+                # coverage, but proposes NOTHING to Core - the engine keeps its dense resident
+                # window and retires heads through its own R-SWA pass. A report proposal would
+                # only loop refusals (`non-shrinking`) and revert traffic every step.
+                self._reselect_prefix(req, pressure=pressure)
+                self._prefix_active = True
+                self._last_proposal = None
+            elif bool(getattr(self, "blockwise_view", False)):
+                self._reselect_blockwise(req, pressure=pressure)
+            else:
+                self._reselect(req, prefill_pressure=pressure, send=False)
         finally:
             self._in_quiescent = False
         proposal = getattr(self, "_last_proposal", None)
@@ -2464,11 +2571,395 @@ class VllmSparseRuntime:
         the model sees a view whose keys disagree with every position it generates)."""
         st = self.state(req)
         st.applied_view_coord = True
+        # The engine no longer addresses positions >= visible. If the proposal-apply path did
+        # not already record the frame (ordering, or the apply went through the socket path),
+        # adopt it now so the lagged commit and the row mirror keep the right offset.
+        try:
+            if int(st.tokens) > int(visible):
+                st.off_pages = (int(st.tokens) - int(visible)) // max(1, int(self.page_tokens))
+            if len(st.logical or ()) < len(st.row or ()):
+                pad = [(rank + int(st.off_pages)) for rank in range(len(st.logical), len(st.row))]
+                st.logical = tuple(st.logical or ()) + tuple(pad)
+        except Exception:
+            pass
         if self.log is not None:
             self.log({"kind": "book_rewound", "req": req, "visible": int(visible),
                       "tokens": int(getattr(st, "tokens", 0)),
                       "seq_len": int(getattr(st, "seq_len", 0))})
         return True
+
+    def _reselect_remobilize(self, req, pressure=False):
+        """THE FINAL PROTOCOL: a view expressed as PHYSICAL BLOCKS the engine really holds.
+
+        Three measured truths forced this shape:
+          1. the kernel write address is `positions // page -> row[pos]` (logical positions, the
+             engine book is never rewound by anything we control - the probe showed the GPU book
+             pushed back to `tokens + step` one step after every rewind);
+          2. so a view row can never be shorter/longer than the engine's own allocation: any
+             `visible < logical` compaction makes the NEXT write index exceed the row - the
+             kernel then reads a zero block id and writes into physical page 0 (the c10/c11/c88K/
+             165K failures: pages 1298 written while the row had 1274, needle pages captured as
+             zeros or stranded outside the adopted blocks);
+          3. the engine's block table is rebuilt from ITS list every step - installed rows are
+             cosmetic, the only rows that survive are the request's real allocation.
+
+        Therefore compaction here means: the engine keeps its dense allocation (writes stay
+        correct, book untouched), and we RE-RANK the K pages in place - the view becomes the
+        ascending physical block list the engine holds, while the SEMANTIC order (what RoPE says)
+        is rewritten so rank == position: each kept logical page's bytes are re-baked from the
+        canonical store to the row position the engine will read at that position. Selection is
+        whole-block quantised (the kernel table granularity), scores consensus TP-averaged.
+
+        No proposals, no adoption, no rewind: Core's books are left alone. The view must be
+        installed at every step (KVMEM_INSTALL_ROW_VIEW) because it is a re-RANKING, not a
+        re-allocation - and the mirror in `sync_row_from_engine` must not clobber it.
+        """
+        st = self._state[req]
+        orch = self._orch[req]
+        pt = int(self.page_tokens)
+        q = max(1, int(getattr(self, "block_pages", None)
+                       or getattr(self, "pages_per_block", 1) or 1))
+        block_tokens = q * pt
+        tokens = int(st.tokens)
+        n_pages = -(-tokens // pt)
+        n_blocks = -(-n_pages // q)
+        budget_blocks = max(2, int(self.budget_tokens) // block_tokens)
+        sink_blocks = max(1, int(getattr(self, "sink_tokens", 0) or 0) // block_tokens)
+        recent_blocks = max(1, -(-int(getattr(self, "recent_tokens", 0) or 0) // block_tokens))
+        if sink_blocks + recent_blocks >= budget_blocks:
+            recent_blocks = max(1, budget_blocks - sink_blocks - 1)
+        kept = set(range(min(sink_blocks, n_blocks))) \
+            | set(range(max(0, n_blocks - recent_blocks), n_blocks))
+        core = None
+        try:
+            core = orch.core_selection_scores()
+        except Exception:
+            core = None
+        if core is None:
+            core = getattr(orch, "_last_core", None)
+        if (core is not None and len(core) and bool(getattr(self, "_in_quiescent", False))
+                and int(getattr(self, "tp_size", 1) or 1) > 1):
+            try:
+                from kvmem_tp_scores import average_reconstruction_scores
+                _sel = getattr(orch, "selector", None)
+                _sb = getattr(_sel, "selection_blocks", None)
+                expected = int(_sb() if callable(_sb) else len(core))
+                device = self.view.paged_kv()[0].device
+                core = average_reconstruction_scores(list(core), expected, req,
+                                                     int(st.tokens), device)
+            except Exception as exc:
+                if self.log is not None:
+                    self.log({"kind": "tp_consensus_degraded", "req": req,
+                              "error": f"{type(exc).__name__}: {exc}"})
+                core = None
+        if core is not None and len(core):
+            grid_pages = max(1, int(getattr(orch, "select_block_tokens", 2 * pt)
+                                    or 2 * pt) // pt)
+            block_scores: dict[int, float] = {}
+            for gi, v in enumerate(core):
+                b = (gi * grid_pages) // q
+                try:
+                    block_scores[b] = block_scores.get(b, 0.0) + float(v)
+                except (TypeError, ValueError):
+                    continue
+            for b in sorted(block_scores, key=lambda x: -block_scores[x]):
+                if len(kept) >= budget_blocks:
+                    break
+                if 0 <= b < n_blocks:
+                    kept.add(int(b))
+        kept = sorted(kept)
+        # the tail page of the LOGICAL stream must exist in the view (decode continues there)
+        tail_block = (n_pages - 1) // q
+        if tail_block not in kept and len(kept) < budget_blocks:
+            kept.append(tail_block)
+            kept = sorted(kept)
+        # physical page at row position p = the engine's own allocation: st.row (dense mirror).
+        old_row = list(st.row or ())
+        if len(old_row) < q * n_blocks:
+            pad = self._page_map.get(req, {})
+            old_row = old_row + [int(pad.get(p, 0)) for p in range(len(old_row), q * n_blocks)]
+        phys_pages, logical_pages = [], []
+        for b in kept:
+            for o in range(q):
+                p = b * q + o
+                if p >= n_pages:
+                    break
+                if p < len(old_row) and int(old_row[p]) > 0:
+                    phys_pages.append(int(old_row[p]))
+                    logical_pages.append(int(p))
+        if not phys_pages:
+            self._last_proposal = None
+            return st
+        if len(phys_pages) * pt >= tokens + pt:
+            # nothing to compress yet (selection covers the stream); keep the pure dense prefix
+            # which the engine already reads correctly.
+            self._last_proposal = None
+            if self.log is not None:
+                self.log({"kind": "remobilize_noop", "req": req, "tokens": tokens,
+                          "pages": len(phys_pages)})
+            return st
+        missing = 0
+        for rank, (lp, phys) in enumerate(zip(logical_pages, phys_pages)):
+            try:
+                if orch.store.has(int(lp)):
+                    orch.restore_page_rank(int(lp), int(phys), int(rank))
+                else:
+                    missing += 1
+            except Exception:
+                missing += 1
+        st.row = tuple(phys_pages)
+        st.logical = tuple(logical_pages)
+        st.seq_len = int(len(phys_pages) * pt)
+        st.spare = None
+        st.off_pages = 0
+        st.applied_view_coord = True
+        orch.slot_of = dict(zip(logical_pages, phys_pages))
+        orch.resident = set(logical_pages)
+        self._install_row_now[req] = tuple(phys_pages)
+        if self.log is not None:
+            self.log({"kind": "remobilize", "req": req, "blocks": len(kept),
+                      "pages": len(phys_pages), "seq_len": int(st.seq_len),
+                      "tokens": tokens, "missing": missing,
+                      "scores": bool(core is not None and len(core or ()))})
+        return st
+
+    def _reselect_prefix(self, req, pressure=False):
+        """THE protocol for this fork: the engine retires its OWN prefix; we do not move KV.
+
+        Measured laws (2026-10-30 SM75, probe-verified):
+          1. the worker block table is append-only in LOGICAL order (`append_block_ids
+             (overwrite=False)` from the feed) - no adoption or install can reorder it;
+          2. the device book is pushed back to the logical frontier by the feed one step after
+             every rewind, and positions/slot-mappings derive from it - the token stream is
+             permanently LOGICAL-COORDINATED in the engine;
+          3. the fork ALREADY runs `remove_skipped_blocks(processed_computed_tokens)` every
+             step, replacing out-of-window blocks with null_block placeholders - its native
+             sliding-window retirement.
+
+        So the only self-consistent compaction here is the engine's own: the resident window
+        stays at the logical frontier (K keeps its true-position phase, writes hit their real
+        pages, attention reads them unchanged), history beyond the window is retired, and the
+        CANONICAL STORE keeps every retired page in the logical frame (sha-verified) for
+        retrieval and session replay. Our job: never corrupt that machinery - proposals are
+        made ONLY to Core when Core's own books need the retirement record (pressure), and the
+        store is fed at every step from the real write slots. `visible_tokens` is the resident
+        window as the ENGINE sees it; `selected_pages` the logical pages still resident.
+
+        This is deliberately NOT a shrinking of the GPU allocation at an arbitrary mid-stream
+        boundary: on this fork the GPU window can only be moved by the engine itself (null
+        placeholders + the R-SWA pass) or by a genuine prefill-rebuild admission (stage 2:
+        KVMEM_COMPACT_REBUILD restores a selection and re-prefills the rest). A proposal that
+        shrinks below what the engine's next feed re-derives is refused - correctly - and the
+        revert keeps books intact; the 40K pairing run measured that path clean (refusal,
+        dense continuation, CORRECT needle answer).
+        """
+        st = self._state[req]
+        orch = self._orch[req]
+        pt = int(self.page_tokens)
+        q = max(1, int(getattr(self, "block_pages", None)
+                       or getattr(self, "pages_per_block", 1) or 1))
+        tokens = int(st.tokens)
+        resident = int(st.seq_len)
+        budget = int(self.budget_tokens)
+        row = [int(p) for p in (st.row or ())]
+        logical = [int(v) if v is not None else -1 for v in (st.logical or ())]
+        if len(logical) != len(row):
+            logical = list(range(len(row)))
+        if self.log is not None:
+            self.log({"kind": "prefix_report", "req": req, "resident": int(resident),
+                      "tokens": tokens, "budget": budget, "pages": len(row)})
+        return st
+
+    def _reselect_blockwise(self, req, pressure=False):
+        """The NO-MOVE block view - the only view this engine's kernel table can express.
+
+        The scheduler feeds the attention kernel a list of FULL blocks and the gather expands
+        every block id into its 49 pages, so a page-granular selection becomes fiction at
+        adopt: `kept = unique(page // 49)` drags whole neighbouring blocks in and drops the
+        pages whose block was only partly chosen. Measured (the 86,686-token pairing): the
+        SAME prompt+question answers `ZX-4417-QJ7` when no compaction runs and degenerates to
+        a token loop after ONE page-granular compaction - a needle sitting at view rank 0 (no
+        rotation at all) was unreadable, because the row we installed and the row the kernel
+        expands were different sequences.
+
+        Protocol (official KVMem build_sparse_view semantics under block quantisation):
+          * selection stays in the LOGICAL frame the page picker and the store keys use, but
+            picks whole LOGICAL blocks (sink band + score-ranked middle + recent/tail band);
+          * every kept page stays EXACTLY where it physically is - the physical page of a
+            logical page is looked up through the PREVIOUS view (row position of that logical
+            id), so no device move happens and the row is by construction the ascending
+            expansion of whole blocks (the induction: round one sees a dense row);
+          * each kept page is rebuilt IN PLACE from the canonical store rotated to its new
+            view rank (`restore_page_rank`, one hop) - the fork's engine bakes/reads rope at
+            the resident book position, which the apply rewinds to the view frame, so the
+            rotation is what makes the view's phases agree with the positions the model
+            will generate (this fork has NO `kvmem_rope_offset` consumer - pure-copy views
+            cannot be corrected at read time and every one of them looped).
+        """
+        st = self._state[req]
+        orch = self._orch[req]
+        pt = int(self.page_tokens)
+        q = max(1, int(getattr(self, "block_pages", None)
+                       or getattr(self, "pages_per_block", 1) or 1))
+        block_tokens = q * pt
+        resident_before = int(st.seq_len)
+        tokens = int(st.tokens)
+        old_row = list(st.row or ())
+        old_logical = list(st.logical or ())
+        if not old_row:
+            self._last_proposal = None
+            if self.log is not None:
+                self.log({"kind": "blockwise_no_row", "req": req})
+            return st
+        if len(old_logical) != len(old_row):
+            if bool(getattr(st, "applied_view_coord", False)) or int(getattr(st, "off_pages", 0)):
+                self._last_proposal = None
+                if self.log is not None:
+                    self.log({"kind": "blockwise_no_logical", "req": req,
+                              "row": len(old_row), "logical": len(old_logical)})
+                return st
+            # DENSE frame: the engine wrote at true positions, so row position IS the logical
+            # page (the page ids themselves are physical and irrelevant here).
+            old_logical = list(range(len(old_row)))
+        pos_of_logical = {}
+        for i, v in enumerate(old_logical):
+            if v is not None:
+                pos_of_logical.setdefault(int(v), i)
+        n_pages = -(-tokens // pt)                       # logical pages that exist
+        n_blocks = -(-n_pages // q)
+        budget_blocks = max(2, int(self.budget_tokens) // block_tokens)
+        sink_blocks = max(1, int(getattr(self, "sink_tokens", 0) or 0) // block_tokens)
+        recent_blocks = max(1, -(-int(getattr(self, "recent_tokens", 0) or 0) // block_tokens))
+        if sink_blocks + recent_blocks >= budget_blocks:
+            recent_blocks = max(1, budget_blocks - sink_blocks - 1)
+        kept = set(range(min(sink_blocks, n_blocks))) \
+            | set(range(max(0, n_blocks - recent_blocks), n_blocks))
+        kept.add((n_pages - 1) // q)                     # Core validates the tail page
+        core = None
+        try:
+            core = orch.core_selection_scores()
+        except Exception:
+            core = None
+        if core is None:
+            core = getattr(orch, "_last_core", None)
+        if (core is not None and len(core) and bool(self._in_quiescent)
+                and int(getattr(self, "tp_size", 1) or 1) > 1):
+            # TP2 consensus: without it each rank ranks the middle by its own shard's scores,
+            # the proposals differ and Core refuses ("TP ranks proposed different working
+            # sets"). The collective raises SYMMETRICALLY, so degrading to `no ranking` keeps
+            # every rank on the same deterministic sink/recent/tail selection.
+            try:
+                from kvmem_tp_scores import average_reconstruction_scores
+                _sel = getattr(orch, "selector", None)
+                _sb = getattr(_sel, "selection_blocks", None)
+                expected = int(_sb() if callable(_sb) else len(core))
+                device = self.view.paged_kv()[0].device
+                core = average_reconstruction_scores(list(core), expected, req,
+                                                     int(st.tokens), device)
+            except Exception as exc:
+                if self.log is not None:
+                    self.log({"kind": "tp_consensus_degraded", "req": req,
+                              "error": f"{type(exc).__name__}: {exc}"})
+                core = None
+        if core is not None and len(core):
+            try:
+                grid_pages = max(1, int(getattr(orch, "select_block_tokens", 2 * pt)
+                                        or 2 * pt) // pt)
+                block_scores = {}
+                for gi, v in enumerate(core):
+                    b = (gi * grid_pages) // q
+                    try:
+                        block_scores[b] = block_scores.get(b, 0.0) + float(v)
+                    except (TypeError, ValueError):
+                        continue
+                order = sorted(block_scores, key=lambda b: -block_scores[b])
+                room = max(0, budget_blocks - len(kept))
+                for b in order:
+                    if room <= 0:
+                        break
+                    if 0 <= b < n_blocks and b not in kept:
+                        kept.add(int(b))
+                        room -= 1
+            except Exception:
+                pass
+        kept = sorted(kept)
+        while len(kept) < budget_blocks:                 # nearest-missing middle blocks
+            nxt = max(kept) + 1
+            if nxt >= n_blocks:
+                break
+            kept.append(nxt)
+        logical_pages, phys_pages = [], []
+        for b in kept:
+            members = []
+            complete = True
+            for o in range(q):
+                lp = b * q + o
+                if lp >= n_pages:
+                    break                              # the partial tail block is allowed
+                i = pos_of_logical.get(lp)
+                if i is None or int(old_row[i]) <= 0:
+                    complete = False
+                    break
+                members.append((lp, int(old_row[i])))
+            if not complete and b != (n_pages - 1) // q:
+                continue                               # a block with lost pages cannot be
+                                                       # adopted as a whole block - drop it
+            for lp, phys in members:
+                logical_pages.append(lp)
+                phys_pages.append(phys)
+        if not logical_pages:
+            self._last_proposal = None
+            return st
+        visible = sum(min(pt, max(0, tokens - p * pt)) for p in logical_pages)
+        if visible <= 0 or visible >= resident_before:
+            self._last_proposal = None
+            if self.log is not None:
+                self.log({"kind": "blockwise_no_shrink", "req": req, "visible": int(visible),
+                          "resident": int(resident_before), "pages": len(logical_pages)})
+            return st
+        moved = failed = 0
+        for rank, (lp, phys) in enumerate(zip(logical_pages, phys_pages)):
+            try:
+                orch.restore_page_rank(int(lp), int(phys), int(rank))
+                moved += 1
+            except Exception:
+                failed += 1
+        st.row = tuple(phys_pages)
+        st.logical = tuple(logical_pages)
+        st.seq_len = int(visible)
+        st.spare = None
+        # The engine book rewinds to `visible` at apply; positions the engine will generate next
+        # are VIEW coordinates while the LOGICAL stream keeps running (off = frontier-visible).
+        st.off_pages = max(0, (tokens - int(visible)) // pt)
+        orch.slot_of = dict(zip(logical_pages, phys_pages))
+        orch.resident = set(logical_pages)
+        try:
+            orch.rebuild_index(tuple(logical_pages))
+        except Exception:
+            pass
+        self._owned_slots[req] = list(st.row)
+        self._last_proposal = {
+            "request": str(req), "epoch": int(getattr(self, "epoch", 0) or 0),
+            "logical_frontier": tokens,
+            "resident_frontier": resident_before,
+            "selected_pages": [int(p) for p in logical_pages],
+            "physical_pages": [int(p) for p in phys_pages],
+            "visible_tokens": int(visible), "page_tokens": int(pt),
+            "block_pages": int(q),
+            "engine_logical": self._engine_logical.get(req),
+            "engine_computed": self._engine_computed.get(req),
+            "store_pages": len(orch.store.pages),
+            "store_max": max(orch.store.pages, default=-1),
+            "blockwise": True, "moved": moved, "failed": failed,
+        }
+        if self.log is not None:
+            self.log({"kind": "blockwise_reselect", "req": req,
+                      "blocks": len(kept), "kept": [int(b) for b in kept],
+                      "pages": len(logical_pages),
+                      "visible": int(visible), "resident_before": int(resident_before),
+                      "moved": moved, "failed": failed,
+                      "scores": bool(core is not None and len(core or ()))})
+        return st
 
     def revert_quiescent(self, req):
         """EngineCore-callable rollback after it REFUSED the last quiescent proposal.
@@ -2486,11 +2977,15 @@ class VllmSparseRuntime:
         st = self._state[req]
         orch = self._orch[req]
         try:
-            for page, slot in zip(snap["logical"] or (), snap["row"]):
+            # rebuild the slide-undo: old ranks restored one hop from the store
+            for rank, (page, slot) in enumerate(zip(snap["logical"] or (), snap["row"])):
                 if page is None:
                     continue
                 try:
-                    orch.restore_page(int(page), int(slot))
+                    if self._pure_copy():
+                        orch.restore_page(int(page), int(slot))
+                    else:
+                        orch.restore_page_rank(int(page), int(slot), int(rank))
                 except Exception:
                     continue
         except Exception:

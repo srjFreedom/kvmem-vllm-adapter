@@ -19,7 +19,7 @@ import os
 import sys
 
 DEFAULTS = {
-    "budget": 32768,
+    "budget": int(os.environ.get("KVMEM_BUDGET_TOKENS", "32768") or "32768"),
     "gen_reserve": 16384,
     "sink": 12288,
     "recent": 1024,
