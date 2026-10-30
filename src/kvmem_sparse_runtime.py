@@ -2587,7 +2587,23 @@ class VllmSparseRuntime:
             elif bool(getattr(self, "blockwise_view", False)):
                 self._reselect_blockwise(req, pressure=pressure)
             else:
-                self._reselect(req, prefill_pressure=pressure, send=False)
+                _rebuild_mode = bool(mode == "page"
+                                     and int(getattr(self, "compact_rebuild", False)))
+                self._in_page_rebuild = _rebuild_mode
+                try:
+                    self._reselect(req, prefill_pressure=pressure, send=False)
+                finally:
+                    self._in_page_rebuild = False
+                if _rebuild_mode:
+                    # page mode + rebuild: the worker's own reselect only plans; fire the
+                    # stage-2 pack (picker+move+channel) the moment the prompt is complete.
+                    _plq = int(self._prompt_len.get(req, 0) or 0)
+                    if _plq and int(st.tokens) >= _plq and not bool(
+                            getattr(st, "rebuilt", False)):
+                        _ok, _det = self._rebuild_select(req)
+                        if self.log is not None:
+                            self.log({"kind": "page_rebuild_try", "req": req,
+                                      "ok": bool(_ok), "detail": str(_det)[:160]})
         finally:
             self._in_quiescent = False
         proposal = getattr(self, "_last_proposal", None)
