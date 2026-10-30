@@ -2748,6 +2748,7 @@ class VllmSparseRuntime:
                     kv[int(dest[lp])].copy_(kv[int(src)])
                 baked = (rank_ - int(lp)) * pt
                 orch.baked_delta[int(lp)] = int(baked)
+                orch.slot_of[int(lp)] = int(dest[lp])
                 done += 1
             phys = [int(dest[lp]) for lp in logical_pages]
             selected = [int(lp) for lp in logical_pages]
@@ -2772,6 +2773,14 @@ class VllmSparseRuntime:
         blocks = list(dict.fromkeys(pages))
         expanded = [b * bp + o for b in blocks for o in range(bp)]
         if pages != expanded[:len(pages)]:
+            if self.log is not None:
+                self.log({"kind": "rebuild_contig_diag", "req": req,
+                          "first_bad": next((i for i in range(len(pages))
+                                            if pages[i] != expanded[i]), -1),
+                          "phys_head": phys[:4], "phys_tail": phys[-6:],
+                          "pages_head": pages[:4], "pages_tail": pages[-6:],
+                          "pool_head": pool_pages[:4]})
+            return False, "packed row is not complete-block contiguous"
             # the picker kept whole blocks in ascending order normally; a partial tail block
             # is legal only for the LAST page (the prompt's final page) - anything else means
             # the pack landed on scattered pool pages Core would reject.
