@@ -1479,8 +1479,18 @@ def register():
                 runtime = getattr(runner, "kvmem_runtime", None)
                 if runtime is None:
                     return {}
-                return {str(req): runtime.prepare_session_checkpoint(req)
-                        for req in request_ids}
+                out = {str(req): runtime.prepare_session_checkpoint(req)
+                       for req in request_ids}
+                try:
+                    import json as _json
+                    with open("/tmp/kvmem_sparse.jsonl", "a") as _fh:
+                        _fh.write(_json.dumps({"kind": "park_rpc_result",
+                                               "pid": os.getpid(), "reqs": str(request_ids),
+                                               "result_types": {str(k): type(v).__name__
+                                                                for k, v in out.items()}}) + "\n")
+                except Exception:
+                    pass
+                return out
 
             def _abort_kvmem_session_checkpoints(worker, request_ids):
                 runner = getattr(worker, "model_runner", None)

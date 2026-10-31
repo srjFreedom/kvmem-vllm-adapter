@@ -791,6 +791,8 @@ class VllmSparseRuntime:
     def _park_session(self, req):
         """Prepare a sealed prefix for EngineCore's all-TP terminal publication barrier."""
         if not self.session_reuse or self.session_store is None:
+            self.log({"kind": "session_park_enter", "req": req, "which": "disabled",
+                      "reuse": self.session_reuse, "store": self.session_store is not None})
             return False
         owner_session_id = self._session_ids.get(req)
         if not owner_session_id:
@@ -834,6 +836,8 @@ class VllmSparseRuntime:
             return False
         orch = self._orch.get(req)
         if orch is None:
+            self.log({"kind": "session_park_enter", "req": req, "which": "no-orch",
+                      "frontier": int(checkpoint[0])})
             return False
         hashes = self._session_hashes(req, ids)
         pages = orch.usable_pages(covered)
