@@ -228,3 +228,26 @@ Verification (GPU, spec=4, resident, full hooks, greedy temp0):
 
 Still open: MTP x session-reuse composition (seal-time draft gate + StateImage-at-accepted
 prefix), diagnostics cleanup, tag stage4-mtp.
+
+## Amendment 3 (2026-11-01, round 10): MTP x session-reuse composition experiment
+
+Lifted both refusals (worker SystemExit + seal gate spec>0 term) and ran the composition
+end-to-end (spec=4, reuse=1, 88K prompt via `X-Session-ID`):
+- prefill-boundary StateImage capture SUCCEEDS under MTP: `session_checkpoint_captured`
+  logged at the frontier; the scheduler's boundary gate keeps the entire prefill
+  draft-free, so the books match exactly (the old "StateImage law" premise - draft rows
+  advancing the GDN main slot - is disproved by the fork's own spec_state_indices
+  scratch-slot isolation, and by Definitive MTP4 being byte-equal with spec0).
+- turn1 NEEDLE correct (ZX-4417-QJ7), turn2 KEY-LATE answer correct.
+- BUT: the terminal PARK fails the TP barrier - `prepare_session_checkpoint` yields
+  non-dict records on at least one rank -> "TP workers did not all prepare a
+  checkpoint" -> nothing is parked and turn2 silently re-prefills (150.9s = full
+  prefill, resume never hit).
+
+Both refusals are therefore RESTORED fail-closed, with the evidence written into the
+messages (worker.py) and this amendment. The remaining gap for stage4-mtp is exactly
+one protocol: make the terminal park TP-safe under spec>0 (prepare/readiness semantics
+for a request whose final step carried drafts). Until then: production combo remains
+spec=0 x reuse=1 (milestone stage3-session-reuse), and MTP runs without reuse
+(validated this milestone: short requests byte-equal + ~2.9x, 88K beyond-pool NEEDLE
+correct, offline suite green).

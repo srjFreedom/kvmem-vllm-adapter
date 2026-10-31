@@ -97,11 +97,16 @@ def main(argv=None) -> int:
         if _env_flag("KVMEM_SESSION_REUSE"):
             if int(getattr(ns, "speculative_tokens", -1)) != 0:
                 raise SystemExit(
-                    "KVMEM_SESSION_REUSE requires explicit --speculative-tokens 0: "
-                    "the session checkpoint seals the GDN StateImage, and a draft "
-                    "step leaves recurrent state across K+1 token rows that are not "
-                    "checkpointed yet (draft-ledger protocol 2026-11-01; the seal "
-                    "gate in kvmem_sparse_runtime refuses spec>0 by the same law)")
+                    "KVMEM_SESSION_REUSE + SPECULATIVE_TOKENS!=0 is not yet combinable: "
+                    "the prefill-boundary StateImage capture works under MTP (measured "
+                    "2026-11-01: checkpoint captured at the frontier, NEEDLE correct, "
+                    "turn2 right), but the terminal PARK fails the TP barrier "
+                    "(prepare_session_checkpoint returns non-dict records on a rank -> "
+                    "'TP workers did not all prepare a checkpoint' -> nothing parks and "
+                    "every next turn silently re-prefills). Run reuse at --speculative-"
+                    "tokens 0 (milestone stage3-session-reuse) or MTP without reuse "
+                    "(stage4 candidate) until the park protocol lands.")
+            cfg['session_reuse'] = True
             cfg['session_reuse'] = True
         if _env_flag("KVMEM_DRAFT_LEDGER"):
             # C6 audit (docs/design-mtp-draft-ledger.md): per-step draft/served

@@ -710,6 +710,13 @@ class VllmSparseRuntime:
                 or self.capture_state is None or not self.kv_block_size
                 or int(self.session_checkpoint_speculative_tokens) > 0
                 or self.session_checkpoint_executed_frontier is None):
+            # KVMem (round-10 evidence): with spec>0 the prefill-boundary capture ITSELF
+            # succeeds (measured: `session_checkpoint_captured` at the frontier, NEEDLE
+            # correct, turn2 right) - the remaining blocker is the terminal park: the TP
+            # barrier `prepare_session_checkpoint` returns non-dict records on at least one
+            # rank -> "TP workers did not all prepare a checkpoint" -> nothing parks and
+            # turn2 misses. Until the park protocol lands for spec>0, sealing stays
+            # refused fail-closed (a spec>0 reuse deployment would silently never reuse).
             return False
         owner = self._session_ids.get(req)
         ids = self._prompt_ids.get(req)
