@@ -1525,6 +1525,14 @@ class VllmSparseRuntime:
                 # the row length: the adopted prefix plus its appends is what the kernels read.
                 # Mirror it (positions/slot ids for the commit come from here).
                 pass
+            if (not bool(getattr(self, "sched_compact", False))
+                    and not bool(getattr(self, "install_row_in_view", False))
+                    and not bool(st.row)):
+                # dense prefill bookkeeping: the runtime does NOT need a mirror of the engine
+                # row - copying it makes `st.row` look like an ACTIVE view and the session
+                # checkpoint seal (identity books, no compaction) then refuses itself
+                # (measured). The row stays empty until a real compaction/rebuild owns one.
+                return 0
             table = self.view.block_table_rows()[0]
             values = table[st.row_index].tolist()[:w]
             if (bool(getattr(self, "sched_compact", False))
