@@ -928,28 +928,56 @@ class VllmSparseRuntime:
         checkpoint = self._session_checkpoints.pop(req, None)
         return checkpoint is not None
 
+    def _proof_fail(self, which, **kw):
+        self.log({"kind": "resume_proof", "which": which,
+                  "rank": int(getattr(self, "tp_rank", 0)), **kw})
+        return False
+
     def check_session_checkpoint(self, owner, hashes, frontier, digest, capacity_pages):
         """Prove this TP rank still owns the exact StateImage/KV before scheduler admission."""
         if not self.session_reuse or self.session_store is None or not owner:
-            return False
+            return self._proof_fail("disabled", reuse=self.session_reuse,
+                                    store=self.session_store is not None,
+                                    owner=bool(owner))
         found = self.session_store.lookup(tuple(hashes), owner_session_id=tuple(owner))
         if found is None:
-            return False
+            probe = self.session_store.lookup(tuple(hashes))
+            return self._proof_fail("store-lookup", want_blocks=len(hashes),
+                                    owner=list(owner),
+                                    probe_no_owner=(probe[1] if probe else None),
+                                    store_entries=len(getattr(self.session_store, "_entries",
+                                                              getattr(self.session_store,
+                                                                      "entries", ())) or ()))
         entry, blocks = found
-        if (blocks != len(hashes) or int(entry.covered_tokens) != int(frontier)
-                or int(capacity_pages) * self.page_tokens != int(frontier)
-                or entry.prefix_digest != digest
-                or int(entry.capacity_pages) != int(capacity_pages)
-                or (self.has_recurrent and entry.mamba_state is None)):
-            return False
+        if blocks != len(hashes):
+            return self._proof_fail("blocks", blocks=blocks, want=len(hashes))
+        if int(entry.covered_tokens) != int(frontier):
+            return self._proof_fail("covered", entry=int(entry.covered_tokens),
+                                    want=int(frontier))
+        if int(capacity_pages) * self.page_tokens != int(frontier):
+            return self._proof_fail("capacity-geometry",
+                                    cap=int(capacity_pages), pt=self.page_tokens,
+                                    frontier=int(frontier))
+        if entry.prefix_digest != digest:
+            return self._proof_fail("digest", have=str(entry.prefix_digest)[:12],
+                                    want=str(digest)[:12])
+        if int(entry.capacity_pages) != int(capacity_pages):
+            return self._proof_fail("capacity", entry=int(entry.capacity_pages),
+                                    want=int(capacity_pages))
+        if self.has_recurrent and entry.mamba_state is None:
+            return self._proof_fail("mamba-state")
         orch = entry.orchestrator
-        if (len(orch.usable_pages(frontier)) < frontier // self.page_tokens
-                or (self.retrieval_enabled and getattr(orch, "retrieval_index", None) is None)):
-            return False
+        if len(orch.usable_pages(frontier)) < frontier // self.page_tokens:
+            return self._proof_fail("usable", have=len(orch.usable_pages(frontier)),
+                                    want=frontier // self.page_tokens)
+        if self.retrieval_enabled and getattr(orch, "retrieval_index", None) is None:
+            return self._proof_fail("retrieval-index")
         if self.stats_core:
             stats = getattr(orch, "statistics", None)
             if stats is None or int(stats.frontier) != int(frontier):
-                return False
+                return self._proof_fail("stats",
+                                        frontier=(int(stats.frontier) if stats else None),
+                                        want=int(frontier))
         return True
 
     def _resume_selection(self, orch, count, total_tokens):
