@@ -2076,6 +2076,7 @@ def register():
                     # the one whose worker assert aborts EngineCore below.
                     _dl = _sched_cfg(self).get("draft_ledger_log")
                     if _dl and _out is not None:
+                        _dl = f"{_dl}.{os.getpid()}"
                         _spec = getattr(_out, "scheduled_spec_decode_tokens", {}) or {}
                         with open(_dl, "a") as _f:
                             for _rid, _rows in (_out.num_scheduled_tokens or {}).items():
