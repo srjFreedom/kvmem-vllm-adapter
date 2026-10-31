@@ -637,6 +637,11 @@ class VllmSparseRuntime:
             self.log({"kind": "session_checkpoint_seal_error", "req": req,
                       "error": f"{type(exc).__name__}: {exc}"})
             return False
+        # measured: the guard above bailed without a trace; log which one fired
+        if st is not None and (st.compacted_in_prefill or st.row):
+            self.log({"kind": "session_checkpoint_skipped", "req": req,
+                      "reason": "compacted/row-active at frontier", "frontier": int(frontier),
+                      "row": bool(st.row), "compact": bool(st.compacted_in_prefill)})
 
     def _maybe_capture_session_checkpoint(self, req, st):
         """Capture a completed, pre-pressure prompt prefix before the next forward."""
