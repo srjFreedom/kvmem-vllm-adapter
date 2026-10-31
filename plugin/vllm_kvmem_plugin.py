@@ -1175,6 +1175,8 @@ def _attach_sparse(runner, log_path):
                 pass
             original_prepare(idx_mapping, query_start_loc, num_computed_tokens, positions,
                              seq_lens)
+            if os.environ.get("KVMEM_HOOK1_POST", "1") == "0":
+                return
             try:
                 if _CAPTURE is not None:
                     _CAPTURE._positions = positions

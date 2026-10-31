@@ -33,6 +33,7 @@ class PositionBooksTest(unittest.TestCase):
         st.row_index = 0
         st.tokens = 145088      # logical history
         st.seq_len = 36864      # resident after the first pressure compaction
+        st.applied_view_coord = True   # the compaction rewound the coordinates
         st.row = tuple(range(101, 101 + 1176))
         table = torch.arange(101, 101 + 1274, dtype=torch.int32).reshape(1, 1274)
         seq = torch.zeros(1, dtype=torch.int32)
@@ -66,6 +67,47 @@ class PositionBooksTest(unittest.TestCase):
         rt.before_step("r", row_index=0, position_slots=range(4096))
         self.assertEqual(int(seq[0]), 40960)
         self.assertEqual(rt._seq_override, {0: 40960})
+
+
+class UncompactedKeepsEngineBooks(unittest.TestCase):
+    """The measured spec4 regression (2026-11-01): a NON-compacted request must not get a
+    view seq/positions override at all. Under speculation `step_end = st.seq_len + rows`
+    double-counts the in-flight draft rows and the override shrank the attention book below
+    the engine's real rows - greedy MTP then diverged from spec0 from the first draft step
+    (sha f700b1ee vs c2f36446; the no-view builds stayed byte-equal). The row itself must
+    still be published."""
+    def test_no_override_without_applied_coord(self):
+        import torch
+        from kvmem_sparse_runtime import VllmSparseRuntime, _ReqState
+        rt = VllmSparseRuntime.__new__(VllmSparseRuntime)
+        st = _ReqState()
+        st.row_index = 0
+        st.tokens = 4000
+        st.seq_len = 4000      # resident == true: nothing was ever compacted
+        st.row = tuple(range(101, 101 + 128))
+        table = torch.zeros(1, 128, dtype=torch.int32)
+        seq = torch.zeros(1, dtype=torch.int32)
+        rt.view = NS(block_table_rows=lambda: [table], seq_lens=lambda: seq,
+                     positions=lambda: torch.zeros(64, dtype=torch.int64))
+        rt._orch = {"r": NS()}
+        rt._state = {"r": st}
+        rt._engine_computed = {"r": 4000}
+        rt._seq_override = {}
+        rt.page_tokens = 32
+        rt.inrequest_compaction = True
+        rt.install = True
+        rt.install_row = True
+        rt.install_seq = True
+        rt.install_pos = True
+        rt.sched_compact = False
+        rt.log = lambda record: None
+        rt._absorb_upto = {"r": 0}
+        rt.before_step("r", row_index=0, position_slots=range(64))
+        self.assertEqual(rt._seq_override, {},
+                         "the engine book must not be overridden for an un-compacted request")
+        self.assertEqual(int(seq[0]), 0, "seq_lens must keep the engine value")
+        self.assertTrue(bool(table[0, :128].ne(0).any()),
+                        "the block-table row is still published")
 
 
 class PositionsStayTrueAfterCompaction(unittest.TestCase):

@@ -1530,6 +1530,16 @@ class VllmSparseRuntime:
             position_slots = [req * n_query_tokens + j for j in range(n_query_tokens)]
         st.row_index = row_index
         step_end = int(st.seq_len) + len(position_slots)
+        # KVMem (spec-losslessness, measured 2026-11-01): under speculation the engine's
+        # committed book (`st.seq_len`, fed by `advance()` from the REAL computed tensor)
+        # already covers the step scheduled in the previous cycle, while `position_slots`
+        # counts the CURRENT step's rows again - on a draft step that double-counts 1+K
+        # and the override then SHRINKS the attention book against the engine (losslessness
+        # died exactly at the first draft step: greedy output diverged from spec0 while the
+        # no-plugin/no-view builds stayed byte-equal). Without a compaction offset (applied
+        # view not rewinding anything), the view must not rewrite the engine's seq_len at
+        # all - the engine book is authoritative. The clamp below only ever mattered for
+        # compacted rows (rewound seq_len < logical), where `applied_view_coord` is set.
         capacity = len(st.row) * int(self.page_tokens)
         if st.seq_len < 0 or step_end > capacity:
             raise SparseViewCapacityError(
@@ -1547,15 +1557,28 @@ class VllmSparseRuntime:
                     table[row_index, :len(st.row)] = torch.tensor(
                         st.row, dtype=table.dtype, device=table.device)
             return st
-        self._seq_override[row_index] = step_end
-        # Positions must stay TRUE once a compaction makes logical > resident: the fork adds
-        # `kvmem_rope_offset` to the engine's positions for RoPE and `prepare_attn` subtracts
-        # `kvmem_slot_offset` for the write address. Overwriting them with compacted values here
-        # made the slot index negative after the boundary compaction (measured: CUDA illegal access
-        # at 163,840 tokens; the same run completed with positions left alone).
         self._positions_must_stay_true = (
             int(st.tokens) > int(st.seq_len)
             and not (os.environ.get("KVMEM_NO_ROPE_OFFSET", "").strip() in ("1", "true", "yes", "on")))
+        if not bool(getattr(st, "applied_view_coord", False)):
+            # KVMem (spec-losslessness, measured 2026-11-01): a NON-compacted, non-rebuilt
+            # request runs in the engine's own coordinates - resident == true, seq book ==
+            # logical. The view's job for it is ONLY publishing the block-table row; the
+            # seq/positions overrides are dead weight that under speculation actively HARM:
+            # `step_end = st.seq_len + position_slots` double-counts the in-flight draft
+            # rows (the committed book already covers the previously scheduled step), so
+            # the override shrinks the attention book below the engine's real rows and the
+            # greedy MTP output diverges from spec0 from the FIRST draft step (the
+            # no-plugin and hooks-off builds stayed byte-equal with spec0). The override
+            # only exists to REWIND the book after a compaction, and that state is exactly
+            # what `applied_view_coord` marks.
+            if self.install_row and st.row and not bool(getattr(self, "sched_compact", False)):
+                import torch
+                for table in self.view.block_table_rows():
+                    table[row_index, :len(st.row)] = torch.tensor(
+                        st.row, dtype=table.dtype, device=table.device)
+            return st
+        self._seq_override[row_index] = step_end
         if not self.install:
             return st
         # seq_lens must COVER the tokens of this step: vLLM expects the number of computed

@@ -153,6 +153,11 @@ def main():
     check(st.seq_len <= st.tokens, "the compacted view never exceeds the true history")
 
     # The installed tensors must agree with the runtime state (install, then compare).
+    # On the live engine the compaction application calls book_rewound() (plugin:1591),
+    # which marks the request as running in VIEW coordinates; the simulation applies the
+    # compaction through the orchestrator directly, so mirror the mark here. Without it
+    # the un-compacted book gate (see before_step) would skip the override under test.
+    st.applied_view_coord = True
     rt.before_step(0, 1)
     row_t = view.block_table_rows()[0][0]
     check(all(int(row_t[i]) == st.row[i] for i in range(len(st.row))), "row matches the tensor")
