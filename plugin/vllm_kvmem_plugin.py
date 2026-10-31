@@ -518,7 +518,8 @@ def _attach_adapter(runner, log_path):
                                               for g, raw in
                                               KvmemAdapter._block_table_entries(runner)],
                                    "attn_groups": sorted(attn_groups)})
-            if not stats["needle_done"] and len(ids) >= 2 and stats["steps"] >= 2:
+            if (not stats["needle_done"] and len(ids) >= 2 and stats["steps"] >= 2
+                    and os.environ.get("KVMEM_ADAPTER_NEEDLE", "1") == "1"):
                 stats["needle_done"] = True
                 target = ids[0]
                 _append(log_path, {"kind": "needle_pre", "pid": os.getpid(),
