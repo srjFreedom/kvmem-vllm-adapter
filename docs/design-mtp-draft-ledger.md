@@ -173,3 +173,32 @@ runner 计数式；83437a1 gate 本身；`_reserve_prefill_lookahead`（multi-mo
   `spec_short` 类 cudagraph 形状问题不会自动消失。
 - 多模块 MTP 的 StateImage 快照时序（decode 步草稿被拒后循环状态的回滚语义）
   ——若短请求验证输出漂移，此项升为下一个设计题。
+
+## Amendment (2026-11-01, after GPU evidence - SUPERSEDES the closed-form section)
+
+1. FINAL LEDGER (implemented, engine e3ddb28): the MILESTONE books are the correct
+   draft ledger once the ordering/pad fixes are in: `logical += scheduled rows` at
+   schedule time, `logical -= rejected` at output time. The closed loop equals the
+   acknowledged count. The closed form `logical = num_tokens` is WRONG for the
+   beyond-pool path: during a long prefill it jumps to the whole prompt while the
+   worker executed book tracks committed rows, so the quiescent equality protocol
+   (want == have) never matches and the rebuild never fires. Evidence: 88K/MTP with
+   closed form = HTTP200 + 3 tokens, `quiescent_compact_stale want=86686 have=4096`;
+   the CONTROL at SPECULATIVE_TOKENS=0 fails IDENTICALLY - the ledger change itself
+   was the regression. With the restored loop: 88K/MTP NEEDLE correct, 151s, zero
+   stale, reconstruction fires.
+
+2. OPEN DEFECT (MTP losslessness): at temperature 0, greedy spec decode must be
+   LOSSLESS, and it is on short requests (multiplication table byte-identical to
+   the milestone outputs across repeats), but the 88K beyond-pool output diverges
+   from spec=0 in the reasoning prefix (content answer still correct). Suspect:
+   the MTP drafter re-attends the COMPACTED row (88K > the 60,480-token row) while
+   the draft state is never rewound on rejection (no mamba/state restore exists in
+   the speculators); prefill lookahead slots the drafter also reads the compacted
+   table. This is design question 2 of this doc, now measurable on short prompts
+   (acceptance vs GDN state contamination) - fix belongs in the drafter state, not
+   the scheduler ledger.
+
+3. CONFIG LAW unchanged and still hard-gated: session-reuse + spec>0 must not
+   start (the checkpoint seals GDN state; the draft contamination above makes the
+   sealed state non-comparable between spec modes). Lift only after (2) is fixed.
