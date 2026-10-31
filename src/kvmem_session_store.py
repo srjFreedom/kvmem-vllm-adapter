@@ -254,6 +254,14 @@ class MetaStore:
     def __init__(self, max_sessions: int = 8):
         self._entries: "OrderedDict[tuple, MetaEntry]" = OrderedDict()
         self._max = max(1, int(max_sessions))
+        # Park happens on a TP worker; the resume decision runs inside EngineCore, where this
+        # store is otherwise a process-local object nobody ever fills (measured: the meta store
+        # stayed empty across a whole turn pair). The entry content is pure metadata (hashes,
+        # lengths, digests - the KV itself lives in the shared host store), so the worker
+        # publishes and EngineCore reloads through one JSON file, mtime-checked.
+        import os as _os
+        self._file = _os.environ.get("KVMEM_SESSION_META_FILE",
+                                     "/tmp/kvmem_session_meta.json")
 
     def __len__(self) -> int:
         return len(self._entries)
@@ -265,21 +273,111 @@ class MetaStore:
         if not hashes:
             return
         key = (owner_session_id, hashes)
+        # Publish across the process boundary FIRST (the file is the handoff): re-read the
+        # current view so a worker's park cannot clobber entries another process published,
+        # then add this one and write the merged set back (measured: the last writer kept the
+        # whole store, so a worker re-park erased EngineCore's own knowledge and vice versa).
+        self._reload_if_stale()
         self._entries[key] = MetaEntry(hashes, covered_tokens, page_tokens,
                                        pages_per_block, capacity_pages, has_state,
                                        prefix_digest, owner_session_id, source_request)
         self._entries.move_to_end(key)
         while len(self._entries) > self._max:
             self._entries.popitem(last=False)
+        self._publish()
 
     def discard_requests(self, request_ids):
         request_ids = set(request_ids)
+        removed = False
+        self._reload_if_stale()
         for key, entry in list(self._entries.items()):
             if entry.source_request in request_ids:
                 self._entries.pop(key, None)
+                removed = True
+        if removed:
+            self._publish()
+
+    def _publish(self):
+        if not self._file:
+            return
+        try:
+            import json as _json, os as _os, tempfile as _tmp
+            def _enc(h):
+                if isinstance(h, (bytes, bytearray)):
+                    return h.hex()
+                if isinstance(h, str):
+                    return h
+                raise TypeError("unsupported block hash type %r" % type(h).__name__)
+            rows = [[[_enc(h) for h in e.block_hashes], e.covered_tokens, e.page_tokens,
+                     e.pages_per_block, e.capacity_pages, e.has_state, e.prefix_digest,
+                     list(e.owner_session_id) if e.owner_session_id else None,
+                     e.source_request]
+                    for e in self._entries.values()]
+            gen = int(getattr(self, "_file_gen", 0)) + 1
+            self._file_gen = gen
+            rows.append(["__gen__", gen])
+            d = _os.path.dirname(self._file) or "."
+            fd, path = _tmp.mkstemp(dir=d, prefix=".kvmsess.")
+            with _os.fdopen(fd, "w") as fh:
+                _json.dump(rows, fh)
+            _os.replace(path, self._file)
+        except Exception:
+            pass
+
+    def _reload_if_stale(self):
+        if not self._file:
+            return
+        import json as _json, os as _os
+        try:
+            with open(self._file) as fh:
+                rows = _json.load(fh)
+        except FileNotFoundError:
+            if getattr(self, "_file_gen", None) != 0:
+                self._file_gen = 0
+                self._entries = OrderedDict()
+            return
+        except Exception:
+            return
+        rows = list(rows)
+        gen = 0
+        clean = []
+        for r in rows:
+            if (isinstance(r, list) and len(r) == 2
+                    and r[0] == "__gen__" and isinstance(r[1], int)):
+                gen = int(r[1])
+            else:
+                clean.append(r)
+        rows = clean
+        # generation counter, not mtime: two publishes in the same clock step (measured,
+        # with ns-resolution st_mtime colliding across processes) silently starve an
+        # mtime-gated reload and lose the other writer's entries.
+        if getattr(self, "_file_gen", None) == gen:
+            return
+        self._file_gen = gen
+
+        # the file IS the store: reload rebuilds entries from the published set alone (an
+        # in-memory union would resurrect entries another process deleted)
+        merged = OrderedDict()
+        def _dec(h):
+            if isinstance(h, str):
+                try:
+                    return bytes.fromhex(h)
+                except ValueError:
+                    return h.encode("utf-8", "surrogateescape")
+            return bytes(h)
+        for row in rows:
+            hashes = tuple(_dec(h) for h in row[0])
+            owner = tuple(row[7]) if row[7] else None
+            key = (owner, hashes)
+            merged[key] = MetaEntry(hashes, row[1], row[2], row[3], row[4],
+                                    row[5], row[6], owner, row[8])
+        while len(merged) > self._max:
+            merged.popitem(last=False)
+        self._entries = merged
 
     def lookup(self, block_hashes, prefix_digest=None,
                owner_session_id=None) -> tuple["MetaEntry", int] | None:
+        self._reload_if_stale()
         incoming = tuple(block_hashes)
         best = None
         best_key = None

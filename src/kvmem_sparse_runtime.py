@@ -618,7 +618,19 @@ class VllmSparseRuntime:
                           "st": st is not None,
                           "compacted": bool(st and st.compacted_in_prefill),
                           "row_active": bool(st and st.row),
+                          "row_head": [int(x) for x in (st.row or ())[:8]] if st else [],
+                          "logical_head": [int(x) for x in (st.logical or ())[:8]] if st else [],
+                          "tokens": int(st.tokens) if st else -1,
                           "mapping": len(mapping), "pages": pages})
+            return False
+        if st.logical and pages and any(int(x) > pages for x in st.logical[:pages]):
+            # dense prefill must have a LOGICAL identity book: page i holds page-i's bytes.
+            # Anything else (a view/adopted ordering) cannot be sealed page-exactly.
+            if self.log is not None:
+                self.log({"kind": "session_seal_guard", "req": req, "which": "not-identity",
+                          "logical_head": [int(x) for x in st.logical[:8]],
+                          "logical_tail": [int(x) for x in st.logical[-6:]],
+                          "tokens": int(st.tokens), "pages": pages})
             return False
         try:
             row = self.view.block_table_rows()[0][st.row_index]
