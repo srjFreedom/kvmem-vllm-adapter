@@ -289,13 +289,16 @@ class VllmSparseRuntime:
         # mid-prefill capture never got to execute (measured: retire aborted, nothing parked).
         if getattr(self, "session_reuse", False) and st is not None:
             try:
+                # the rebuild's fresh admission starts a NEW logical coordinate system
+                # (pages 0..|rebuilt|): seal the DENSE archive first, at the last frontier
+                # where the books were still dense-logical, before resetting anything.
                 self._maybe_capture_session_checkpoint(req, st)
             except Exception:
                 import traceback as _tb
                 self.log({"kind": "session_checkpoint_seal_error", "req": req,
                           "error": _tb.format_exc()[-300:]})
-        self._prepark_keep = getattr(self, "_prepark_keep", set())
-        self._prepark_keep.add(req)
+            self._prepark_keep = getattr(self, "_prepark_keep", set())
+            self._prepark_keep.add(req)
         self._rebuilt_req = getattr(self, "_rebuilt_req", set())
         self._rebuilt_req.add(req)
         if st is not None:
