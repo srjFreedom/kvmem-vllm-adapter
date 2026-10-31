@@ -752,10 +752,19 @@ class VllmSparseRuntime:
                 list(range(frontier // index_checkpoint.block_tokens))):
             return False
         stats = self._statistics.get(req) if self.stats_core else None
-        if self.stats_core and (stats is None or stats.frontier != frontier):
+        # a FORCED seal runs at the terminal (GPU past the frontier): require coverage of the
+        # checkpoint range, not equality with it. The natural mid-prefill boundary still has
+        # stats.frontier == frontier by construction.
+        if self.stats_core and (stats is None or int(stats.frontier) < int(frontier)
+                or (not force and int(stats.frontier) != int(frontier))):
             self.log({"kind": "session_checkpoint_skipped", "req": req,
                       "reason": "core statistics frontier incomplete", "frontier": frontier,
                       "stats_frontier": getattr(stats, "frontier", -1)})
+            return False
+        if self.stats_core and any(not stats.has_block(b)
+                                   for b in range(int(frontier) // max(1, stats.block_tokens))):
+            self.log({"kind": "session_checkpoint_skipped", "req": req,
+                      "reason": "core statistics blocks missing", "frontier": frontier})
             return False
         try:
             mean_tail = stats.mean_checkpoint(frontier) if stats is not None else None
