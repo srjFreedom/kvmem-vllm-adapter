@@ -1980,6 +1980,10 @@ def register():
                     priority=priority,
                     lora_request=getattr(old, "lora_request", None),
                     cache_salt=getattr(old, "cache_salt", None),
+                    # the native conversation namespace must survive the rebuild requeue,
+                    # or the request can never park its checkpoint (measured: park skipped
+                    # with "native session_id missing" on the rebuilt child)
+                    session_id=getattr(old, "session_id", None),
                 )
                 try:
                     req.kvmem_rebuilt = True
