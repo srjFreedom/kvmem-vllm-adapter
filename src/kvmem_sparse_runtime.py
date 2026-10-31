@@ -297,8 +297,6 @@ class VllmSparseRuntime:
                 import traceback as _tb
                 self.log({"kind": "session_checkpoint_seal_error", "req": req,
                           "error": _tb.format_exc()[-300:]})
-            self._prepark_keep = getattr(self, "_prepark_keep", set())
-            self._prepark_keep.add(req)
         self._rebuilt_req = getattr(self, "_rebuilt_req", set())
         self._rebuilt_req.add(req)
         if st is not None:
@@ -689,7 +687,7 @@ class VllmSparseRuntime:
                       "reason": "compacted/row-active at frontier", "frontier": int(frontier),
                       "row": bool(st.row), "compact": bool(st.compacted_in_prefill)})
 
-    def _maybe_capture_session_checkpoint(self, req, st):
+    def _maybe_capture_session_checkpoint(self, req, st, force=False):
         """Capture a completed, pre-pressure prompt prefix before the next forward."""
         if (not self.session_reuse or req in self._session_checkpoints
                 or self.capture_state is None or not self.kv_block_size
@@ -704,17 +702,31 @@ class VllmSparseRuntime:
                                              self.budget_tokens, self.select_block_tokens)
         if not owner or not ids or len(ids) < prompt or getattr(st, "compacted_in_prefill", False):
             return False
-        try:
-            frontier = int(self.session_checkpoint_executed_frontier(req))
-        except Exception:
-            return False
-        if frontier != target:
-            return False
+        if force:
+            # terminal seal: the frontier is a COMPLETED prefix of the resident prompt; the
+            # GPU counter already ran past it, which only invalidates the runtime-books gate
+            # below, not the seal itself.
+            frontier = target
+        else:
+            try:
+                frontier = int(self.session_checkpoint_executed_frontier(req))
+            except Exception:
+                return False
+            if frontier != target:
+                return False
         if int(getattr(st, "tokens", 0) or 0) > frontier:
-            self.log({"kind": "session_checkpoint_skipped", "req": req,
-                      "reason": "runtime ahead of GPU frontier", "frontier": frontier,
-                      "runtime_tokens": int(st.tokens)})
-            return False
+            if not force:
+                self.log({"kind": "session_checkpoint_skipped", "req": req,
+                          "reason": "runtime ahead of GPU frontier", "frontier": frontier,
+                          "runtime_tokens": int(st.tokens)})
+                return False
+            if int(st.tokens) < int(prompt):
+                # NOT a completed prompt: mid-stream runtime (a rebuild's own books reset at
+                # accept) - sealing would archive pages the model has not evaluated.
+                self.log({"kind": "session_checkpoint_skipped", "req": req,
+                          "reason": "forced seal on incomplete stream", "frontier": frontier,
+                          "runtime_tokens": int(st.tokens), "prompt": prompt})
+                return False
         if not self._seal_session_checkpoint_kv(req, frontier):
             self.log({"kind": "session_checkpoint_skipped", "req": req,
                       "reason": "prefix KV could not be sealed", "frontier": frontier})
@@ -751,6 +763,12 @@ class VllmSparseRuntime:
             return False
         self._session_checkpoints[req] = (
             frontier, exact_tokens, state, index_checkpoint, mean_tail)
+        # remember the namespace at seal time: a rebuild requeue can release the books
+        # (dropping `_session_ids`) before the terminal prepare call reaches `_park_session`
+        self._park_owner = getattr(self, "_park_owner", {})
+        owner = self._session_ids.get(req)
+        if owner:
+            self._park_owner[req] = owner
         self.log({"kind": "session_checkpoint_captured", "req": req,
                   "frontier": frontier, "suffix": prompt - frontier,
                   "state": state is not None})
@@ -776,6 +794,8 @@ class VllmSparseRuntime:
             return False
         owner_session_id = self._session_ids.get(req)
         if not owner_session_id:
+            owner_session_id = getattr(self, "_park_owner", {}).get(req)
+        if not owner_session_id:
             self.log({"kind": "session_park_skipped", "req": req,
                       "reason": "native session_id missing"})
             return False
@@ -792,7 +812,12 @@ class VllmSparseRuntime:
                 int(self._prompt_len.get(req, 0) or 0), self.kv_block_size,
                 self.budget_tokens, self.select_block_tokens)
             if target > 0 and int(st.tokens) >= target:
-                self._maybe_capture_session_checkpoint(req, st)
+                self._maybe_capture_session_checkpoint(req, st, force=True)
+        # A rebuilt request's identity can only be carried from the ARCHIVE request: the
+        # requeue path may release the books (which drop `_session_ids`) between the seal and
+        # the terminal prepare. `_park_session` runs at the terminal, when the books are live
+        # again, so pass the archived owner explicitly.
+        archive = self._session_checkpoints.get(req)
         keep = req in getattr(self, "_prepark_keep", set())
         checkpoint = (self._session_checkpoints.get(req) if keep
                       else self._session_checkpoints.pop(req, None))
@@ -1365,7 +1390,10 @@ class VllmSparseRuntime:
         self._prev_n.pop(req, None)
         self._prompt_ids.pop(req, None)
         self._session_ids.pop(req, None)
-        self._session_checkpoints.pop(req, None)
+        # a sealed checkpoint SURVIVES the books: the stage-2 requeue releases the archived
+        # request under the very id the rebuilt child continues with, and the terminal park
+        # publishes the seal made before the requeue. Park consumes it; a cancelled request
+        # leaves one small dict entry (tokens tuple), never device memory.
         self._statistics.pop(req, None)
         self._stats_next.pop(req, None)
         self._stats_written.pop(req, None)
