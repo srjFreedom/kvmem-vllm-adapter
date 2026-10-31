@@ -91,11 +91,13 @@ class EntryPolicy:
         return asdict(self)
 
     def generation_ceil(self) -> int:
-        """Output ceiling in tokens. Normally R. With in-request compaction the resident pool is
-        recycled during generation (B is only the window; the rest of the history sits on the host
-        tier), so the ceiling is the logical context CTX (0 disables the cap)."""
-        if self.inrequest_compaction:
-            return int(self.ctx or 0)
+        """Output ceiling in tokens: R, always. The old CTX branch existed for the era when the
+        resident pool recycled mid-generation (the beyond-R compaction round); that round is not
+        wired, so the ceiling has to be the generation reserve - and the entry default was the
+        reason a request without `max_tokens` was rejected: CTX written into
+        `max_completion_tokens` left `max_total - max_output = 0` input budget for the char-level
+        pre-trim, which every non-empty prompt fails (the stock `get_max_tokens`/`build_tok_params`
+        clamps then never even run)."""
         return int(self.gen_reserve)
 
     def warnings(self) -> list[str]:
