@@ -202,3 +202,29 @@ runner 计数式；83437a1 gate 本身；`_reserve_prefill_lookahead`（multi-mo
 3. CONFIG LAW unchanged and still hard-gated: session-reuse + spec>0 must not
    start (the checkpoint seals GDN state; the draft contamination above makes the
    sealed state non-comparable between spec modes). Lift only after (2) is fixed.
+
+## Amendment 2 (2026-11-01, round 9): the losslessness defect is FIXED at the view layer
+
+Root cause (measured, bisection rounds 5-9): `VllmSparseRuntime.before_step` published
+`step_end = st.seq_len + len(position_slots)` as the attention book for EVERY request with a
+row - compacted or not. Under speculation the lagged runtime book (driven by the SCHEDULED
+rows of the previous step) already covers the committing step, so the formula double-counted
+the 1+K draft rows and the override SHRANK the attention book below the engine's real rows.
+Greedy MTP diverged from spec0 from the FIRST draft step, on short prompts too. The upstream
+Definitive fork (same weights, MTP4) was byte-equal with spec0, and the no-plugin / hooks-off
+KVMem builds were lossless - the isolation matrix is recorded in commit 43f0689.
+
+Fix (commit 54a6900): the seq/positions override is REWIND-ONLY, gated on
+`applied_view_coord` (set exactly at the real apply points: `book_rewound` on EngineCore
+rewind, the stage-2 rebuild, the prefix-mode apply). Un-compacted requests keep the engine's
+own books and still get the block-table row published.
+
+Verification (GPU, spec=4, resident, full hooks, greedy temp0):
+- short A: c2f3644600da41bb == spec0 baseline; speed 38.5 tok/s (~2.9x over spec0)
+- short B: 426751992d476adc == spec0 baseline
+- 88K beyond-pool: NEEDLE ZX-4417-QJ7 True, 70 tok in 150.5s, no 3-token stall, content
+  byte-equal with the spec0 run
+- offline suite: all 7 tests green (new regression UncompactedKeepsEngineBooks)
+
+Still open: MTP x session-reuse composition (seal-time draft gate + StateImage-at-accepted
+prefix), diagnostics cleanup, tag stage4-mtp.
