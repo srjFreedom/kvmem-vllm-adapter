@@ -613,9 +613,16 @@ class VllmSparseRuntime:
         pages = int(frontier) // self.page_tokens
         st = self._state.get(req)
         if st is None or st.compacted_in_prefill or st.row:
+            if self.log is not None:
+                self.log({"kind": "session_seal_guard", "req": req, "which": "books",
+                          "st": st is not None,
+                          "compacted": bool(st and st.compacted_in_prefill),
+                          "row_active": bool(st and st.row),
+                          "mapping": len(mapping), "pages": pages})
             return False
         try:
             row = self.view.block_table_rows()[0][st.row_index]
+            _bad = None
             for page in range(pages):
                 if orch.store.has(page) or getattr(orch.store, "has_disk", lambda p: False)(page):
                     continue
@@ -628,8 +635,18 @@ class VllmSparseRuntime:
                         return False
                     slot = int(row[page].item())
                 if int(slot) <= 0:
+                    if self.log is not None:
+                        self.log({"kind": "session_seal_guard", "req": req,
+                                  "which": "slot", "page": page, "slot": int(slot),
+                                  "row_len": len(row), "mapping": len(mapping)})
                     return False
                 orch.commit_written_page(page, int(slot), baked=0)
+            _miss = [p for p in range(pages)
+                     if not (orch.store.has(p) or
+                             getattr(orch.store, "has_disk", lambda q: False)(p))]
+            if self.log is not None and _miss:
+                self.log({"kind": "session_seal_guard", "req": req, "which": "coverage",
+                          "missing": len(_miss), "first": _miss[:6], "pages": pages})
             return all(orch.store.has(page) or
                        getattr(orch.store, "has_disk", lambda p: False)(page)
                        for page in range(pages))
