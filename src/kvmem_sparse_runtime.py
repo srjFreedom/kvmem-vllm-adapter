@@ -419,7 +419,13 @@ class VllmSparseRuntime:
 
     def _ensure(self, req):
         if req not in self._orch:
-            adopted = self._adopt_session(req)
+            try:
+                adopted = self._adopt_session(req)
+            except Exception as exc:
+                import traceback as _tb
+                self.log({"kind": "resume_adopt_error", "req": req,
+                          "error": _tb.format_exc()[-300:]})
+                adopted = None
             if adopted is not None:
                 # Continue a parked session: its orchestrator already owns the whole context in the
                 # host tier, so nothing is re-prefilled and no new host share is opened.
@@ -461,8 +467,19 @@ class VllmSparseRuntime:
                         orch.planner.pre_rope_statistics = True
                 if self.stats_core:
                     saved_stats = getattr(orch, "statistics", None)
-                    if saved_stats is None or int(saved_stats.frontier) != int(hit_tokens):
-                        raise RuntimeError("resumed request lost exact-prefix mean-K statistics")
+                    # coverage, not equality: the parked orchestrator stayed LIVE after the
+                    # seal and kept harvesting, so its frontier is at or past the checkpoint.
+                    # An exception here would be swallowed by the caller while the engine has
+                    # ALREADY skipped the cached prefix - the row would keep un-restored pages
+                    # (measured: 1m38s run, first 1078 pages garbage, output degenerates).
+                    if (saved_stats is None
+                            or int(saved_stats.frontier) < int(hit_tokens)
+                            or any(not saved_stats.has_block(b) for b in range(
+                                int(hit_tokens) // max(1, saved_stats.block_tokens)))):
+                        self.log({"kind": "resume_stats_gap", "req": req,
+                                  "frontier": (int(saved_stats.frontier)
+                                               if saved_stats is not None else None),
+                                  "hit": int(hit_tokens)})
                     self._statistics[req] = saved_stats
                     self._stats_next[req] = int(hit_tokens)
                     self._stats_written[req] = 0
