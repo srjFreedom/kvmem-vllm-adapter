@@ -2678,6 +2678,22 @@ def _install(cls, module_name, probe, smoke, state):
                 if runtime is not None and counts:
                     for req, n_new in list(counts.items()):
                         runtime.advance_tokens(req, int(n_new))
+                    # KVMem (draft-ledger sync, 2026-11-01): the engine's logical
+                    # book is the ACKNOWLEDGED sequence (closed form `num_tokens`);
+                    # drafts and cudagraph pad rows never enter it. Drive the
+                    # worker's executed book to the same frontier every step, so
+                    # quiescent proposals (`want == have` equality protocol) can
+                    # no longer disagree by a whole draft epoch or a ghost pad
+                    # (measured 88K/MTP: have=4096 vs want=86686 forever).
+                    _req_states = getattr(self, "req_states", None)
+                    _idx = getattr(_req_states, "req_id_to_index", None) or {}
+                    _log = getattr(_req_states, "num_logical_tokens_np", None)
+                    if _log is not None:
+                        for req in list(counts):
+                            _i = _idx.get(req)
+                            if _i is None:
+                                continue
+                            runtime.note_engine_logical(req, int(_log[_i]))
             except Exception:
                 _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                         {"kind": "advance_error", "error": traceback.format_exc()})

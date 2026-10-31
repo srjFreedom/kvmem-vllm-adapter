@@ -1611,7 +1611,17 @@ class VllmSparseRuntime:
     def note_engine_logical(self, req, tokens):
         """The served-token count (logical frontier) as the ENGINE counts it."""
         try:
-            self._engine_logical[req] = int(tokens)
+            _t = int(tokens)
+            # KVMem (draft-ledger, 2026-11-01): an ack count only describes REAL
+            # executed rows. Beyond this request's row book (`seq_len`, mirrored
+            # from `num_computed_tokens`) there are no KV rows - so a surplus is
+            # a ghost pad ack. Adopting it would put the worker permanently
+            # ahead of the Core frontier the quiescent equality protocol
+            # negotiates: the 88K/MTP stall was `want=86686 have=4096` forever.
+            _st = self._state.get(req)
+            if _st is not None and int(_st.seq_len) > 0 and _t > int(_st.seq_len):
+                return
+            self._engine_logical[req] = _t
         except Exception:
             pass
 
@@ -1772,6 +1782,22 @@ class VllmSparseRuntime:
                 self.log({"kind": "tail_replay_error", "req": req,
                           "error": _tb.format_exc()[-300:]})
             return None
+
+    def note_engine_logical(self, req, logical):
+        """Sync the executed book to the engine's ACKNOWLEDGED sequence (max-wins).
+
+        The engine's `num_logical_tokens` is the closed-form served frontier
+        (prompt + acknowledged outputs; drafts and cudagraph pad rows excluded by
+        construction). The worker's step-sum is only an estimate; adopting the
+        engine value whenever it is ahead keeps quiescent proposals' equality
+        protocol satisfiable under speculation. Rebuild/compaction rewinds the
+        engine book; that direction is owned by the explicit reset paths (see
+        `reset_books`), not by this sync.
+        """
+        st = self.state(req)
+        _l = int(logical or 0)
+        if _l > int(st.tokens):
+            st.tokens = _l
 
     def advance_tokens(self, req, n_new):
         self._inflight[req] = int(n_new or 0)
