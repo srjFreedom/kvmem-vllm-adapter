@@ -1144,11 +1144,19 @@ class VllmSparseRuntime:
             self.log({"kind": "resume_miss", "req": req,
                       "reason": "sealed retrieval statistics missing"})
             return None
-        if self.stats_core and (getattr(entry.orchestrator, "statistics", None) is None
-                or int(entry.orchestrator.statistics.frontier) != int(hit_tokens)):
-            self.log({"kind": "resume_miss", "req": req,
-                      "reason": "sealed core statistics missing"})
-            return None
+        if self.stats_core:
+            # coverage, not equality (same rule as the proof and the adoption branch): the
+            # parked orchestrator kept harvesting after the seal; anything covering the
+            # checkpoint prefix is valid mean-K data for a resume.
+            saved = getattr(entry.orchestrator, "statistics", None)
+            if (saved is None or int(saved.frontier) < int(hit_tokens)
+                    or any(not saved.has_block(b) for b in range(
+                        int(hit_tokens) // max(1, saved.block_tokens)))):
+                self.log({"kind": "resume_miss", "req": req,
+                          "reason": "sealed core statistics coverage incomplete",
+                          "frontier": (int(saved.frontier) if saved is not None else None),
+                          "hit": int(hit_tokens)})
+                return None
         self.session_store.take(entry)
         return entry, int(hit_tokens), int(visible_tokens)
 
