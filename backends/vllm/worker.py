@@ -119,6 +119,10 @@ def main(argv=None) -> int:
             cfg[_cfgk] = True
     if os.environ.get("KVMEM_REPLAY_WINDOW", "").strip():
         cfg["replay_window"] = int(os.environ["KVMEM_REPLAY_WINDOW"])
+    # The API-server process (which defaults an unset max_tokens) is a child of this
+    # launcher, so the environment DOES reach it: publish R for the serving-layer clamp
+    # (`get_max_tokens` in vllm/entrypoints/serve/utils/api_utils.py).
+    os.environ["KVMEM_GEN_RESERVE"] = str(int(ns.kvmem_gen_reserve))
     payload = json.dumps({"kvmem": cfg}, separators=(",", ":"))
     if "--dry-run" in argv:
         json.dump({"additional_config": payload, "plugin_config": cfg}, sys.stdout,
