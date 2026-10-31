@@ -294,6 +294,8 @@ class VllmSparseRuntime:
                 import traceback as _tb
                 self.log({"kind": "session_checkpoint_seal_error", "req": req,
                           "error": _tb.format_exc()[-300:]})
+        self._prepark_keep = getattr(self, "_prepark_keep", set())
+        self._prepark_keep.add(req)
         self._rebuilt_req = getattr(self, "_rebuilt_req", set())
         self._rebuilt_req.add(req)
         if st is not None:
@@ -788,7 +790,9 @@ class VllmSparseRuntime:
                 self.budget_tokens, self.select_block_tokens)
             if target > 0 and int(st.tokens) >= target:
                 self._maybe_capture_session_checkpoint(req, st)
-        checkpoint = self._session_checkpoints.pop(req, None)
+        keep = req in getattr(self, "_prepark_keep", set())
+        checkpoint = (self._session_checkpoints.get(req) if keep
+                      else self._session_checkpoints.pop(req, None))
         if checkpoint is None:
             self.log({"kind": "session_park_skipped", "req": req,
                       "reason": "no sealed executed-frontier checkpoint"})
