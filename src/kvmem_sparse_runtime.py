@@ -283,6 +283,17 @@ class VllmSparseRuntime:
         st = self._state.get(req)
         if req in getattr(self, "_rebuilt_req", ()) and (st is None or not st.row):
             return
+        # Seal the session checkpoint BEFORE the retirement: the dense prompt is fully
+        # GPU-resident and archived right here, and the rebuild requeue aborts the old
+        # stream, whose retirement barrier would otherwise try to prepare a checkpoint the
+        # mid-prefill capture never got to execute (measured: retire aborted, nothing parked).
+        if getattr(self, "session_reuse", False) and st is not None:
+            try:
+                self._maybe_capture_session_checkpoint(req, st)
+            except Exception:
+                import traceback as _tb
+                self.log({"kind": "session_checkpoint_seal_error", "req": req,
+                          "error": _tb.format_exc()[-300:]})
         self._rebuilt_req = getattr(self, "_rebuilt_req", set())
         self._rebuilt_req.add(req)
         if st is not None:
@@ -676,11 +687,6 @@ class VllmSparseRuntime:
     def _maybe_capture_session_checkpoint(self, req, st):
         """Capture a completed, pre-pressure prompt prefix before the next forward."""
         if (not self.session_reuse or req in self._session_checkpoints
-                or int(self._prompt_len.get(req, 0) or 0) > int(self.budget_tokens)
-                # a beyond-budget prompt goes to stage-2 reconstruction at its prompt-complete
-                # boundary (the archive's seal + rebuild's same-id requeue abort fire the
-                # retirement RPC before the terminal answer and pop the checkpoint - measured
-                # on 88K); it does not need a mid-prefill session checkpoint at all
                 or self.capture_state is None or not self.kv_block_size
                 or int(self.session_checkpoint_speculative_tokens) > 0
                 or self.session_checkpoint_executed_frontier is None):
@@ -768,6 +774,20 @@ class VllmSparseRuntime:
             self.log({"kind": "session_park_skipped", "req": req,
                       "reason": "native session_id missing"})
             return False
+        st = self._state.get(req)
+        if st is not None and not self._session_checkpoints.get(req):
+            # Seal at the terminal. The mid-prefill capture only fires when a step boundary
+            # EXECUTES exactly the checkpoint frontier; a fast dense prefill (or a stage-2
+            # rebuild requeue, which is the common path for long prompts) skips it, and the
+            # retirement barrier's first prepare call popped the dict before the second rank
+            # could seal. The whole prompt is GPU-resident and archived by now - the frontier
+            # is a prefix of what `after_step` just committed.
+            from kvmem_session_store import session_checkpoint_frontier
+            target = session_checkpoint_frontier(
+                int(self._prompt_len.get(req, 0) or 0), self.kv_block_size,
+                self.budget_tokens, self.select_block_tokens)
+            if target > 0 and int(st.tokens) >= target:
+                self._maybe_capture_session_checkpoint(req, st)
         checkpoint = self._session_checkpoints.pop(req, None)
         if checkpoint is None:
             self.log({"kind": "session_park_skipped", "req": req,
