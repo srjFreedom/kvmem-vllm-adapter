@@ -676,6 +676,11 @@ class VllmSparseRuntime:
     def _maybe_capture_session_checkpoint(self, req, st):
         """Capture a completed, pre-pressure prompt prefix before the next forward."""
         if (not self.session_reuse or req in self._session_checkpoints
+                or int(self._prompt_len.get(req, 0) or 0) > int(self.budget_tokens)
+                # a beyond-budget prompt goes to stage-2 reconstruction at its prompt-complete
+                # boundary (the archive's seal + rebuild's same-id requeue abort fire the
+                # retirement RPC before the terminal answer and pop the checkpoint - measured
+                # on 88K); it does not need a mid-prefill session checkpoint at all
                 or self.capture_state is None or not self.kv_block_size
                 or int(self.session_checkpoint_speculative_tokens) > 0
                 or self.session_checkpoint_executed_frontier is None):
