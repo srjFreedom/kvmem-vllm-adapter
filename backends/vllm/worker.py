@@ -97,9 +97,16 @@ def main(argv=None) -> int:
         if _env_flag("KVMEM_SESSION_REUSE"):
             if int(getattr(ns, "speculative_tokens", -1)) != 0:
                 raise SystemExit(
-                    "KVMEM_SESSION_REUSE requires explicit --speculative-tokens 0; "
-                    "MTP draft StateImage is not checkpointed yet")
+                    "KVMEM_SESSION_REUSE requires explicit --speculative-tokens 0: "
+                    "the session checkpoint seals the GDN StateImage, and a draft "
+                    "step leaves recurrent state across K+1 token rows that are not "
+                    "checkpointed yet (draft-ledger protocol 2026-11-01; the seal "
+                    "gate in kvmem_sparse_runtime refuses spec>0 by the same law)")
             cfg['session_reuse'] = True
+        if _env_flag("KVMEM_DRAFT_LEDGER"):
+            # C6 audit (docs/design-mtp-draft-ledger.md): per-step draft/served
+            # book trace from EngineCore's scheduler, opt-in only.
+            cfg['draft_ledger_log'] = "/tmp/kvmem_draft_ledger.jsonl"
         # The logical ceiling must travel WITH the config: the fork's scheduler and the runtime both
         # need it to distinguish "resident KV length" from "served position" (a 199K prompt stalled
         # at 180,000 = max_model_len because ctx was missing and the cap fell back to the window).
