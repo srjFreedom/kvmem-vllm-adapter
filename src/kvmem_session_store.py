@@ -165,6 +165,18 @@ class SessionStore:
             return entry
         return None
 
+    def restore(self, entry) -> None:
+        """Put a taken entry back under its own key after a successful adoption.
+
+        A parked session is a REUSABLE prefix, not a one-shot consumable: multi-turn
+        conversations re-hit the same checkpoint every round. The live request adopts the
+        entry's orchestrator and keeps it warm (the release path retains the host share for
+        pre-parked requests), so the next turn's proof sees exactly this entry again.
+        """
+        key = (entry.owner_session_id, entry.block_hashes)
+        self._entries[key] = entry
+        self._entries.move_to_end(key)
+
 
 # --- native block hashing ---------------------------------------------------------------
 

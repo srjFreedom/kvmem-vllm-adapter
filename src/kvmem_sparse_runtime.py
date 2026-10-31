@@ -1158,6 +1158,10 @@ class VllmSparseRuntime:
                           "hit": int(hit_tokens)})
                 return None
         self.session_store.take(entry)
+        # Reusable prefix: put the entry straight back and mark THIS request as one that
+        # retains the share at release, so the next turn can prove against it again.
+        self.session_store.restore(entry)
+        self._preparked_requests.add(req)
         return entry, int(hit_tokens), int(visible_tokens)
 
     def retrieval_index(self, req):
