@@ -840,17 +840,15 @@ class VllmSparseRuntime:
         if index_checkpoint is not None:
             orch.retrieval_index = index_checkpoint
         if stats is not None:
-            try:
-                stats.truncate_to(covered)
-                stats.restore_mean_checkpoint(covered, mean_tail)
-                if stats.frontier != covered or any(
-                        not stats.has_block(b) for b in range(covered // stats.block_tokens)):
-                    raise ValueError("checkpoint statistics coverage is incomplete")
-                orch.statistics = stats
-            except Exception as exc:
+            # Do NOT truncate or clone: the sealing request keeps running and keeps harvesting
+            # into the SAME object, so at resume time it covers the checkpoint frontier already.
+            # The only requirement is complete coverage of the checkpoint range right now.
+            if any(not stats.has_block(b)
+                   for b in range(covered // max(1, stats.block_tokens))):
                 self.log({"kind": "session_park_prepare_failed", "req": req,
-                          "reason": f"statistics restore: {type(exc).__name__}"})
+                          "reason": "statistics coverage incomplete at seal"})
                 return None
+            orch.statistics = stats
         try:
             self.session_store.park(
                 hashes, orch, covered, self.page_tokens, mamba_state=state,
@@ -974,10 +972,13 @@ class VllmSparseRuntime:
             return self._proof_fail("retrieval-index")
         if self.stats_core:
             stats = getattr(orch, "statistics", None)
-            if stats is None or int(stats.frontier) != int(frontier):
+            if stats is None or int(stats.frontier) < int(frontier):
                 return self._proof_fail("stats",
                                         frontier=(int(stats.frontier) if stats else None),
                                         want=int(frontier))
+            if any(not stats.has_block(b)
+                   for b in range(int(frontier) // max(1, stats.block_tokens))):
+                return self._proof_fail("stats-blocks", want=int(frontier))
         return True
 
     def _resume_selection(self, orch, count, total_tokens):
