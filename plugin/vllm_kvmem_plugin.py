@@ -2305,6 +2305,8 @@ def _install(cls, module_name, probe, smoke, state):
     original = cls.execute_model
 
     def execute_model(self, scheduler_output, *args, **kwargs):
+        if os.environ.get("KVMEM_EXEC_HOOKS", "1") == "0":
+            return original(self, scheduler_output, *args, **kwargs)
         _config_from_runner(self)
         # Cross-request prefix reuse MUST be recorded before anything calls into the sparse runtime:
         # the runtime creates a request's orchestrator on first sight (`_ensure`), and a resumed
@@ -2388,8 +2390,9 @@ def _install(cls, module_name, probe, smoke, state):
                     # certain to be accepted (eager path; the compiled path is documented as
                     # eager-only for KVMem retrieval).
                     try:
-                        from vllm import kvmem_bridge as _kb
-                        _kb.KEY_ROWS_LIMIT = 1 if _req in (_rt.spec_reqs or set()) else 0
+                        if os.environ.get("KVMEM_X_SPEC", "1") == "1":
+                            from vllm import kvmem_bridge as _kb
+                            _kb.KEY_ROWS_LIMIT = 1 if _req in (_rt.spec_reqs or set()) else 0
                     except Exception:
                         pass
                     try:
@@ -2423,7 +2426,8 @@ def _install(cls, module_name, probe, smoke, state):
                                 state.setdefault("was_decode", {})[_req] = int(_n) <= 8
                     except Exception:
                         pass
-                    _rt.advance_tokens(_req, int(_n))
+                    if os.environ.get("KVMEM_X_ADV", "1") == "1":
+                        _rt.advance_tokens(_req, int(_n))
                     # The mean-K statistics are keyed by TRUE positions while the model may run at
                     # compacted ones; publish the offset before the model executes so the capture op
                     # buckets this step correctly (device tensor -> CUDA graph replays it live).
@@ -2469,6 +2473,8 @@ def _install(cls, module_name, probe, smoke, state):
                         # frontier, not resident KV. After compaction subtracting that
                         # mirror produced offset zero and wrote the next chunk into
                         # old page slots. The scheduler output carries both books.
+                        if os.environ.get("KVMEM_X_PUB", "1") != "1":
+                            raise RuntimeError("x-pub off")
                         from kvmem_position_books import scheduled_position_offset
                         _off = scheduled_position_offset(scheduler_output, _req)
                         if _off is None:
@@ -2479,6 +2485,16 @@ def _install(cls, module_name, probe, smoke, state):
                                 getattr(_st, "seq_len", 0))
                         if _off < 0:
                             _off = 0
+                        if _off > 0:
+                            # TEMP instrumentation (2026-11-01, losslessness hunt)
+                            try:
+                                _append("/tmp/kvmem_offprobe.jsonl",
+                                        {"kind": "off_publish", "req": str(_req)[:9],
+                                         "off": int(_off),
+                                         "tokens": int(getattr(_st, "tokens", -1)),
+                                         "seq_len": int(getattr(_st, "seq_len", -1))})
+                            except Exception:
+                                pass
                         _buf = getattr(self, "_kvmem_slot_offset", None)
                         if _buf is None:
                             import torch as _t
@@ -2498,6 +2514,8 @@ def _install(cls, module_name, probe, smoke, state):
         except Exception:
             self._kvmem_req_ids = []
         result = original(self, scheduler_output, *args, **kwargs)
+        if os.environ.get("KVMEM_EXEC_POST", "1") == "0":
+            return result
         # Profiling/dummy runs are not real steps.
         if kwargs.get("dummy_run") or kwargs.get("is_profile"):
             return result
@@ -2672,6 +2690,8 @@ def _install(cls, module_name, probe, smoke, state):
 
         @functools.wraps(_original_sample)
         def sample_tokens(self, scheduler_output, *args, **kwargs):
+            if os.environ.get("KVMEM_SAMPLE_HOOKS", "1") == "0":
+                return original(self, scheduler_output, *args, **kwargs)
             try:
                 runtime = state.get("sparse")
                 counts = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
