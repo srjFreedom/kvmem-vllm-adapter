@@ -1272,6 +1272,34 @@ def _attach_sched_probe(log_path):
             _append(log_path, {"kind": "sched_advance_error", "error": traceback.format_exc()})
         out = original(self, *args, **kwargs)
         try:
+            # C6 draft audit (docs/design-mtp-draft-ledger.md): record the TRUE
+            # emitted SchedulerOutput. The engine may abort inside the real
+            # `schedule()` (worker assert) and the wrapper still sees the output;
+            # post-assembly hooks in scheduler.py miss that step entirely.
+            _dl = _sched_cfg(self).get("draft_ledger_log")
+            if _dl and out is not None:
+                _spec = getattr(out, "scheduled_spec_decode_tokens", {}) or {}
+                with open(_dl, "a") as _f:
+                    for _rid, _rows in (out.num_scheduled_tokens or {}).items():
+                        _rq = getattr(self, "requests", {}).get(_rid)
+                        if _rq is None:
+                            continue
+                        _d = _spec.get(_rid)
+                        _f.write(json.dumps({
+                            "kind": "draft_ledger", "req": _rid[:14],
+                            "rows": int(_rows),
+                            "dict": (len(_d) if _d is not None else 0),
+                            "dict_head": (_d[0] if _d else None),
+                            "computed": int(_rq.num_computed_tokens),
+                            "logical": int(_rq.num_logical_tokens),
+                            "offset": int(getattr(_rq, "num_kvmem_offset", 0) or 0),
+                            "pool": len(_rq.spec_token_ids),
+                            "tokens": int(_rq.num_tokens),
+                            "prompt": int(_rq.num_prompt_tokens),
+                        }) + "\n")
+        except Exception:
+            pass
+        try:
             state["step"] += 1
             every = int(_config().get("sched_probe_every", 8))
             if state["step"] % every:
