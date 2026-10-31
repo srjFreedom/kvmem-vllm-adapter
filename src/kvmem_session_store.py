@@ -297,6 +297,12 @@ class MetaStore:
         if removed:
             self._publish()
 
+    def _owner_key(self):
+        # the namespace this instance writes: every entry shares one owner by construction
+        # (a store holds one conversation family), falling back to the single global partition
+        owners = {e.owner_session_id for e in self._entries.values() if e.owner_session_id}
+        return next(iter(owners)) if len(owners) == 1 else None
+
     def _publish(self):
         if not self._file:
             return
@@ -308,18 +314,26 @@ class MetaStore:
                 if isinstance(h, str):
                     return h
                 raise TypeError("unsupported block hash type %r" % type(h).__name__)
-            rows = [[[_enc(h) for h in e.block_hashes], e.covered_tokens, e.page_tokens,
-                     e.pages_per_block, e.capacity_pages, e.has_state, e.prefix_digest,
-                     list(e.owner_session_id) if e.owner_session_id else None,
-                     e.source_request]
-                    for e in self._entries.values()]
+            mine = self._owner_key()
+            def _row(e):
+                return [[_enc(h) for h in e.block_hashes], e.covered_tokens, e.page_tokens,
+                        e.pages_per_block, e.capacity_pages, e.has_state, e.prefix_digest,
+                        list(e.owner_session_id) if e.owner_session_id else None,
+                        e.source_request]
+            # merged view of the CURRENT generation + this instance's entries
+            rows = [_row(e) for e in self._entries.values()]
+            # foreign owners' entries are only edited by their own writer: preserve them
+            foreign = getattr(self, "_foreign", None) or {}
+            for fkey, frow in foreign.items():
+                f_owner = tuple(frow[7]) if frow[7] else None
+                if f_owner != mine:
+                    rows.append(frow)
             gen = int(getattr(self, "_file_gen", 0)) + 1
             self._file_gen = gen
-            rows.append(["__gen__", gen])
             d = _os.path.dirname(self._file) or "."
             fd, path = _tmp.mkstemp(dir=d, prefix=".kvmsess.")
             with _os.fdopen(fd, "w") as fh:
-                _json.dump(rows, fh)
+                _json.dump({"gen": gen, "rows": rows}, fh)
             _os.replace(path, self._file)
         except Exception:
             pass
@@ -338,16 +352,16 @@ class MetaStore:
             return
         except Exception:
             return
-        rows = list(rows)
-        gen = 0
-        clean = []
-        for r in rows:
-            if (isinstance(r, list) and len(r) == 2
-                    and r[0] == "__gen__" and isinstance(r[1], int)):
-                gen = int(r[1])
-            else:
-                clean.append(r)
-        rows = clean
+        if isinstance(rows, dict):
+            gen = int(rows.get("gen", 0))
+            rows = list(rows.get("rows", ()))
+        else:  # legacy flat list from before the partitioned format
+            gen = sum(int(r[1]) for r in rows
+                      if isinstance(r, list) and len(r) == 2 and r[0] == "__gen__"
+                      and isinstance(r[1], int))
+            rows = [r for r in rows
+                    if not (isinstance(r, list) and len(r) == 2
+                            and r[0] == "__gen__" and isinstance(r[1], int))]
         # generation counter, not mtime: two publishes in the same clock step (measured,
         # with ns-resolution st_mtime colliding across processes) silently starve an
         # mtime-gated reload and lose the other writer's entries.
@@ -356,7 +370,18 @@ class MetaStore:
         self._file_gen = gen
 
         # the file IS the store: reload rebuilds entries from the published set alone (an
-        # in-memory union would resurrect entries another process deleted)
+        # in-memory union would resurrect entries another process deleted). Entries of OTHER
+        # owners are foreign partitions: remembered verbatim for the next merged publish.
+        mine_ns = {tuple(o) if isinstance(o, (list, tuple)) else o
+                   for o in ({e.owner_session_id for e in self._entries.values()} |
+                             {None})
+                   if o is not None}
+        foreign = getattr(self, "_foreign", None) or {}
+        for r in rows:
+            fo = tuple(r[7]) if len(r) > 7 and r[7] else None
+            if fo is not None and fo not in mine_ns:
+                foreign[fo] = r
+        self._foreign = foreign
         merged = OrderedDict()
         def _dec(h):
             if isinstance(h, str):
