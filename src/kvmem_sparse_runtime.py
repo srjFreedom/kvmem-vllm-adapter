@@ -761,17 +761,19 @@ class VllmSparseRuntime:
             mean_tail = stats.mean_checkpoint(frontier) if stats is not None else None
         except Exception:
             return False
-        self._session_checkpoints[req] = (
-            frontier, exact_tokens, state, index_checkpoint, mean_tail)
+        payload = self._publish_session_park(req, owner, frontier, exact_tokens,
+                                             state, index_checkpoint, mean_tail)
+        self._session_checkpoints[req] = {
+            "frontier": frontier, "ids": exact_tokens, "state": state,
+            "index": index_checkpoint, "mean_tail": mean_tail, "payload": payload}
         # remember the namespace at seal time: a rebuild requeue can release the books
         # (dropping `_session_ids`) before the terminal prepare call reaches `_park_session`
         self._park_owner = getattr(self, "_park_owner", {})
-        owner = self._session_ids.get(req)
         if owner:
             self._park_owner[req] = owner
         self.log({"kind": "session_checkpoint_captured", "req": req,
                   "frontier": frontier, "suffix": prompt - frontier,
-                  "state": state is not None})
+                  "state": state is not None, "published": payload is not None})
         return True
 
     def note_resume(self, req, hit_tokens, visible_tokens):
@@ -788,75 +790,32 @@ class VllmSparseRuntime:
         from kvmem_session_store import block_hash_sequence
         return block_hash_sequence(ids, self.kv_block_size)
 
-    def _park_session(self, req):
-        """Prepare a sealed prefix for EngineCore's all-TP terminal publication barrier."""
-        if not self.session_reuse or self.session_store is None:
-            self.log({"kind": "session_park_enter", "req": req, "which": "disabled",
-                      "reuse": self.session_reuse, "store": self.session_store is not None})
-            return False
-        owner_session_id = self._session_ids.get(req)
-        if not owner_session_id:
-            owner_session_id = getattr(self, "_park_owner", {}).get(req)
-        if not owner_session_id:
-            self.log({"kind": "session_park_skipped", "req": req,
-                      "reason": "native session_id missing"})
-            return False
-        st = self._state.get(req)
-        if st is not None and not self._session_checkpoints.get(req):
-            # Seal at the terminal. The mid-prefill capture only fires when a step boundary
-            # EXECUTES exactly the checkpoint frontier; a fast dense prefill (or a stage-2
-            # rebuild requeue, which is the common path for long prompts) skips it, and the
-            # retirement barrier's first prepare call popped the dict before the second rank
-            # could seal. The whole prompt is GPU-resident and archived by now - the frontier
-            # is a prefix of what `after_step` just committed.
-            from kvmem_session_store import session_checkpoint_frontier
-            target = session_checkpoint_frontier(
-                int(self._prompt_len.get(req, 0) or 0), self.kv_block_size,
-                self.budget_tokens, self.select_block_tokens)
-            if target > 0 and int(st.tokens) >= target:
-                self._maybe_capture_session_checkpoint(req, st, force=True)
-        # A rebuilt request's identity can only be carried from the ARCHIVE request: the
-        # requeue path may release the books (which drop `_session_ids`) between the seal and
-        # the terminal prepare. `_park_session` runs at the terminal, when the books are live
-        # again, so pass the archived owner explicitly.
-        archive = self._session_checkpoints.get(req)
-        keep = req in getattr(self, "_prepark_keep", set())
-        checkpoint = (self._session_checkpoints.get(req) if keep
-                      else self._session_checkpoints.pop(req, None))
-        if checkpoint is None:
-            self.log({"kind": "session_park_skipped", "req": req,
-                      "reason": "no sealed executed-frontier checkpoint"})
-            return False
-        covered, ids, state, index_checkpoint, mean_tail = checkpoint
-        if (covered <= 0 or covered % max(1, self.kv_block_size)
-                or len(ids) != covered or (self.has_recurrent and state is None)):
-            self.log({"kind": "session_park_skipped", "req": req,
-                      "reason": "invalid checkpoint frontier", "frontier": int(covered),
-                      "state": state is not None})
-            return False
+    def _publish_session_park(self, req, owner_session_id, covered, ids, state,
+                              index_checkpoint, mean_tail):
+        """Open the worker-store park and build the cross-process record.
+
+        Runs AT SEAL TIME: the terminal prepare RPC can arrive after the books were released
+        (measured: rebuild's final step frees the worker state first), and every input here -
+        orchestrator store pages, statistics, hashes - only exists while books are live.
+        """
         orch = self._orch.get(req)
         if orch is None:
-            self.log({"kind": "session_park_enter", "req": req, "which": "no-orch",
-                      "frontier": int(checkpoint[0])})
-            return False
+            self.log({"kind": "session_park_enter", "req": req, "which": "no-orch"})
+            return None
         hashes = self._session_hashes(req, ids)
         pages = orch.usable_pages(covered)
-        if self.retrieval_enabled and index_checkpoint is None:
-            self.log({"kind": "session_park_skipped", "req": req,
-                      "reason": "sealed retrieval statistics checkpoint unavailable"})
-            return False
         stats = self._statistics.get(req) if self.stats_core else None
         if self.stats_core and (stats is None or stats.frontier < covered):
             self.log({"kind": "session_park_skipped", "req": req,
                       "reason": "core statistics checkpoint unavailable"})
-            return False
+            return None
         expected_pages = covered // max(1, self.page_tokens)
         if not hashes or len(pages) < expected_pages:
             self.log({"kind": "session_park_skipped", "req": req,
                       "reason": "checkpoint KV coverage incomplete",
                       "blocks": len(hashes), "pages": len(pages),
                       "expected_pages": expected_pages, "checkpoint_tokens": int(covered)})
-            return False
+            return None
         ppb = max(1, int(self.pages_per_block))
         budget = int(self.selector.budget_pages())
         capacity = (min(len(pages), budget) // ppb) * ppb
@@ -867,7 +826,7 @@ class VllmSparseRuntime:
             self.log({"kind": "session_park_skipped", "req": req,
                       "reason": "checkpoint requires full resident prefix",
                       "frontier": covered, "visible": capacity * self.page_tokens})
-            return False
+            return None
         import hashlib as _hl
         _digest = _hl.sha256(b"".join(
             int(t).to_bytes(4, "little", signed=False) for t in ids)).hexdigest()
@@ -906,6 +865,47 @@ class VllmSparseRuntime:
         self.log({"kind": "session_park_prepared", "req": req, "blocks": len(hashes),
                   "covered": covered, "pages": len(pages), "capacity": capacity,
                   "state": state is not None, "rank": int(getattr(self, "tp_rank", 0))})
+        return payload
+
+    def _park_session(self, req):
+        """Terminal hook: hand EngineCore's retirement barrier the sealed, published record.
+
+        The seal AND the worker-store publish happen at capture time (books alive); by the
+        terminal the request's orchestrator may already be released, so this must not touch
+        any live books. A checkpoint that was sealed but never published is re-published here
+        while books still exist (short answers that finished before any release).
+        """
+        if not self.session_reuse or self.session_store is None:
+            self.log({"kind": "session_park_enter", "req": req, "which": "disabled",
+                      "reuse": self.session_reuse, "store": self.session_store is not None})
+            return False
+        owner_session_id = self._session_ids.get(req)
+        if not owner_session_id:
+            owner_session_id = getattr(self, "_park_owner", {}).get(req)
+        if not owner_session_id:
+            self.log({"kind": "session_park_skipped", "req": req,
+                      "reason": "native session_id missing"})
+            return False
+        ck = self._session_checkpoints.get(req)
+        if ck is None:
+            st = self._state.get(req)
+            if st is not None:
+                from kvmem_session_store import session_checkpoint_frontier
+                target = session_checkpoint_frontier(
+                    int(self._prompt_len.get(req, 0) or 0), self.kv_block_size,
+                    self.budget_tokens, self.select_block_tokens)
+                if target > 0 and int(st.tokens) >= target:
+                    self._maybe_capture_session_checkpoint(req, st, force=True)
+                ck = self._session_checkpoints.get(req)
+        if ck is None:
+            self.log({"kind": "session_park_skipped", "req": req,
+                      "reason": "no sealed executed-frontier checkpoint"})
+            return False
+        payload = ck.get("payload")
+        if payload is None:
+            self.log({"kind": "session_park_skipped", "req": req,
+                      "reason": "sealed checkpoint was never published"})
+            return False
         return payload
 
     def prepare_session_checkpoint(self, req):
