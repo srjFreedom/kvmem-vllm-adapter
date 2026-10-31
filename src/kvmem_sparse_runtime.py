@@ -612,17 +612,18 @@ class VllmSparseRuntime:
         mapping = self._page_map.get(req, {})
         pages = int(frontier) // self.page_tokens
         st = self._state.get(req)
-        if st is None or st.compacted_in_prefill or st.row:
+        if st is None or st.compacted_in_prefill:
             if self.log is not None:
                 self.log({"kind": "session_seal_guard", "req": req, "which": "books",
                           "st": st is not None,
                           "compacted": bool(st and st.compacted_in_prefill),
-                          "row_active": bool(st and st.row),
-                          "row_head": [int(x) for x in (st.row or ())[:8]] if st else [],
-                          "logical_head": [int(x) for x in (st.logical or ())[:8]] if st else [],
                           "tokens": int(st.tokens) if st else -1,
                           "mapping": len(mapping), "pages": pages})
             return False
+        # `st.row` is NOT a refusal here: with KVMEM_INSTALL_ROW_VIEW the dense row mirrors the
+        # engine table (row[i] = the engine page holding LOGICAL i - measured heads 49,50,... =
+        # block-1 onward, the null block owning 0..48). Emptiness judged the seal by a symptom;
+        # the real invariant is the IDENTITY book below.
         if st.logical and pages and any(int(x) > pages for x in st.logical[:pages]):
             # dense prefill must have a LOGICAL identity book: page i holds page-i's bytes.
             # Anything else (a view/adopted ordering) cannot be sealed page-exactly.
@@ -1525,14 +1526,6 @@ class VllmSparseRuntime:
                 # the row length: the adopted prefix plus its appends is what the kernels read.
                 # Mirror it (positions/slot ids for the commit come from here).
                 pass
-            if (not bool(getattr(self, "sched_compact", False))
-                    and not bool(getattr(self, "install_row_in_view", False))
-                    and not bool(st.row)):
-                # dense prefill bookkeeping: the runtime does NOT need a mirror of the engine
-                # row - copying it makes `st.row` look like an ACTIVE view and the session
-                # checkpoint seal (identity books, no compaction) then refuses itself
-                # (measured). The row stays empty until a real compaction/rebuild owns one.
-                return 0
             table = self.view.block_table_rows()[0]
             values = table[st.row_index].tolist()[:w]
             if (bool(getattr(self, "sched_compact", False))
