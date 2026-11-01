@@ -1,3 +1,17 @@
+diff --git a/.gitignore b/.gitignore
+index 46418c0..4100fc8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -254,3 +254,9 @@ vllm/grpc/vllm_engine_pb2.pyi
+ 
+ # Ignore generated cpu headers 
+ csrc/cpu/cpu_attn_dispatch_generated.h
++
++# KVMem adapter: engine runtime artefacts (caches, pid files, launcher state)
++/triton-cache/
++run-logs/*.pid
++run-logs/*.pid.token
++run-logs/*.start-manager.state
 diff --git a/launcher.sh b/launcher.sh
 index 2938912..4c2f9e5 100755
 --- a/launcher.sh
@@ -423,7 +437,7 @@ index 39d670c..36cd9ba 100644
          attach_router as register_sagemaker_api_router,
      )
 diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
-index b7b292e..0adceeb 100644
+index b7b292e..27b4cf6 100644
 --- a/vllm/entrypoints/openai/chat_completion/protocol.py
 +++ b/vllm/entrypoints/openai/chat_completion/protocol.py
 @@ -51,6 +51,7 @@ from vllm.sampling_params import (
@@ -434,8 +448,22 @@ index b7b292e..0adceeb 100644
  
  logger = init_logger(__name__)
  
-@@ -623,7 +624,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
+@@ -621,9 +622,21 @@ class ChatCompletionRequest(OpenAIBaseModel):
+         else:
+             max_output_tokens = self.max_tokens
              max_output_tokens_param = "max_tokens"
++        # KVMem: an unset generation cap must default to the resident generation reserve R,
++        # not to the logical context ceiling - the beyond-R compaction round is not wired,
++        # and without this clamp every request that omits max_tokens is rejected outright
++        # (the char-level pre-trim compares `max_total - max_output` against 0 input budget).
++        # Mirrors the serving-layer clamp in `get_max_tokens` (api_utils.py).
++        try:
++            import os as _os
++            _r = int(_os.environ.get("KVMEM_GEN_RESERVE", "0") or 0)
++        except Exception:
++            _r = 0
++        if _r > 0 and max_output_tokens is None:
++            max_output_tokens = _r
  
          return TokenizeParams(
 -            max_total_tokens=model_config.max_model_len,
@@ -613,12 +641,43 @@ index 0000000..298977f
 +
 +def attach_router(app: FastAPI):
 +    app.include_router(router)
+diff --git a/vllm/entrypoints/serve/utils/api_utils.py b/vllm/entrypoints/serve/utils/api_utils.py
+index aa089cf..fcd15ab 100644
+--- a/vllm/entrypoints/serve/utils/api_utils.py
++++ b/vllm/entrypoints/serve/utils/api_utils.py
+@@ -192,6 +192,26 @@ def get_max_tokens(
+         if max_tokens is not None
+         else default_sampling_params.get("max_tokens")
+     )
++    # KVMem: the generation reserve R bounds an UNSET max_tokens (the beyond-R compaction
++    # round is not wired, so a request that reaches R stops at EOS). Applies to both the
++    # request value and the model's default_sampling_params fallback; an explicit client
++    # max_tokens below R is untouched, and `min(...)` below keeps the context bound.
++    _r = 0
++    try:
++        # published by the KVMem launcher from `--kvmem-gen-reserve`; the API-server
++        # process inherits the environment of the process that spawns the engine.
++        import os as _os
++        _r = int(_os.environ.get("KVMEM_GEN_RESERVE", "0") or 0)
++    except Exception:
++        _r = 0
++    if _r > 0:
++        if max_tokens is None:
++            fallback_max_tokens = (
++                _r if fallback_max_tokens is None
++                else min(fallback_max_tokens, _r)
++            )
++        else:
++            fallback_max_tokens = min(fallback_max_tokens, _r)
+ 
+     return min(
+         val
 diff --git a/vllm/kvmem_bridge.py b/vllm/kvmem_bridge.py
 new file mode 100644
-index 0000000..324c872
+index 0000000..64f4cc2
 --- /dev/null
 +++ b/vllm/kvmem_bridge.py
-@@ -0,0 +1,541 @@
+@@ -0,0 +1,640 @@
 +"""KVMem bridge: expose the current step's query to an out-of-tree policy layer.
 +
 +The hard constraint: under `torch.compile` (fullgraph) + CUDA Graph replay **no Python runs per
@@ -701,6 +760,9 @@ index 0000000..324c872
 +_K_MISMATCH = [0]
 +_K_MISMATCH_INFO: dict = {}
 +_KV_HEADS = 0
++_Q_HEADS = 0
++_Q_HEAD_DIM = 0
++MAX_ROWS = int(os.environ.get("VLLM_KVMEM_MAX_CHUNK_TOKENS", "4096") or "4096")
 +_KEY_WIDTH = 0
 +_K_BUCKETS = 0
 +# The model sees the COMPACTED position of a token; KVMem's statistics are keyed by the token's
@@ -783,12 +845,14 @@ index 0000000..324c872
 +    _KIDX.update(idx)
 +    _KFLAG.update(flag)
 +    _calls.update(calls)
-+    _ARMED = True
++    _ARMED = __import__("os").environ.get("KVMEM_BRIDGE_ARM", "1") != "0"
 +    ARMED = True
 +    _positions = positions
 +    _pos_count = pos_count
 +    _pos_offset = pos_offset
 +    _KV_HEADS = int(kv_heads or heads)
++    globals()["_Q_HEADS"] = int(heads) if heads else 0
++    globals()["_Q_HEAD_DIM"] = int(head_dim)
 +    _KEY_WIDTH = _KV_HEADS * int(head_dim)
 +    _K_BUCKETS = STEP_TOKENS // BUCKET + 2
 +    _ready = True
@@ -808,6 +872,36 @@ index 0000000..324c872
 +def pre_rope() -> bool:
 +    """True when `read()` hands out pre-RoPE rows (the adapter must not rotate them again)."""
 +    return PRE_ROPE
++
++
++
++# KVMem (2026-11-02, CUDA-graph compatibility): every NEW tensor allocation that happens
++# while a graph is being captured goes through the caching allocator, trips its
++# capture-state INTERNAL ASSERT and invalidates the whole stream
++# (cudaErrorStreamCaptureInvalidated) - measured twice on the SM75 FP8 build: the assert
++# surfaced at `key[:n].to(torch.float32)`. All buffers below are therefore allocated on
++# FIRST EAGER USE (warmup runs before any capture) and every later call - eager or
++# captured - writes them in place. No allocation, no `.item()`, no `tolist()` inside the
++# hot path.
++_SCRATCH: dict[tuple, torch.Tensor] = {}
++
++
++def _scratch(name, shape, ref: torch.Tensor, dtype) -> torch.Tensor:
++    """Static buffer created on first EAGER use (warmup always precedes capture); later
++    calls - eager or captured - only look it up. The shape is a tuple of PYTHON ints
++    (config constants / eager-time sizes): reading a CUDA tensor's symbolic `.shape`
++    tuple or allocating here while a stream is capturing invalidates the capture
++    (measured asserts 2026-11-01 boots 19:30 and 23:16)."""
++    buf = _SCRATCH.get(name)
++    if buf is None:
++        if torch.cuda.is_current_stream_capturing():
++            # first use landed INSIDE a capture: allocation would assert and tear the whole
++            # stream down. Skip this step's sample instead (warmup-eager always creates the
++            # buffer before the first graph, so in practice nothing is ever skipped).
++            return None
++        buf = torch.zeros(tuple(shape), dtype=dtype, device=ref.device)
++        _SCRATCH[name] = buf
++    return buf
 +
 +
 +@torch.library.custom_op("kvmem::capture_q", mutates_args=("query",))
@@ -836,20 +930,59 @@ index 0000000..324c872
 +    src = query[n - MAX_TOKENS:] if n > MAX_TOKENS else query
 +    dst = buf if n > MAX_TOKENS else buf[:n]
 +    take = dst.shape[0]
-+    rows = src.to(torch.float32)
++    # KVMem (measured 2026-11-01, boot 23:15): `tuple(t.shape[1:])` on a CUDA tensor can
++    # MATERIALIZE the symbolic shape during capture, and materialization calls
++    # cudaStreamIsCapturing - which PyTorch 2.9's allocator asserts on (`Cannot custom
++    # allocator with cudaStreamIsCapturing`) and it invalidates the whole capture. All
++    # geometry below therefore comes from Python ints (config constants, max'd against the
++    # eager-time sizes); no tensor shape is ever read while a stream is capturing.
++    heads = _Q_HEADS or int(buf.shape[1])
++    hd = _Q_HEAD_DIM or int(buf.shape[2])
++    # dtype MUST be float32 (the original `src.to(torch.float32)` widened once and kept the
++    # rotation in fp32 to the single final `rows.to(dst.dtype)` rounding; an fp8/bf16 buffer
++    # here would add a second rounding between rotation-writeback and publish, and measured
++    # resume-vs-cold output diverges from char ~118 when that happens).
++    rows_full = _scratch("qrows", (MAX_ROWS, heads, hd), src, torch.float32)
++    if rows_full is None:
++        return None
++    rows_full[:take].copy_(src)                              # dequant/copy in place (capturable)
++    rows = rows_full[:take]
 +    rd = int(rotary_dim)
 +    if rd > 0 and rd % 2 == 0 and rows.shape[-1] >= rd and cos_sin_cache is not None:
 +        half = rd // 2
 +        pos = positions if positions.ndim == 1 else positions[0]
 +        pos = pos[n - MAX_TOKENS:] if n > MAX_TOKENS else pos
-+        table = cos_sin_cache.index_select(0, pos)          # (rows, rd) = [cos | sin]
-+        cos = table[:, :half].unsqueeze(-2)                  # (rows, 1, half)
-+        sin = table[:, half:rd].unsqueeze(-2)
++        npos = int(pos.shape[0])
++        table = _scratch("qtab", (MAX_ROWS, rd), cos_sin_cache, cos_sin_cache.dtype)
++        if table is None:
++            return None
++        torch.index_select(cos_sin_cache, 0, pos, out=table[:npos])
++        # BOTH output halves are computed from the ORIGINAL x1/x2 (the upstream code cloned
++        # before writing back); two in-place scratch buffers preserve that order exactly.
++        prod1 = _scratch("qa", (MAX_ROWS, heads, half), rows, torch.float32)
++        prod2 = _scratch("qb", (MAX_ROWS, heads, half), rows, torch.float32)
++        tmp = _scratch("qt", (MAX_ROWS, heads, half), rows, torch.float32)
++        if prod1 is None or prod2 is None or tmp is None:
++            return None
++        cos = table[:npos, :half].unsqueeze(-2)              # (rows, 1, half)
++        sin = table[:npos, half:rd].unsqueeze(-2)
 +        x1 = rows[..., :half]
 +        x2 = rows[..., half:rd]
-+        rows = rows.clone()
-+        rows[..., :half] = x1 * cos + x2 * sin               # inverse rotation
-+        rows[..., half:rd] = x2 * cos - x1 * sin
++        # Kernels run EXACTLY as the original expression `x1*cos + x2*sin` did (mul, mul,
++        # add - three fp32 roundings). The earlier fused `addcmul_` form rounds differently
++        # (FMA), which shifted the mean-K scores and therefore compaction page selection.
++        # EXACT-shape out slices: passing the full MAX_ROWS buffer would make PyTorch
++        # silently RESIZE the out tensor (deprecation warning today, hard error later, and a
++        # resize inside graph capture allocates - the very class of op this rewrite removes).
++        p1 = prod1[:take]; p2 = prod2[:take]; tt = tmp[:take]
++        torch.mul(x1, cos, out=p1)
++        torch.mul(x2, sin, out=tt)
++        p1.add_(tt)
++        torch.mul(x2, cos, out=p2)
++        torch.mul(x1, sin, out=tt)
++        p2.sub_(tt)
++        x1.copy_(p1)
++        x2.copy_(p2)
 +    try:
 +        ok_all = torch.isfinite(rows).all()
 +        torch.where(torch.isfinite(rows), rows.to(dst.dtype), dst, out=dst)
@@ -892,7 +1025,8 @@ index 0000000..324c872
 +        # Probe the FIRST few payloads of every layer with a host sync. That is the window that
 +        # answers "was the query already broken during prefill, or only for the step that happened to
 +        # write last?" - and it costs nothing in steady state because it stops after PROBE_CALLS.
-+        if int(_calls[layer]) <= 5:
++        if (int(_calls[layer]) <= 5
++                and not torch.cuda.is_current_stream_capturing()):
 +            rec = _probe.setdefault(int(layer), [])
 +            rec.append({"n": int(n), "rows": int(query.shape[0]),
 +                        "absmax": float(query.abs().max()),
@@ -951,7 +1085,11 @@ index 0000000..324c872
 +        n = min(n, int(KEY_ROWS_LIMIT))
 +    if n <= 0:
 +        return None
-+    x = key[:n].to(torch.float32)
++    x_full = _scratch("kx", (MAX_ROWS, width), key, torch.float32)
++    if x_full is None:
++        return None
++    x_full[:n].copy_(key[:n])                                # dequant in place (capturable)
++    x = x_full[:n]
 +    if x.dim() == 2:
 +        x = x.view(n, _KV_HEADS, width // _KV_HEADS)
 +    out = rows[:n].view(n, _KV_HEADS, width // _KV_HEADS)
@@ -959,13 +1097,33 @@ index 0000000..324c872
 +    rd = int(rotary_dim)
 +    if rd > 0 and rd % 2 == 0 and x.shape[-1] >= rd and cos_sin_cache is not None:
 +        half = rd // 2
-+        table = cos_sin_cache.index_select(0, positions[:n])   # (n, rd) = [cos | sin]
-+        cos = table[:, :half].unsqueeze(1)                     # (n, 1, half)
-+        sin = table[:, half:rd].unsqueeze(1)
++        table = _scratch("ktab", (MAX_ROWS, int(rd)), cos_sin_cache, cos_sin_cache.dtype)
++        if table is None:
++            return None
++        torch.index_select(cos_sin_cache, 0, positions[:n], out=table[:n])  # (n, rd) [cos|sin]
++        cos = table[:n, :half].unsqueeze(1)                   # (n, 1, half)
++        sin = table[:n, half:rd].unsqueeze(1)
 +        x1 = x[..., :half]
 +        x2 = x[..., half:rd]
-+        out[..., :half].copy_(x1 * cos + x2 * sin)             # inverse rotation
-+        out[..., half:rd].copy_(x2 * cos - x1 * sin)
++        # KVMem graph-safe (measured boot 23:26: the expression temporaries `x1*cos` etc.
++        # allocate NEW tensors every step; the allocator asserts during capture). Both
++        # halves are still computed from the ORIGINAL x1/x2 before writeback.
++        kshape = (MAX_ROWS, _KV_HEADS, half)
++        kp1 = _scratch("kp1", kshape, x, torch.float32)
++        kp2 = _scratch("kp2", kshape, x, torch.float32)
++        ktmp = _scratch("kpt", kshape, x, torch.float32)
++        if kp1 is None or kp2 is None or ktmp is None:
++            return None
++        kp1 = kp1[:n]
++        kp2 = kp2[:n]
++        torch.mul(x1, cos, out=kp1)                          # mul,mul,add = original rounding
++        torch.mul(x2, sin, out=ktmp[:n])
++        kp1.add_(ktmp[:n])
++        torch.mul(x2, cos, out=kp2)
++        torch.mul(x1, sin, out=ktmp[:n])
++        kp2.sub_(ktmp[:n])
++        out[..., :half].copy_(kp1)                            # inverse rotation
++        out[..., half:rd].copy_(kp2)
 +    # A non-finite key row must never enter the statistics: one NaN poisons that bucket's mean key
 +    # and every cosine that reads it. Scrub in place and record the layer (device side, no sync).
 +    finite = torch.isfinite(out)
@@ -1422,18 +1580,20 @@ index 87fdbfb..7e8be2f 100644
      # Version of dataclass repr with token IDs obfuscated.
      def anon_repr(self) -> str:
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 253ea9d..6935c40 100644
+index 253ea9d..8a57b5d 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
-@@ -1,6 +1,7 @@
+@@ -1,6 +1,9 @@
  # SPDX-License-Identifier: Apache-2.0
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
  import itertools
++
++_GATE_OFF = __import__("os").environ.get("KVMEM_MTP_GATE","1")=="0"
 +import threading
  import time
  from collections import defaultdict, deque
  from collections.abc import Iterable
-@@ -129,6 +130,26 @@ class Scheduler(SchedulerInterface):
+@@ -129,6 +132,27 @@ class Scheduler(SchedulerInterface):
              else self.scheduler_config.max_num_batched_tokens
          )
          self.max_model_len = vllm_config.model_config.max_model_len
@@ -1444,6 +1604,7 @@ index 253ea9d..6935c40 100644
 +                  if isinstance(getattr(vllm_config, "additional_config", None), dict) else None)
 +        _kvmem = _kvmem if isinstance(_kvmem, dict) else {}
 +        self.kvmem_resident = bool(_kvmem.get("inrequest_compaction"))
++        self.logits_row_audit = _kvmem.get("draft_ledger_log")
 +        self.kvmem_reconstruction_enabled = bool(_kvmem.get("compact_rebuild"))
 +        self.kvmem_session_reuse = bool(_kvmem.get("session_reuse"))
 +        self.kvmem_session_checkpoint_budget = int(_kvmem.get("budget_tokens") or 0)
@@ -1460,7 +1621,7 @@ index 253ea9d..6935c40 100644
          self.enable_kv_cache_events = (
              self.kv_events_config is not None
              and self.kv_events_config.enable_kv_cache_events
-@@ -213,6 +234,10 @@ class Scheduler(SchedulerInterface):
+@@ -213,6 +237,10 @@ class Scheduler(SchedulerInterface):
  
          # IDs of requests preempted since the last call to schedule().
          self.reset_preempted_req_ids: set[str] = set()
@@ -1471,7 +1632,7 @@ index 253ea9d..6935c40 100644
  
          # Counter for requests waiting for streaming input. Used to calculate
          # number of unfinished requests
-@@ -332,6 +357,11 @@ class Scheduler(SchedulerInterface):
+@@ -332,6 +360,11 @@ class Scheduler(SchedulerInterface):
          self.scheduler_reserve_full_isl = (
              self.scheduler_config.scheduler_reserve_full_isl
          )
@@ -1483,7 +1644,37 @@ index 253ea9d..6935c40 100644
          additional_config = vllm_config.additional_config
          self.prefill_batch_barrier = bool(
              isinstance(additional_config, dict)
-@@ -650,7 +680,7 @@ class Scheduler(SchedulerInterface):
+@@ -596,7 +629,28 @@ class Scheduler(SchedulerInterface):
+         Either finish the prefill or leave at least num_prefill_lookahead for
+         the next chunk. No-op for eagle-family drafters (lookahead 1).
+         """
+-        remaining = request.num_tokens - num_computed_tokens - num_new_tokens
++        # KVMem: the row ledger is LOGICAL with a resident book (and the draft pool
++        # lives in `num_tokens`, so the pool must be subtracted here too - otherwise
++        # an in-flight pool turns `remaining` negative at a decode step, the clamp
++        # silently misfires every step that carries drafts, the last row slot gets
++        # the wrong token, and greedy MTP diverges from spec0 (measured 2026-11-01:
++        # short prompts A/B differ under resident+spec4, identical without the
++        # plugin hooks or with inrequest compaction off)).
++        if self.kvmem_resident:
++            _pool = len(request.spec_token_ids or ())
++            remaining = (
++                request.num_tokens_with_spec
++                - request.num_logical_tokens
++                - num_new_tokens
++            )
++            # A step that carries drafts must keep its full row count: clamping it
++            # splits the prefill boundary into `1 + pool` single-row steps, and the
++            # first draft step then runs while the engine is one step behind the
++            # book (scheduled=1 vs logits=1+pool - the row slice loses its tail).
++            if remaining == 0 and _pool and _pool < self.num_prefill_lookahead:
++                remaining = -1
++        else:
++            remaining = request.num_tokens - num_computed_tokens - num_new_tokens
+         if 0 < remaining < self.num_prefill_lookahead:
+             num_new_tokens -= self.num_prefill_lookahead - remaining
+         return max(num_new_tokens, 0)
+@@ -650,7 +704,7 @@ class Scheduler(SchedulerInterface):
              prefill_candidates = [
                  request
                  for request in self.running
@@ -1492,7 +1683,7 @@ index 253ea9d..6935c40 100644
              ]
              # A newly arriving prefill must not pause an already decoding-only
              # batch. The barrier is for aligning an in-flight prefill cohort;
-@@ -668,7 +698,7 @@ class Scheduler(SchedulerInterface):
+@@ -668,7 +722,7 @@ class Scheduler(SchedulerInterface):
                  waiting_candidates = (
                      request
                      for request in self.waiting
@@ -1501,7 +1692,7 @@ index 253ea9d..6935c40 100644
                      and request.request_id
                      not in self._prefill_barrier_admission_blocked
                  )
-@@ -677,7 +707,7 @@ class Scheduler(SchedulerInterface):
+@@ -677,7 +731,7 @@ class Scheduler(SchedulerInterface):
                  )
  
              remaining_prompts = [
@@ -1510,7 +1701,7 @@ index 253ea9d..6935c40 100644
                  for request in prefill_candidates
              ]
              if remaining_prompts and barrier_has_running_prefill:
-@@ -740,7 +770,7 @@ class Scheduler(SchedulerInterface):
+@@ -740,7 +794,7 @@ class Scheduler(SchedulerInterface):
                  continue
  
              request_prefill_remaining = max(
@@ -1519,23 +1710,57 @@ index 253ea9d..6935c40 100644
              )
              if (
                  prefill_frontier is not None
-@@ -789,10 +819,14 @@ class Scheduler(SchedulerInterface):
+@@ -789,10 +843,48 @@ class Scheduler(SchedulerInterface):
                  req_index += 1
                  continue
  
++            # KVMem: a draft slot scheduled while the prompt is still being served
++            # inflates the books with rows the sampler never emits; and clearing the
++            # pool AFTER `num_new_tokens` was derived from `num_tokens_with_spec`
++            # leaves the reverse mismatch (rows=5 with dict=0, measured 2026-11-01).
++            # The gate must run FIRST: no drafts, no dict, no pad, and the row
++            # count sees the true pool. `<=` because at the prompt boundary the
++            # first sampled token is not yet acknowledged as served.
++            if (self.kvmem_resident
++                    and request.num_logical_tokens <= request.num_prompt_tokens
++                    and not _GATE_OFF):
++                # KVMem: the gate reads the ROW invariant (`logical` == executed
++                # rows - rejected drafts, == prompt exactly when every prompt row
++                # has been scheduled and acknowledged). The earlier form
++                # `num_tokens <= prompt` compared TWO LEDGERS that speculation
++                # never keeps equal (the drafter appends its proposals to
++                # `num_tokens` before the first decode step), so the gate never
++                # fired, drafts escaped onto rows the compacted row cannot attend
++                # - logits outran rows (scheduled=1 vs logits=5), and greedy MTP
++                # lost the spec0 parity (measured 2026-11-01).
++                request.spec_token_ids = []
++                scheduled_spec_decode_tokens.pop(request.request_id, None)
++                request.kvmem_drafts_armed = False
++            elif self.kvmem_resident and not getattr(
++                    request, "kvmem_drafts_armed", False):
++                request.kvmem_drafts_armed = True
++
 +            # KVMem: the logical frontier minus the SERVED count. `num_computed_tokens` is the
 +            # resident KV length and a compaction rewinds it, so using it here would re-schedule
 +            # tokens that were already served (and, with a compacted book, the wrong ones).
++            # KVMem (milestone parity): the row formula reads the INVARIANT book
++            # `logical == computed + offset`. With speculation the books still
++            # agree after the gate purge (logical grew by rows + pool at the
++            # previous step, computed rolled back to the accepted prefix): rows =
++            # 1 + pool_new, dict = pool_new, logits = 1 + K <= rows. Using the
++            # raw row ledger (`computed + offset`) here over-subtracted the
++            # in-flight pool (rows=1 on a 4-draft step -> logits=5 assert).
++            _book = (request.num_logical_tokens if self.kvmem_resident
++                     else request.num_computed_tokens)
              num_new_tokens = (
                  request.num_tokens_with_spec
                  + request.num_output_placeholders
 -                - request.num_computed_tokens
-+                - (request.num_logical_tokens if self.kvmem_resident
-+                   else request.num_computed_tokens)
++                - _book
              )
              if 0 < self.scheduler_config.long_prefill_token_threshold < num_new_tokens:
                  num_new_tokens = self.scheduler_config.long_prefill_token_threshold
-@@ -804,11 +838,16 @@ class Scheduler(SchedulerInterface):
+@@ -804,11 +896,16 @@ class Scheduler(SchedulerInterface):
  
              # Make sure the input position does not exceed the max model len.
              # This is necessary when using spec decoding.
@@ -1555,12 +1780,20 @@ index 253ea9d..6935c40 100644
              )
  
              # Apply Mamba alignment before encoder caps.
-@@ -840,8 +879,31 @@ class Scheduler(SchedulerInterface):
+@@ -840,8 +937,39 @@ class Scheduler(SchedulerInterface):
              num_new_tokens = self._reserve_prefill_lookahead(
                  request, request.num_computed_tokens, num_new_tokens
              )
-+            if (self.kvmem_session_reuse and self.num_spec_tokens == 0
++            if (self.kvmem_session_reuse
 +                    and request.session_id and num_new_tokens > 0):
++                # KVMem (round-11): the `num_spec_tokens == 0` term was lifted after the
++                # round-10 evidence: the boundary gate keeps EVERY prefill step draft-free
++                # (`logical <= prompt` purges the pool), so aligning the chunk that crosses
++                # the checkpoint frontier is the same operation under speculation - and
++                # WITHOUT it, speculation merely changed the chunk ladder: executed never
++                # equals the frontier, the capture never fires, and the terminal park finds
++                # no sealed checkpoint on any rank (measured: park_skipped on both ranks).
++                # decode steps are untouched: `start < target` fails once served passes it.
 +                from kvmem_session_store import clip_session_checkpoint_chunk
 +                num_new_tokens = clip_session_checkpoint_chunk(
 +                    request.num_logical_tokens, num_new_tokens,
@@ -1587,7 +1820,7 @@ index 253ea9d..6935c40 100644
                  # The request cannot be scheduled because one of the following
                  # reasons:
                  # 1. No new tokens to schedule. This may happen when
-@@ -881,6 +943,15 @@ class Scheduler(SchedulerInterface):
+@@ -881,6 +1009,15 @@ class Scheduler(SchedulerInterface):
                          break
  
                      # The request cannot be scheduled.
@@ -1603,25 +1836,7 @@ index 253ea9d..6935c40 100644
                      # Preempt the lowest-priority request.
                      if self.policy == SchedulingPolicy.PRIORITY:
                          preempted_req = max(
-@@ -947,6 +1018,17 @@ class Scheduler(SchedulerInterface):
-             req_index += 1
- 
-             # Speculative decode related.
-+            # KVMem: a draft slot scheduled while the prompt is still being served inflates the
-+            # resident/served books with tokens the sampler never emits, and the request then
-+            # spins with num_new_tokens == 0. Drafts only make sense once every prompt token is
-+            # ackawledged as served.
-+            # Use <= : at the prompt boundary served == prompt, and handing drafts to that step
-+            # makes the sampler emit a round the runtime cannot attribute, so generation restarts
-+            # a few tokens early and replays the template tail. Drafts start from the step AFTER
-+            # the first sampled token is acknowledged.
-+            if (self.kvmem_resident
-+                    and request.num_logical_tokens <= request.num_prompt_tokens):
-+                request.spec_token_ids = []
-             if request.spec_token_ids:
-                 num_scheduled_spec_tokens = (
-                     num_new_tokens
-@@ -1009,7 +1091,7 @@ class Scheduler(SchedulerInterface):
+@@ -1009,7 +1146,7 @@ class Scheduler(SchedulerInterface):
                  request_id = request.request_id
  
                  request_prefill_remaining = max(
@@ -1630,18 +1845,49 @@ index 253ea9d..6935c40 100644
                  )
                  if (
                      prefill_frontier is not None
-@@ -1187,7 +1269,9 @@ class Scheduler(SchedulerInterface):
+@@ -1187,7 +1324,15 @@ class Scheduler(SchedulerInterface):
                      # We use `request.num_tokens` instead of
                      # `request.num_prompt_tokens` to consider the resumed
                      # requests, which have output tokens.
 -                    num_new_tokens = request.num_tokens - num_computed_tokens
-+                    num_new_tokens = request.num_tokens - (
-+                        request.num_logical_tokens if self.kvmem_resident
-+                        else num_computed_tokens)
++                    # KVMem (C4): the pad/decode path derives num_new_tokens from
++                    # the ROW ledger and includes draft slots. Reading the SAMPLED
++                    # logical book hid in-flight drafts (new==1 on a 4-draft step),
++                    # which re-enabled the phantom pad and crashed the runner
++                    # (scheduled=1 vs logits=5, measured 2026-10-31, MTP/4).
++                    _book = (num_computed_tokens + int(
++                        getattr(request, "num_kvmem_offset", 0) or 0)
++                        if self.kvmem_resident else num_computed_tokens)
++                    num_new_tokens = request.num_tokens_with_spec - _book
  
                      # Pad new decode requests to uniform spec decoding size to
                      # preserve full cudagraph for this step.
-@@ -1217,7 +1301,7 @@ class Scheduler(SchedulerInterface):
+@@ -1198,6 +1343,24 @@ class Scheduler(SchedulerInterface):
+                         and num_new_tokens == 1
+                         and not prefill_scheduled
+                         and (scheduled_running_reqs or num_computed_tokens > 0)
++                        # KVMem: the resident draft gate above (83437a1) just cleared
++                        # `spec_token_ids` for a request whose prompt is not fully
++                        # SAMPLED yet. Padding that step to `1 + num_spec` rows writes
++                        # a phantom all-draft dict (`[-1] * num_spec`) while no draft
++                        # exists -> the runner computes logits = num_spec + bonus
++                        # against fewer query rows and asserts. Skip padding exactly
++                        # when the gate has just fired.
++                        and not (self.kvmem_resident and request.num_logical_tokens
++                                 <= request.num_prompt_tokens)
++                        # KVMem (C3): pad is a draft step by construction (rows=1+K
++                        # pairs with dict=K), so it may fire only with a REAL draft
++                        # pool (the running-branch gate clears the pool BEFORE this
++                        # branch sees the request; a rebuild re-admission - pool 0,
++                        # logical > prompt - would otherwise get the ghost pad whose
++                        # ack desyncs the worker books: 88K/MTP stall). The `-1` dict
++                        # head is this fork's padded-drafter-batch marker, audited on
++                        # all 104 draft steps of the working run - not a ghost sign.
++                        and bool(request.spec_token_ids)
+                     ):
+                         padded_num_tokens = 1 + self.num_spec_tokens
+                         # Pad only when there is room for the sampled token(s).
+@@ -1217,7 +1380,7 @@ class Scheduler(SchedulerInterface):
                      if 0 < threshold < num_new_tokens:
                          num_new_tokens = threshold
                      if (
@@ -1650,7 +1896,38 @@ index 253ea9d..6935c40 100644
                          and prefill_frontier_step is not None
                      ):
                          num_new_tokens = min(num_new_tokens, prefill_frontier_step)
-@@ -1679,6 +1763,111 @@ class Scheduler(SchedulerInterface):
+@@ -1605,6 +1768,30 @@ class Scheduler(SchedulerInterface):
+             ec_manager_metadata=self.encoder_cache_manager.get_manager_metadata(),
+         )
+ 
++        if self.logits_row_audit is not None:
++            try:
++                import json as _j
++                with open(self.logits_row_audit, "a") as _f:
++                    for _rid, _rows in scheduler_output.num_scheduled_tokens.items():
++                        _rq = self.requests.get(_rid)
++                        if _rq is None:
++                            continue
++                        _dict = scheduler_output.scheduled_spec_decode_tokens.get(_rid)
++                        _f.write(_j.dumps({
++                            "kind": "draft_ledger", "req": _rid[:9],
++                            "rows": int(_rows),
++                            "dict": (len(_dict) if _dict is not None else 0),
++                            "dict_head": (_dict[0] if _dict else None),
++                            "computed": int(_rq.num_computed_tokens),
++                            "logical": int(_rq.num_logical_tokens),
++                            "offset": int(getattr(_rq, "num_kvmem_offset", 0) or 0),
++                            "pool": len(_rq.spec_token_ids),
++                            "tokens": int(_rq.num_tokens),
++                            "prompt": int(_rq.num_prompt_tokens),
++                        }) + "\n")
++            except Exception:
++                pass
++
+         # NOTE(Kuntai): this function is designed for multiple purposes:
+         # 1. Plan the KV cache store
+         # 2. Wrap up all the KV cache load / save ops into an opaque object
+@@ -1679,6 +1866,111 @@ class Scheduler(SchedulerInterface):
  
          return new_block_ids_to_zero or None
  
@@ -1762,7 +2039,7 @@ index 253ea9d..6935c40 100644
      def _preempt_request(
          self, request: Request, timestamp: float, drop_stale_output: bool = False
      ) -> None:
-@@ -1700,6 +1889,10 @@ class Scheduler(SchedulerInterface):
+@@ -1700,6 +1992,10 @@ class Scheduler(SchedulerInterface):
          self._inflight_prefills.discard(request)
          request.status = RequestStatus.PREEMPTED
          request.num_computed_tokens = 0
@@ -1773,10 +2050,27 @@ index 253ea9d..6935c40 100644
          if request.spec_token_ids:
              request.spec_token_ids = []
          # Async scheduling: mark all in-flight output as stale. Its tokens are
-@@ -1736,11 +1929,33 @@ class Scheduler(SchedulerInterface):
+@@ -1733,14 +2029,61 @@ class Scheduler(SchedulerInterface):
+         # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
+         #    computed tokens will be adjusted in update_from_output.
+         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
++        _sched_spec = scheduler_output.scheduled_spec_decode_tokens
++        _audit = []
          for req_id, num_scheduled_token in num_scheduled_tokens.items():
              request = self.requests[req_id]
              request.num_computed_tokens += num_scheduled_token
++            # KVMem (draft ledger, FINAL): the logical book accumulates SCHEDULED
++            # ROWS here (milestone behavior, byte-identical at spec=0) and the
++            # rejection rollback in update_from_output subtracts the REJECTED rows.
++            # The closed loop `+rows -rejected` equals the acknowledged count:
++            # accepted drafts stay, rejected never do, cudagraph pad rows are
++            # rolled back with the drafts they padded. The pure closed form
++            # `logical = num_tokens` broke this: during a long prefill it jumps to
++            # the WHOLE prompt while the worker book tracks executed rows, so the
++            # quiescent equality protocol (`want == have`) can never match and the
++            # beyond-pool rebuild never fires (88K stall at spec=0 too, measured
++            # 2026-11-01). Draft-gate and pad guards below keep the rows book
++            # honest for speculation steps.
 +            request.num_logical_tokens += num_scheduled_token
 +            # KVMem invariant: the served count tracks the RESIDENT count exactly, and the only
 +            # legitimate difference is the compaction offset (set when a compaction rewinds
@@ -1787,9 +2081,20 @@ index 253ea9d..6935c40 100644
 +            # model was fed undefined ids at overlapping positions (measured: 18-token prompt,
 +            # greedy, coherent for ~2 steps then a repetition loop; the same prompt is clean with
 +            # compaction off).
++            if self.kvmem_resident and int(getattr(request, "num_kvmem_offset", 0) or 0):
++                # Only a COMPACTION offset may separate the two books; requests under
++                # the compaction offset are forbidden from speculating (draft gate in
++                # update_draft_token_ids), so no in-flight draft rows exist either.
++                request.num_logical_tokens = (
++                    request.num_computed_tokens + int(request.num_kvmem_offset))
 +            if self.kvmem_resident:
-+                _offset = int(getattr(request, "num_kvmem_offset", 0) or 0)
-+                request.num_logical_tokens = request.num_computed_tokens + _offset
++                _audit.append((req_id[:9], num_scheduled_token,
++                               len(_sched_spec.get(req_id) or ()),
++                               int(request.num_computed_tokens),
++                               int(request.num_logical_tokens),
++                               int(getattr(request, "num_kvmem_offset", 0)),
++                               len(request.spec_token_ids),
++                               int(request.num_tokens)))
              request.num_in_flight_tokens += num_scheduled_token
              if self.defer_block_free:
                  # Record the in-flight step, to fence deferred block freeing.
@@ -1808,7 +2113,7 @@ index 253ea9d..6935c40 100644
                  request.num_tokens + request.num_output_placeholders
              )
              scheduler_output.has_structured_output_requests |= (
-@@ -1828,6 +2043,7 @@ class Scheduler(SchedulerInterface):
+@@ -1828,6 +2171,7 @@ class Scheduler(SchedulerInterface):
          new_block_ids: list[tuple[list[int], ...] | None] = []
          all_token_ids: dict[str, list[int]] = {}
          num_computed_tokens: list[int] = []
@@ -1816,7 +2121,7 @@ index 253ea9d..6935c40 100644
          num_output_tokens: list[int] = []
          resumed_req_ids = set()
  
-@@ -1860,6 +2076,7 @@ class Scheduler(SchedulerInterface):
+@@ -1860,6 +2204,7 @@ class Scheduler(SchedulerInterface):
                  req_to_new_blocks[req_id].get_block_ids(allow_none=True)
              )
              num_computed_tokens.append(req.num_computed_tokens)
@@ -1824,7 +2129,7 @@ index 253ea9d..6935c40 100644
              num_output_tokens.append(
                  req.num_output_tokens + req.num_output_placeholders
              )
-@@ -1871,6 +2088,7 @@ class Scheduler(SchedulerInterface):
+@@ -1871,6 +2216,7 @@ class Scheduler(SchedulerInterface):
              all_token_ids=all_token_ids,
              new_block_ids=new_block_ids,
              num_computed_tokens=num_computed_tokens,
@@ -1832,7 +2137,7 @@ index 253ea9d..6935c40 100644
              num_output_tokens=num_output_tokens,
          )
  
-@@ -2170,6 +2388,14 @@ class Scheduler(SchedulerInterface):
+@@ -2170,6 +2516,14 @@ class Scheduler(SchedulerInterface):
                  # In this case, we use is_finished() to check.
                  continue
  
@@ -1847,7 +2152,7 @@ index 253ea9d..6935c40 100644
              # Drop-mode stale output (same-step resume) is discarded entirely.
              if output_is_stale and request.drop_stale_output:
                  continue
-@@ -2179,6 +2405,28 @@ class Scheduler(SchedulerInterface):
+@@ -2179,6 +2533,28 @@ class Scheduler(SchedulerInterface):
                  sampled_token_ids[req_index] if sampled_token_ids else []
              )
  
@@ -1876,19 +2181,25 @@ index 253ea9d..6935c40 100644
              scheduled_spec_token_ids = (
                  scheduler_output.scheduled_spec_decode_tokens.get(req_id)
              )
-@@ -2196,6 +2444,11 @@ class Scheduler(SchedulerInterface):
+@@ -2196,6 +2572,17 @@ class Scheduler(SchedulerInterface):
                  if not output_is_stale:
                      if request.num_computed_tokens > 0:
                          request.num_computed_tokens -= num_rejected
 +                    # Rejected draft tokens were never served: the logical counter rolls back
 +                    # together with the resident one (their difference only changes on compaction).
 +                    if request.num_logical_tokens > 0:
++                        # KVMem: the rows-accumulated book above COUNTED the drafts
++                        # this step scheduled; the rejected share must roll back or
++                        # pad/draft rows leak permanently into the served frontier
++                        # (this rollback + the schedule-side increment is the closed
++                        # loop; disabling it under resident made the book outrun the
++                        # row ledger - 88K/MTP stall, measured 2026-11-01).
 +                        request.num_logical_tokens = max(
 +                            0, request.num_logical_tokens - num_rejected)
                      if request.num_output_placeholders > 0:
                          request.num_output_placeholders -= num_rejected
                  spec_decoding_stats = self.make_spec_decoding_stats(
-@@ -2246,7 +2499,7 @@ class Scheduler(SchedulerInterface):
+@@ -2246,7 +2633,7 @@ class Scheduler(SchedulerInterface):
                  stopped = True
              elif (
                  self.is_mm_encoder_only
@@ -1897,7 +2208,7 @@ index 253ea9d..6935c40 100644
              ):
                  # An encoder instance runs the encoder and publishes the
                  # embeddings instead of sampling, so it stops as soon as the
-@@ -2577,7 +2830,13 @@ class Scheduler(SchedulerInterface):
+@@ -2577,7 +2964,13 @@ class Scheduler(SchedulerInterface):
  
              # Check for stop and update request state.
              # This must be called before we make the EngineCoreOutput.
@@ -1912,7 +2223,7 @@ index 253ea9d..6935c40 100644
              if stopped:
                  del new_token_ids[num_new:]  # Trim new tokens if needed.
                  break
-@@ -2637,6 +2896,17 @@ class Scheduler(SchedulerInterface):
+@@ -2637,6 +3030,17 @@ class Scheduler(SchedulerInterface):
                      request.spec_token_ids = []
                  continue
  
@@ -1930,7 +2241,7 @@ index 253ea9d..6935c40 100644
              # Add newly generated spec token ids to the request.
              if self.structured_output_manager.should_advance(request):
                  metadata = request.structured_output_request
-@@ -2800,6 +3070,8 @@ class Scheduler(SchedulerInterface):
+@@ -2800,6 +3204,8 @@ class Scheduler(SchedulerInterface):
  
          self.encoder_cache_manager.free(request)
          request_id = request.request_id
@@ -1939,7 +2250,7 @@ index 253ea9d..6935c40 100644
          self._prefill_barrier_admission_blocked.discard(request_id)
          self.finished_req_ids.add(request_id)
          if self.finished_req_ids_dict is not None:
-@@ -3005,6 +3277,16 @@ class Scheduler(SchedulerInterface):
+@@ -3005,6 +3411,16 @@ class Scheduler(SchedulerInterface):
          connector_stats_payload = (
              kv_connector_stats.to_dict() if kv_connector_stats else None
          )
@@ -1956,7 +2267,7 @@ index 253ea9d..6935c40 100644
          return SchedulerStats(
              num_running_reqs=len(self.running),
              num_waiting_reqs=len(self.waiting),
-@@ -3017,6 +3299,8 @@ class Scheduler(SchedulerInterface):
+@@ -3017,6 +3433,8 @@ class Scheduler(SchedulerInterface):
              kv_connector_stats=connector_stats_payload,
              cudagraph_stats=cudagraph_stats,
              perf_stats=perf_stats,
@@ -1965,7 +2276,7 @@ index 253ea9d..6935c40 100644
          )
  
      def make_spec_decoding_stats(
-@@ -3322,6 +3606,7 @@ class Scheduler(SchedulerInterface):
+@@ -3322,6 +3740,7 @@ class Scheduler(SchedulerInterface):
                      marked_invalid_block_ids |= request_invalid_block_ids
                      total_affected_tokens += req_num_computed_tokens
                      request.num_computed_tokens = 0
@@ -2004,7 +2315,7 @@ index ffc9a5d..82a5eff 100644
      def log_error_detail(self, scheduler_output: SchedulerOutput):
          """Execute the model and log detailed info on failure."""
 diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
-index 4cc433c..28db4e3 100644
+index 4cc433c..2cc69f6 100644
 --- a/vllm/v1/engine/input_processor.py
 +++ b/vllm/v1/engine/input_processor.py
 @@ -31,6 +31,7 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
@@ -2015,17 +2326,57 @@ index 4cc433c..28db4e3 100644
  
  logger = init_logger(__name__)
  
-@@ -359,7 +360,8 @@ class InputProcessor:
+@@ -293,6 +294,22 @@ class InputProcessor:
+         resumable: bool = False,
+         session_id: str | None = None,
+     ) -> EngineCoreRequest:
++        # KVMem: give an unset max_tokens a sane default BEFORE validation. The stock
++        # "generate up to max_model_len" default lands at the FULL context window under a
++        # resident-prefill deployment (524288 here), which the prompt-length check then
++        # rejects for any non-empty prompt - every request without max_tokens 400'd. The
++        # default is the generation reserve R (the beyond-R compaction round is not wired
++        # yet, so a request that reaches R stops at EOS); an explicit max_tokens is never
++        # touched. The cap further below (`min(max_tokens, R)`) keeps both paths consistent.
++        if (isinstance(params, SamplingParams) and params.max_tokens is None
++                and self.vllm_config is not None):
++            _kvm = getattr(self.vllm_config, "additional_config", None) or {}
++            _kv = _kvm.get("kvmem") if isinstance(_kvm, dict) else None
++            _rr = int(((_kv or {}).get("gen_reserve_tokens")
++                       or __import__("os").environ.get("KVMEM_GEN_RESERVE", "16384")))
++            if _rr > 0:
++                params = params.clone()
++                params.max_tokens = _rr
+         self._validate_params(params, supported_tasks)
+         self._validate_lora(lora_request)
+ 
+@@ -359,7 +376,25 @@ class InputProcessor:
                  seq_len = length_from_prompt_token_ids_or_embeds(
                      prompt_token_ids, prompt_embeds
                  )
 -                sampling_params.max_tokens = self.model_config.max_model_len - seq_len
 +                sampling_params.max_tokens = (logical_max_len(self.model_config.max_model_len)
 +                                              - seq_len)
++                # KVMem: an unset max_tokens must not let a generation run past the
++                # resident generation reserve R - the working set is B + R by design,
++                # and the beyond-R compaction round is not wired yet (a request that
++                # reaches R stops cleanly at EOS instead). Only the DEFAULT is capped;
++                # an explicit client max_tokens is never touched.
++                _r = 0
++                try:
++                    _ac = getattr(self.vllm_config, "additional_config", None) or {}
++                    _kv = _ac.get("kvmem") if isinstance(_ac, dict) else None
++                    if isinstance(_kv, dict):
++                        _r = int(_kv.get("gen_reserve_tokens", 0) or 0)
++                except Exception:
++                    _r = 0
++                if _r <= 0:
++                    _r = int(__import__("os").environ.get("KVMEM_GEN_RESERVE", "16384"))
++                if _r > 0:
++                    sampling_params.max_tokens = min(sampling_params.max_tokens, _r)
  
              sampling_params.update_from_generation_config(
                  self.generation_config_fields,
-@@ -446,7 +448,9 @@ class InputProcessor:
+@@ -446,7 +481,9 @@ class InputProcessor:
  
          model_config = self.model_config
          max_prompt_len = (
