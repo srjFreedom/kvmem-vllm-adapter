@@ -105,7 +105,14 @@ def main(argv=None) -> int:
             # two cold runs byte-equal). GDN draft isolation (spec_state_indices scratch
             # slots) keeps the parked StateImage at the accepted prefix.
             cfg['session_reuse'] = True
-            cfg['session_reuse'] = True
+            # KVMem (2026-11-02, compiled-path qualification): with CUDA graphs ENABLED the
+            # terminal park races the in-request rebuild - `reconstruction_started` frees the
+            # orchestrator pages BEFORE seal, park skips with "core statistics checkpoint
+            # unavailable", and a would-be resume silently degrades to a full cold prefill
+            # (measured boot 23:37:13, session nosync-early-2). The seal-vs-rebuild ordering
+            # fix is the next work item; until it lands AND is re-qualified byte-for-byte on a
+            # compiled instance, production config keeps KVMEM_SESSION_REUSE=0 while the graph
+            # path is on (the eager instance keeps reuse=1 as validated at stage4-mtp).
         if _env_flag("KVMEM_DRAFT_LEDGER"):
             # C6 audit (docs/design-mtp-draft-ledger.md): per-step draft/served
             # book trace from EngineCore's scheduler, opt-in only.
