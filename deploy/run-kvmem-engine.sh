@@ -21,7 +21,16 @@ export KVMEM_PLUGIN_CONFIG=${KVMEM_PLUGIN_CONFIG:-/tmp/kvmem_plugin.json}
 export KV_CONCURRENCY_EFFECTIVE_LEN=${KV_CONCURRENCY_EFFECTIVE_LEN:-32768}
 # 思考 token 上限：未设置 = 无上限（默认）。设了才会限制推理长度。
 if [ -n "${THINKING_BUDGET:-}" ]; then export REASONING_BUDGET="$THINKING_BUDGET"; fi
+# SM75 + MTP + CUDA graph 的 fork 内策略（v0.4.0 生产值，实测组合）：
+#   nosync = 投机解码图内无额外流同步（launcher 的 --mode fast 会推导成 safe，那是调试档）；
+#   MAMBA_SPEC_FULL_CUDAGRAPH=1 = GDN/Mamba 投机全图快路径（本仓库已验证的解码路径）。
+# 显式导出，克隆后无需任何 /etc/default 即可复现生产行为；要改在环境里覆盖即可。
+export VLLM_SM75_SPEC_SYNC_MODE=${VLLM_SM75_SPEC_SYNC_MODE:-nosync}
+export VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=${VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH:-1}
 
+# GPU_UTIL=0.972：编译图模式的静态缓冲要吃掉约 2.5K token 的池；0.97 时池=198,561 <
+# MAX_MODEL_LEN=200,000，200K 请求会 OOM（实测 2026-11-02 夜间服务死亡）。曲线：
+# 0.93->152K, 0.95->175K, 0.97->198.6K, 0.972->201.4K tokens。
 # 注意：这些注释必须留在 ARGS 上方，绝不能插进参数表中间。
 #  [教训] 反斜杠续行的参数表中间插 # 注释会静默截断命令，后面所有 --set 全部失效。
 ARGS=(
@@ -29,7 +38,7 @@ ARGS=(
   --profile "${PROFILE:-2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env}"
   --mode fast --gpu-devices 0,1 --tp-size 2 --pp-size 1
   --set MAX_MODEL_LEN=${MAX_MODEL_LEN:-32768}
-  --set GPU_UTIL=${GPU_UTIL:-0.97}
+  --set GPU_UTIL=${GPU_UTIL:-0.972}
   --set MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-4096}
   --set MAX_NUM_SEQS=${MAX_NUM_SEQS:-1}
   --set SERVED_NAME=${SERVED_NAME:-KVMEM}

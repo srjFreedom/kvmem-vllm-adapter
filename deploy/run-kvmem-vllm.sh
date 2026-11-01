@@ -46,6 +46,23 @@ KVMEM_ENTRY_RESIDENT_PREFILL=${KVMEM_ENTRY_RESIDENT_PREFILL:-1}
 export KVMEM_ENTRY_RESIDENT_PREFILL
 # 检索用的 query 捕获窗口（KVMem query_max_tokens 的官方默认是 512）
 CAPTURE_TOKENS=${CAPTURE_TOKENS:-512}
+# v0.4.0 生产默认（克隆即可复现）：会话复用 park/resume 开启（编译+MTP4 组合已端到端验证：
+# 命中省 ~34s、双路 needle 一致、离线 9/9）。设 KVMEM_SESSION_REUSE=0 可关。
+export KVMEM_SESSION_REUSE=${KVMEM_SESSION_REUSE:-1}
+# 显式引擎窗口上界（resident 模式）：auto-fit(-1) 会把 rotary 等缓冲压到池以下，
+# 更长的 prompt 变成非法访问而不是干净报错（worker.py 注释记录过实测）。2x22G SM75
+# + GPU_UTIL=0.972（池 201,438 tokens）的安全上界是 200000；显存不同的机器请覆盖。
+export KVMEM_MAX_MODEL_LEN=${KVMEM_MAX_MODEL_LEN:-200000}
+# 压缩路径的三个运行时形态（v0.4.0 生产验证组合；unset 会走不同代码分支）：
+#   REBAKE=1 页迁回视图时按视图位置重旋 RoPE（混合模型 + 块内重排必须）
+#   COMPACT_MODE=prefix 前缀式压缩（sink/recent 保序，中间按分数换出）
+#   BLOCKWISE=1 按引擎块所有权回收（超池重建的页表搬运）
+export KVMEM_REBAKE=${KVMEM_REBAKE:-1}
+export KVMEM_COMPACT_MODE=${KVMEM_COMPACT_MODE:-prefix}
+export KVMEM_BLOCKWISE=${KVMEM_BLOCKWISE:-1}
+# 整体重算：prompt prefill 末尾用 TP 汇总评分选定最终工作集并重放一遍（超池正确性的
+# 已验证路径；v0.4.0 起为默认，设 0 退回仅重排不重算的旧行为）。
+export KVMEM_COMPACT_REBUILD=${KVMEM_COMPACT_REBUILD:-1}
 MODEL=${MODEL:?未设置 MODEL：指向你的权重目录，例如 MODEL=$HOME/models/<你的模型>}
 # 对外模型 id：按你实际部署的权重命名（需与客户端请求里的 model 一致）。
 SERVED_NAME=${SERVED_NAME:-Qwen3.8-27B-FP8-MTP}
