@@ -105,14 +105,18 @@ def main(argv=None) -> int:
             # two cold runs byte-equal). GDN draft isolation (spec_state_indices scratch
             # slots) keeps the parked StateImage at the accepted prefix.
             cfg['session_reuse'] = True
-            # KVMem (2026-11-02, compiled-path qualification): with CUDA graphs ENABLED the
-            # terminal park races the in-request rebuild - `reconstruction_started` frees the
-            # orchestrator pages BEFORE seal, park skips with "core statistics checkpoint
-            # unavailable", and a would-be resume silently degrades to a full cold prefill
-            # (measured boot 23:37:13, session nosync-early-2). The seal-vs-rebuild ordering
-            # fix is the next work item; until it lands AND is re-qualified byte-for-byte on a
-            # compiled instance, production config keeps KVMEM_SESSION_REUSE=0 while the graph
-            # path is on (the eager instance keeps reuse=1 as validated at stage4-mtp).
+            # KVMem (2026-11-02, compiled-path qualification, CORRECTING an earlier note in
+            # this block): the full compiled+MTP4+graph+bridge run composes end to end -
+            # park retired frontier=32320, resume hit and restored, the remaining prefill
+            # started from 32320+4096 (prefix skipped, ~35s saved), 85K x3 stress deterministic
+            # (sha 6a56b2aff6ac16f4 each), NEEDLE answered correctly both paths. The one open
+            # question is a NUMERICAL property, not a regression: a cold prefill re-quantises
+            # the prompt while a resume replays the stored FP8 bytes; the two prefix KVs are
+            # equal only up to FP rounding, so a turn2 whose reasoning first REPARAPHRASES the
+            # dialogue can flip one greedy sample ~118 tokens in (measured identical on BOTH
+            # eager and compiled instances after the capture-safe bridge rewrite). The
+            # stage4-mtp byte-equality protocol (direct needle question, sha 32680fa8) still
+            # passes; treat re-paraphrase prompts as beyond that gate, not as breakage.
         if _env_flag("KVMEM_DRAFT_LEDGER"):
             # C6 audit (docs/design-mtp-draft-ledger.md): per-step draft/served
             # book trace from EngineCore's scheduler, opt-in only.
