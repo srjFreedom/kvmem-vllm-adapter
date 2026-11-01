@@ -8,6 +8,8 @@
 - 传递：`--kvmem-*` → `--additional-config '{"kvmem": {...}}'`（vLLM 官方通道，随 VllmConfig
   序列化到每个 TP worker）
 - 布局：本目录可直接拷进 kvmem 仓库的 `backends/vllm/`（纯新增，不改任何既有文件）
+- 启动链：worker.py exec `deploy/run-kvmem-engine.sh` → 引擎 `launcher.sh`；
+  CUDA graph + MTP + 会话复用的生产默认值全部在 deploy/ 脚本里（v0.4.0）
 
 ## 启动
 
@@ -15,16 +17,8 @@
 python3 backends/vllm/worker.py --model /path/to/model --port 8000 \
   --kvmem-budget 32768 --kvmem-gen-reserve 16384 \
   --kvmem-sink-tokens 8192 --kvmem-recent-tokens 1024 \
-  --kvmem-sessions 4 --kvmem-host-mib 16384 --kvmem-block-tokens 32 \
+  --kvmem-sessions 4 --kvmem-host-mib 16384 --kvmem-block-tokens 64 \
   --no-kvmem-lrfu --max-model-len 204800 --tensor-parallel-size 2
 ```
 
 `--dry-run` 打印将要传给 vLLM 的 `additional_config` 与插件配置，用于审计/测试。
-
-## 与 llama/ninfer 的对应关系
-
-| kvmem worker | vllm worker |
-|---|---|
-| 链接 kvmem 静态库 | `vllm_kvmem_ext` pybind 模块（同一套 `MemoryBackend`/`MemorySession`/`HostKvStorage`） |
-| 命令行参数直接可用 | 参数组装进 `--additional-config`，由 vLLM 分发到每个 worker |
-| 引擎与策略同进程 | 策略在 EngineCore 决策、各 TP worker 执行同一 plan（确定性 + 指纹校验） |

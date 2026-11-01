@@ -60,16 +60,16 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 
 | 参数 | 默认 | 含义 | 什么时候改 |
 |---|---|---|---|
-| `GPU_UTIL` | `0.97` | vLLM 请求的显存占用比例（`--gpu-memory-utilization`）| 22 GB 卡用 0.97；显存更小的卡降低（0.90~0.95），OOM 时**先降这个** |
+| `GPU_UTIL` | `0.972` | vLLM 请求的显存占用比例（`--gpu-memory-utilization`）| 22 GB 卡 + CUDA graph 用 0.972（池 201,438 token）；0.97 = 198,561 < `MAX_MODEL_LEN=200000` 实测 OOM。graph 静态缓冲比 eager 多吃约 2.5K token（曲线 0.93→152K / 0.95→175K / 0.97→198.6K / 0.972→201.4K）。显存更小的卡整体降低并同步下调窗口 |
 | `MAX_BATCHED_TOKENS` | `4096` | 单步 prefill 的 token 上限（chunk 大小）| 调大可减少 chunk 数、提升 prefill 并行度，但吃显存；调大后必须重跑启动 smoke |
 | `KVMEM_ENTRY_RESIDENT_PREFILL` | `1`（随内压缩自动打开）| 入口不裁剪，完整 prompt 进入引擎；池内可常驻，**超池时仍须在 prefill 中压缩**（`KVMEM_RESIDENT_PREFILL_COMPACT=1`） | 单独打开并不能让超池 prompt 装入物理池 |
-| `--kvmem-block-tokens` | `32` | 选片块大小（必须是最小 KV 页 16 的整数倍）| 32 是修复值：检索按块取 pre-RoPE key 的**均值**打分，128 会让一条关键行（key/id/罕见词）被同块另外 ~127 个 token 稀释 —— 实测 200K prompt 在 50%~73% 换出时，128 答非所问、32 两把 needle 全中。调回 128 只在上下文很短（<32K）且不需要精确召回时才有意义 |
+| `--kvmem-block-tokens`（env `SELECT_BLOCK_TOKENS`）| `64` | 选片网格大小（必须是最小 KV 页 16 的整数倍）| 64 = 统计桶大小：桶小于网格会重采样劈裂短记录，128 会让一条关键行（key/id/罕见词）被同块 token 稀释（实测 needle 全中 vs 答非所问）。与引擎块 1,616 token 对齐回收 |
 | `KVMEM_DEBUG_POS` | 空（关）| 诊断：每一步在 `/tmp/kvmem_sparse.jsonl` 落一条 `debug_pos`，记录引擎为该请求算出的 `positions` 前 8 个、`npc`（常驻计数镜像）、`nlg`（服务计数镜像）、`seq_len` | 只在查「解码位置不前进 / 输出重复」时打开；`n` 应恒为 1+drafts（MTP=4 时 5），位置窗口应逐 step 前进 |
 | `SPECULATIVE_TOKENS` | `4` | MTP 投机 token 数 | `0` = 关闭投机：省显存/更稳，但 decode 变慢 |
 | `NO_ASYNC_SCHEDULING` | `0` | `0` = 异步调度（默认），`1` = 强制同步 | 入口选片下引擎无块表改写，异步调度安全；开 `inrequest-compaction` 时 worker 强制写回 `1`。整体重算只支持同步。 |
-| `KVMEM_COMPACT_REBUILD` | `0` | 在超池 prompt 的最后一个 prefill forward 后用两张卡的平均评分选片，丢弃旧采样并把选中 token 重新 prefill；原始 prompt 的 API usage 不变。须与 `KVMEM_PROMPT_END_RESELECT=1`、`KVMEM_ENTRY_RESIDENT_PREFILL=1`、`KVMEM_RESIDENT_PREFILL_COMPACT=1`、`KVMEM_SKIP_KV_CHECK=1` 联用 | **实验**：仅同步 V2、TP2、PP1、无前缀缓存的单文本请求；不支持多模态/流式输入/输出 prompt logprobs/跨请求 session 重用。重建后该请求禁止 MTP 投机；全局 MTP4 的 1+4 状态槽仍保留。 |
+| `KVMEM_COMPACT_REBUILD` | `1`（v0.4.0 默认）| 在超池 prompt 的最后一个 prefill forward 后用两张卡的平均评分选片，丢弃旧采样并把选中 token 重新 prefill；原始 prompt 的 API usage 不变。与 `KVMEM_ENTRY_RESIDENT_PREFILL=1` 联用 | **默认路径**：仅同步 V2、TP2、PP1、无前缀缓存的单文本请求（并发未验证）。重建后该请求禁止 MTP 投机（fail-closed）；全局 MTP4 的 1+4 状态槽仍保留。88K/池 36.8K 窗实测 needle 正确 |
 | `KVMEM_PROMPT_END_RESELECT` | `0` | 在完整 prompt 的 query 可用时重新检索 | 当前应与整体重算一起开；仅重排而不重算不能修正旧循环状态。 |
-| `KVMEM_SKIP_KV_CHECK` / `KVMEM_MAX_MODEL_LEN` | `0` / 引擎窗口 | 允许逻辑 prompt 超过物理池并提供足够的输入缓冲区 | 显式实验开关，默认不得跳过 KV 容量检查。 |
+| `KVMEM_MAX_MODEL_LEN` | `200000`（v0.4.0 默认）| 显式引擎窗口上界。auto-fit(`-1`) 会把 rotary 等缓冲压到池以下，超长 prompt 变成非法访问而非干净报错 | resident 模式必备；换显存按池曲线改。`KVMEM_SKIP_KV_CHECK` 仍为显式实验开关，默认不跳过容量检查 |
 | `KVMEM_RESIDENT_PREFILL_COMPACT` | `0` | 在物理池装不下原 prompt 时按高水位压缩常驻工作集 | 不开会在块池耗尽前停住。 |
 | `KVMEM_BLOCK_SIZE` | 未指定 | 请求引擎使用小块；混合模型实际 attention 块仍可能按 Mamba 对齐放大（实测为 1616 token=101 个 16-token 页） | 重算回收按实际 `blocks_per_kv_block`，不按环境变量猜块大小。 |
 | `--kvmem-inrequest-compaction` | **开**（默认常驻模式） | **常驻工作区的唯一开关**：入口上限 `R`→`CTX` + 入口不再裁剪历史 + 引擎内压缩（prefill 与 decode）+ block 通道 + 同步调度 + 关闭前缀缓存。默认开启时同时打开常驻工作区（`KVMEM_ENTRY_RESIDENT_PREFILL=1`）；设 0 = 退回 vLLM 原始路径（入口裁到 B、上限 R、前缀缓存开，未修复的旧路径）| 加这一个参数，显存就是每请求 `B+R`（与上下文长度无关）；超池正确性另须显式打开上述实验开关 |
@@ -82,6 +82,18 @@ N=4: 窗口 212,992  → 略超 → 需把 B 降到 ~26K
 
 这些参数在启动脚本里都有 `${VAR:-默认}` 兜底，所以既可以写进 `~/.config/kvmem-vllm.env`，
 也可以临时 `GPU_UTIL=0.9 ./deploy/run-kvmem-vllm.sh` 试。
+
+### CUDA graph / 编译 / 会话复用（v0.4.0 新增默认）
+
+| 参数 | 默认 | 含义 | 什么时候改 |
+|---|---|---|---|
+| `KVMEM_FORCE_EAGER` | 不设（编译路径）| `1` = 强制整个引擎 eager（无 CUDA graph）| 只在排查图捕获回归时用；实测代价 46 vs 85 tok/s（-46%）|
+| `KVMEM_BRIDGE_ARM` | `1` | 打分桥的 capture 安全模式（静态缓冲 + 原地写）。`0` = 桥退回不可捕获写法（会让编译启动崩溃，仅供复现 bug）| 不改 |
+| `VLLM_SM75_SPEC_SYNC_MODE` | `nosync` | SM75 fork 的 MTP 图内流同步策略（launcher 的 `--mode fast` 会推导成 `safe`，那是调试档）| 显式值优先；`aggressive` 慎用 |
+| `VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH` | `1` | GDN/Mamba + 投机的全图快路径（已验证的解码路径）| 不改 |
+| `KVMEM_SESSION_REUSE` | `1` | 会话停放/恢复：请求结束把 checkpoint 前沿之前的前缀 KV（FP8 原字节）+ 循环状态存入 H 层，块哈希链入 `/tmp/kvmem_session_meta.json`；下一轮带同一 `X-Session-ID` 命中恢复 | 设 `0` 回到纯冷跑。注意 store 为 LRU（`SESSIONS` 条），第三条停放挤掉最早；checkpoint 一次性消费 |
+| `KVMEM_DRAFT_LEDGER` | 不设（关）| 草稿账本显式记账（阶段 4 的验证工具；spec4×reuse 生产组合不依赖）| 调试停放边界时开 |
+| `KVMEM_REBAKE` / `KVMEM_COMPACT_MODE` / `KVMEM_BLOCKWISE` | `1` / `prefix` / `1` | 压缩的三个运行时形态：页迁回视图按视图位置重旋 RoPE / 前缀式压缩 / 按引擎块所有权回收 | 三者是 v0.4.0 验证组合，unset 会走不同分支；改动需重跑超池 NEEDLE |
 
 ### 模型
 

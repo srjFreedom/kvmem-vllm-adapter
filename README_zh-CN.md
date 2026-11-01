@@ -6,13 +6,15 @@
 不是"引擎前面挂个网关"，而是入口策略直接跑在 vLLM 的 API 进程里；引擎本身为两张 22 GB
 消费级卡做过调优——MTP 投机解码、FP8 KV 缓存、前缀缓存，以及按并发数 N 定尺寸的 KV 池。
 
-在 2× RTX 2080 Ti 上换来的东西：
+在 2× RTX 2080 Ti 上换来的东西（以下全部为 v0.4.0 生产实例实测）：
 
-- **真并发，不是排队。** 引擎窗口 = `N × (B + R)`；`N=2` 时两路代码生成各自保持
-  **70–73 tok/s**（单路 74.9），**合计 ≈136 tok/s**。
-- **长得下的长上下文。** 44 GB 显存上开出 **172K token** 的窗口，`GPU_UTIL=0.97`
-  （每请求 B=52K 历史 + 32K 生成，FP8 KV）。
-- **快 prefill。** 5K token 时约 1.3K tok/s，跑满 52K 预算仍有约 1K tok/s。
+- **CUDA graph + MTP 投机，满速。** 2,000 token 倒数解码 **84–85 tok/s**（`spec=4`）——
+  落在原版参考带（70–80）之上，是被迫 eager 旧适配器路径（46）的 ~1.8 倍。打分桥已做到
+  图可捕获（静态缓冲、原地算子、与 eager 数值逐位一致）。
+- **超池上下文，默认开启。** 常驻 prefill + 请求内压缩是缺省路径：88K prompt 在 36,864
+  常驻窗口上仍答对档案中段 needle；KV 池 `GPU_UTIL=0.972` 下装 201,438 token。
+- **会话复用。** 带 `X-Session-ID` 的请求结束后把前缀 KV + 循环状态存入主机内存；
+  下一轮从前沿恢复，85K 档案省 ~34 s prefill（needle 两路答案一致）。
 - **一个服务、一个端口（18200）。** OpenAI 兼容 API、`/metrics`、`/docs` 和 Web UI 同源——
   没有旁挂网关，没有第二个要养的进程。
 - **kvmem 仍是策略层。** 发多少历史（B）、哪些页常驻（用真实 pre-RoPE Q 检索、mean-K 打分、
@@ -27,33 +29,21 @@
 
 ## 性能
 
-实测环境：**2× RTX 2080 Ti 22 GB**，TP=2，`N=2`，`B=53,248`，`R=32,768`（窗口 172,032），
-FP8 KV，MTP `K=4`，`GPU_UTIL=0.97`，前缀缓存开启，`temperature=0`。
+实测环境：**2× RTX 2080 Ti 22 GB**（NVLink 桥接，NCCL 自动使用），TP=2，`N=1`，
+`B=36,864 + R=16,384`，MTP `spec=4`，FP8 KV，CUDA graph 开启（未设 `KVMEM_FORCE_EAGER`），
+`VLLM_SM75_SPEC_SYNC_MODE=nosync`，`temperature=0`，与 graph 前构建同实例对照：
 
-**Prefill**（单请求，冷 prompt）：
-
-| prompt token | TTFT | prefill |
+| 负载 | v0.3.x（被迫 eager） | **v0.4.0（编译 + graph）** |
 |---|---|---|
-| 5,035 | 3.9 s | **1,295 tok/s** |
-| 19,838 | 17.5 s | **1,136 tok/s** |
-| 51,723 | 52.5 s | **985 tok/s** |
+| 2,000 token 倒数解码 | 46.0 tok/s | **85.0 tok/s** |
+| 3,000 token 存活跑（两次跨 1,616 块边界） | 2,000 tok 43.5 s | **3,000 tok 35.4 s**（84.7 tok/s） |
+| 85,675 token 档案，首轮冷跑 | ~150 s | **143 s** |
+| 同档案第二轮会话恢复 | 115.7 s | **110.0 s**（比冷重跑省 34 s） |
 
-再大没有意义——入口策略会在请求进入引擎前把历史裁到 B，52K 就是有效上限。
-
-**Decode**（代码生成）：
-
-| 输出 | 并发 | 吞吐 |
-|---|---|---|
-| 343 tok（二分查找 + 单测） | 1 | **74.9 tok/s** |
-| 768 tok（TOML 子集解析器） | 1 | **59.7 tok/s** |
-| 2,048 tok（TOML 子集解析器） | 1 | **58.3 tok/s** |
-| 2 × 512 tok | 2 | **单路 70–73 tok/s**，合计 ≈**136 tok/s** |
-
-两个来源都不是噪声，而是 MTP 投机的特性：密集重复的代码接受率高（74.9），偏散文的实现说明接受率低
-（58–60）；输出越长，前面较快的阶段被摊得越薄。两路并发时每路仍有单路约 **95%** 的速度——
-第二张卡是在真干活，不是在等。
-
-前缀缓存：同一份 57K token 的 prompt 重发，TTFT 从 58.6 s 降到 2.1 s（等效 ≈20.7K tok/s）。
+测试钉死的验收门：短请求无损（乘法表/随机两位数输出跨 spec0/spec4 逐字节一致，
+sha `c2f36446`/`42675199`）、88K 档案中段 needle `ZX-4417-QJ7`、每路径确定性
+（冷×2 逐字节一致；恢复输出跨重启、跨 eager/graph 稳定——恢复 vs 冷跑的字节一致
+为何不是本设计属性，见"已知限制"）。
 
 ## 现在的架构
 
@@ -96,7 +86,7 @@ vLLM 用逻辑位置索引 KV 块，且假定序列长度单调增长：中途�
 | 外部件 | 固定版本 | 获取方式 |
 |---|---|---|
 | vLLM SM75 fork | `93c9013e375b` + 集成补丁 | `install.sh` 把 `base_commit` 拉到 `engines/vllm`，再用 `backends/patches/vllm-kvmem.patch` 整体替换（校验 `patched_tree`）；默认不改动任何已有 fork，除非显式 `USE_LOCAL_FORK=1` |
-| kvmem 源码 | tag `v0.18.0` | 同上（编译原生扩展要头文件与库）|
+| kvmem 源码 | tag `v0.19.0-rc1` | 同上（编译原生扩展要头文件与库）|
 | 模型权重 | **vLLM 能跑的任何模型**（本部署用的是 FP8 + MTP 导出）| 自己放，改 `MODEL` |
 
 ```bash
@@ -136,13 +126,15 @@ VLLM_ROOT=/path/to/fork KVMA_SRC=/path/to/kvmem PY=/path/to/venv/bin/python ./in
 两层，仓库默认值就是可用的起点——**不需要站点脚本**：
 
 ```
-start-kvmem-vllm.sh 0.3.0 配置（kvmem 预算为主、vLLM 窗口为辅）；systemd 跑它
+start-kvmem-vllm.sh 0.4.0 生产默认配置（kvmem 预算为主、vLLM 窗口为辅）；systemd 跑它
 run-current.sh      通用启动入口，不含任何站点参数
    │ exec
 run-kvmem-vllm.sh   实现（每个参数都是 ${VAR:-default}）
 ```
 
-默认：`B=36864 R=16384 N=1 GPU_UTIL=0.97`，profile 用仓库自带的
+默认：`B=36864 R=16384 N=1 GPU_UTIL=0.972`（并带 `KVMEM_SESSION_REUSE=1`、
+`KVMEM_MAX_MODEL_LEN=200000`、`VLLM_SM75_SPEC_SYNC_MODE=nosync`、MTP `spec=4`——
+v0.4.0 端到端验证过的组合），profile 用仓库自带的
 `2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env`。唯一必须提供的是 `MODEL`（权重目录）；只有模型没有内置 chat template 时才需要给 `CHAT_TEMPLATE_FILE`；其余参数用环境变量覆盖，或写进 `~/.config/kvmem-vllm.env`
 （单元存在则加载）：
 
@@ -152,7 +144,8 @@ CONCURRENCY=2 BUDGET=53248 GPU_UTIL=0.98 ./start-kvmem-vllm.sh
 
 完整参数说明见 **[docs/PARAMETERS.md](docs/PARAMETERS.md)**。
 
-关键约束：**引擎窗口 = `N × (B + R)` 必须装进 KV 池**（本机 210,651 token）。
+关键约束：**引擎窗口 = `N × (B + R)` 必须装进 KV 池**（本机 `GPU_UTIL=0.972` 下 201,438 token；
+CUDA-graph 缓冲比 eager 多吃约 2.5K token，0.97 会把池压到 `MAX_MODEL_LEN=200000` 以下——实测 OOM）。
 默认 `N=1, B+R=53,248` 余量很大；`N=2` → 106,496，`N=3` → 159,744，`N=4` → 212,992 需要把 B 降到约 26K。
 
 `THINKING_BUDGET` 默认为空 = **思考 token 无上限**；填数字才会限制推理长度。
@@ -177,11 +170,12 @@ curl -s localhost:18200/metrics      # vllm:* 指标（prefill/decode/KV 使用�
 | 项目 | 结果 |
 |---|---|
 | 逻辑上下文 | 486,605 token 历史 → `prompt_tokens=89,066`，两个埋针全中（106 s，B=65536 时测得）|
-| R 契约 | `max_tokens=100000` → `applied=32768`（只写 `max_completion_tokens`）|
+| 生成上限 | compaction 默认开 → 上限是 `CTX`（经典路径才回落 R 并裁剪入口）|
 | CTX | 747,614 token → `400 history is ~747614 tokens, above kvmem CTX=524288` |
 | 流式 | 30 个 SSE 事件，首 0.07 s、末 1.43 s，时刻单调 |
 | 端口 | 只有 `0.0.0.0:18200`，无旁挂进程 |
-| 前缀复用 | 同前缀第二轮 `cached=63,024/65,890` |
+| 会话复用 | park `retired frontier=32320` → resume `hit=32320` → prefill 从 32320+4096 起，省 34 s，needle 两路一致 |
+| 图捕获 | 编译实例启动无 capture 违规（离线守卫 `tests/bridge_capture_test.py`，数值逐位对拍） |
 
 这些行钉的是策略契约（多少历史进入引擎、R 上限、CTX 拒绝、SSE 行为）；吞吐数字见[性能](#性能)。
 
@@ -189,7 +183,9 @@ curl -s localhost:18200/metrics      # vllm:* 指标（prefill/decode/KV 使用�
 
 ```bash
 PY=$PWD/engines/vllm/.venv/bin/python
-for t in tests/*_test.py; do PYTHONPATH="build/python:src:plugin" $PY "$t"; done   # 39 个，全 PASS
+for t in tests/*_test.py; do PYTHONPATH="build/python:src:plugin" $PY "$t"; done   # 59 个文件
+# 核心契约 9 项必须全绿：quiescent_compact position_books store_semantics commit_guard
+# sched_gate sparse_runtime sparse_concurrency session_clip bridge_capture
 python3 scripts/check_integration_surface.py        # 28/28 个 vLLM/kvmem 接触点
 ./run-gpu-tests.sh                                  # GPU 模式（需先停服务）
 ```
@@ -201,7 +197,7 @@ backends/vllm/worker.py     vLLM 后端的启动包装（窗口 N×(B+R)、参�
 plugin/                     general 插件 + endpoint 插件（入口策略、UI 挂载）
 src/                        入口策略、文本选片、H/D 缓存、稀疏运行时、原生扩展源码
 scripts/                    worker、wait_ready、prepare-backends、setup-venv、探针
-tests/                      39 个测试（非 GPU 全通过）
+tests/                      59 个测试（核心契约 9 项全非 GPU）
 deploy/                     systemd 单元、通用入口、启动脚本
 backends/versions.json      引擎固定版本 + 补丁 sha256 + patched_tree
 backends/patches/           vLLM 侧全部改动（17 文件 / 612 行）
@@ -211,12 +207,19 @@ INTEGRATION-SURFACE.md      vLLM 接触点清单与源码改动登记
 
 ## 已知限制
 
-- **入口文本选片是代偿路径**（vLLM 不能中途截断 KV），不是 kvmem 的策略本身；历史与问题挤在
-  同一条消息时仍用"末尾段落"启发式，问题很长且主题在前段时可能丢块
-- **in-request compaction 是默认路径**，但比朴素路径更精细：会强制关闭前缀缓存；工作集必须留在池内
-  （超池 prompt 依赖 prefill 期压缩）；新生成块没有检索分数（运行时强制保留 recent 尾部）；
-  带投机 draft 的步不做压缩。目前只验证了单条长文本请求，并发未验证
-- `SESSIONS` 是 H 层同时占用的份额数，须不小于并发数 `N`。默认请求结束就释放；显式开启尚未验收的会话停放时，空闲 checkpoint 继续占用一份，新的冷请求会先淘汰旧 checkpoint
+- **入口文本选片只是经典路径的代偿**；默认的常驻入口把完整 prompt 送进引擎，选页由引擎内
+  mean-K 打分器决定
+- **in-request compaction 是默认路径**，比朴素路径更精细：强制关闭前缀缓存、强制同步调度
+  （压缩在请求中途改写块表；async 禁令是正确性决策，只有当吞吐再次掉出参考带才值得重评）；
+  新生成块没有检索分数（recent 尾部强制保留）；带投机 draft 的步不做压缩
+- **恢复 vs 冷跑的字节一致不是本设计的契约。** 每条路径各自确定（冷×2 逐字节一致；恢复输出
+  跨重启、跨 eager/graph 稳定），needle 两路答案一致；但恢复轮重放的是停放时的选页，冷轮按
+  当前查询重新选页——检索语义决定了两个物理页集合本就不同（实测同页数下 chosen 头部不同）。
+  存的前缀 KV 是 FP8 原字节回放，冷跑会重新量化；贪心采样可能在 gap 处翻转
+- **会话 checkpoint 一次性消费**（恢复后的轮不会原位再停放；第三轮重新 prefill）；
+  store 按 `SESSIONS` 条 LRU 淘汰，第三条停放会挤掉最早的
+- **首轮 needle miss** 仍可能发生：压缩打分器没选中 needle 页时（与投机无关，属打分质量，待办）
+- 单条长文本请求端到端验证过；**并发 × 压缩 × 复用未验证**
 - 未实现参考后端的三级磁盘/会话冷存（`nvme-gb`、`session-cache-dir`）与 NVMe 页级存储
 - UI 的"停止生成"等用法依赖 llama.cpp/ninfer 的服务端扩展接口（`/v1/chat/completions/control`、
   `/v1/stream`、`/slots`），vLLM 没有，会 404

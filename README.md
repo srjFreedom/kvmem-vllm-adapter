@@ -8,13 +8,18 @@ runs in the vLLM API process, and the engine itself is tuned for two consumer 22
 MTP speculative decoding, FP8 KV cache, prefix caching and a KV pool sized for N concurrent
 long-context requests.
 
-What that buys you on 2× RTX 2080 Ti:
+What that buys you on 2× RTX 2080 Ti (all numbers measured on the v0.4.0 production instance):
 
-- **Real concurrency, not a queue.** Engine window = `N × (B + R)`; at `N=2` two code-generation
-  streams keep **70–73 tok/s each** (single stream: 74.9) for **≈136 tok/s aggregate**.
-- **Long context that fits.** A **172K-token** window on 44 GB of VRAM at `GPU_UTIL=0.97`
-  (B = 52K history + 32K generation per request, FP8 KV).
-- **Fast prefill.** ~1.3K tok/s at 5K tokens, still ~1K tok/s at the full 52K budget.
+- **CUDA graphs + MTP speculation, at full speed.** Decode **84–85 tok/s** on a 2,000-token
+  countdown with `spec=4` — inside the upstream reference band (70–80) and ~1.8× the old
+  eager-only adapter path (46). The KVMem scoring bridge is graph-capturable (static buffers,
+  in-place ops, bit-exact with the eager numerics).
+- **Beyond-pool context, by default.** Resident prefill + in-request compaction are ON out of the
+  box: an 88K prompt on a 36,864-token resident window answers a mid-archive needle correctly;
+  the pool itself holds 201,438 tokens at `GPU_UTIL=0.972`.
+- **Session reuse.** With `X-Session-ID`, a finished conversation parks its prefix KV + recurrent
+  state into host RAM; the next turn resumes from the frontier and skips ~34 s of prefill on the
+  85K archive (needle answered identically through either path).
 - **One service, one port (18200).** OpenAI-compatible API, `/metrics`, `/docs` and the web UI on
   the same origin — no sidecar gateway, no second process to keep alive.
 - **kvmem stays the policy layer.** It decides how much history is sent (B), which pages stay
@@ -30,36 +35,22 @@ client ──▶ :18200 ┬─ /v1/*        OpenAI-compatible API
 
 ## Performance
 
-Measured on **2× RTX 2080 Ti 22 GB**, TP=2, `N=2`, `B=53,248`, `R=32,768` (window 172,032),
-FP8 KV, MTP `K=4`, `GPU_UTIL=0.97`, prefix caching on; `temperature=0`.
+Measured on **2× RTX 2080 Ti 22 GB** (NVLink bridge, NCCL uses it automatically), TP=2, `N=1`,
+`B=36,864 + R=16,384`, MTP `spec=4`, FP8 KV, CUDA graphs on (`KVMEM_FORCE_EAGER` unset),
+`VLLM_SM75_SPEC_SYNC_MODE=nosync`, `temperature=0`, same-instance A/B against the pre-graph build:
 
-**Prefill** (single request, cold prompt):
-
-| prompt tokens | TTFT | prefill |
+| workload | v0.3.x (forced eager) | **v0.4.0 (compiled + graphs)** |
 |---|---|---|
-| 5,035 | 3.9 s | **1,295 tok/s** |
-| 19,838 | 17.5 s | **1,136 tok/s** |
-| 51,723 | 52.5 s | **985 tok/s** |
+| 2,000-token countdown decode | 46.0 tok/s | **85.0 tok/s** |
+| 3,000-token survival run (two 1,616-block boundary crossings) | 43.5 s/2,000 | **35.4 s/3,000** (84.7 tok/s) |
+| 85,675-token archive, cold first turn | ~150 s | **143 s** |
+| same archive, second turn via session resume | 115.7 s | **110.0 s** (−34 s vs cold re-run) |
 
-Larger prompts are pointless by design: the entry policy trims history to B before the engine sees
-it, so 52K is the ceiling that matters.
-
-**Decode** (code generation):
-
-| output | streams | throughput |
-|---|---|---|
-| 343 tok (binary search + tests) | 1 | **74.9 tok/s** |
-| 768 tok (TOML-subset parser) | 1 | **59.7 tok/s** |
-| 2,048 tok (TOML-subset parser) | 1 | **58.3 tok/s** |
-| 2 × 512 tok | 2 | **70–73 tok/s each**, ≈**136 tok/s** aggregate |
-
-Two things explain the spread, and both are properties of MTP speculative decoding, not noise:
-acceptance is higher on dense repetitive code (74.9) than on prose-heavy answers (58–60), and very
-long outputs amortise the faster opening phase. With two concurrent streams each request keeps
-~95 % of its single-stream speed — the second card is doing real work rather than waiting.
-
-Prefix cache: re-sending the same 57K-token prompt costs 2.1 s TTFT instead of 58.6 s
-(≈20.7K tok/s effective).
+Acceptance gates pinned by the test suite: short-request losslessness (multiplication-table and
+"random two-digit" outputs byte-identical across spec0/spec4, shas `c2f36446`/`42675199`),
+88K mid-archive needle `ZX-4417-QJ7`, and per-path determinism (two cold runs byte-equal;
+resume output byte-stable across boots and eager/graph switches — see Known limitations for why
+resume-vs-cold byte equality is not a property of this design).
 
 ## Architecture
 
@@ -136,7 +127,7 @@ Three external pieces are required and are not vendored (`backends/versions.json
 | Piece | Pinned version | How it is obtained |
 |---|---|---|
 | vLLM SM75 fork | `93c9013e375b` + integration patch | `install.sh` fetches `base_commit` into `engines/vllm` and replaces it with `backends/patches/vllm-kvmem.patch` (verifies `patched_tree`); existing forks are never modified unless you pass `USE_LOCAL_FORK=1` |
-| kvmem sources | tag `v0.18.0` | same (the native extension needs its headers and library) |
+| kvmem sources | tag `v0.19.0-rc1` | same (the native extension needs its headers and library) |
 | Model weights | **any model vLLM can serve** (this deployment runs an FP8 + MTP export) | you provide them; point `MODEL` at the directory |
 
 ```bash
@@ -190,7 +181,9 @@ run-current.sh      generic entry, no site parameters
 run-kvmem-vllm.sh   implementation (every knob is ${VAR:-default})
 ```
 
-Defaults: `B=36864 R=16384 N=1 GPU_UTIL=0.97` with the shipped
+Defaults: `B=36864 R=16384 N=1 GPU_UTIL=0.972` (with `KVMEM_SESSION_REUSE=1`,
+`KVMEM_MAX_MODEL_LEN=200000`, `VLLM_SM75_SPEC_SYNC_MODE=nosync` and MTP `spec=4` - the
+combination validated end-to-end in v0.4.0) with the shipped
 `2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env` profile. The only required input is
 `MODEL` (your weights directory); set `CHAT_TEMPLATE_FILE` only when the model ships no built-in
 chat template. Override anything else with environment variables, or put
@@ -211,17 +204,20 @@ CHAT_TEMPLATE_FILE=                      # only if the model has no built-in tem
 KVMEM_UI_DIR=                            # optional static UI mounted at /
 ```
 
-Generation ceiling: **R by default** (`max_tokens` is clamped to R). Pass
-`--kvmem-inrequest-compaction` to the worker to enable super-R generation, which raises the ceiling to
-`CTX`, compacts the live context when the resident pool fills and forces synchronous scheduling — one flag
-for the whole feature, no environment variable to set:
+Generation ceiling: **`CTX` by default** - `run-kvmem-vllm.sh` ships with
+`INREQUEST_COMPACTION=1` + `KVMEM_ENTRY_RESIDENT_PREFILL=1` (the validated beyond-pool path: the
+entry does not trim, prompts longer than B are chunk-prefilled and compacted inside the request,
+prefix caching is force-disabled, scheduling stays synchronous because compaction rewrites the
+block table mid-request). `max_tokens` is clamped to `CTX`, not R. Set
+`INREQUEST_COMPACTION=0` only to debug the classic entry-trim path (ceiling then reverts to R).
 
-```bash
-./backends/vllm/worker.py --model "$MODEL" --port 18200 ... --kvmem-inrequest-compaction
-```
+Session reuse rides the same switch (`KVMEM_SESSION_REUSE=1` default): pass
+`X-Session-ID: <id>` on chat requests and a finished conversation parks its prefix at the
+checkpoint frontier; the next turn with the same id resumes from it.
 
-The constraint that bites: **engine window = `N × (B + R)` must fit the KV pool** (210,651 tokens on
-this box). Defaults (`N=1, B+R=53,248`) leave a large margin; `N=2` → 106,496, `N=3` → 159,744,
+The constraint that bites: **engine window = `N × (B + R)` must fit the KV pool** (201,438 tokens on
+this box at `GPU_UTIL=0.972`; CUDA-graph buffers cost ~2.5K tokens versus eager, and 0.97 drops the
+pool below `MAX_MODEL_LEN=200000` - measured OOM). Defaults (`N=1, B+R=53,248`) leave a large margin; `N=2` → 106,496, `N=3` → 159,744,
 `N=4` → 212,992 which needs a smaller B (≈26K) or R.
 
 `THINKING_BUDGET` is empty by default, i.e. **no cap on reasoning tokens**; set a number only if you
@@ -248,11 +244,12 @@ block/character counts of `prompt_selected`).
 | Item | Result |
 |---|---|
 | Logical context | 486,605-token history → `prompt_tokens=89,066`, both needles found (106 s; measured with B=65536) |
-| R contract | `max_tokens=100000` → `applied=32768` (only `max_completion_tokens` written) |
+| Generation ceiling | compaction default-on → ceiling is `CTX` (the classic path falls back to R with entry trimming) |
 | CTX | 747,614 tokens → `400 history is ~747614 tokens, above kvmem CTX=524288` |
 | Streaming | 30 SSE events, first at 0.07 s, last at 1.43 s, monotonic |
 | Ports | only `0.0.0.0:18200`; no sidecar process |
-| Prefix reuse | second identical prefix: `cached=63,024/65,890` |
+| Session reuse | park `retired frontier=32320` → resume `hit=32320` → prefill resumes at 32320+4096, −34 s wall clock, needle identical through both paths |
+| Graph capture | compiled boot with CUDA graphs: no capture-invalidating ops in the bridge (offline guard `tests/bridge_capture_test.py`, bit-exact numerics) |
 
 These rows pin the policy contract (how much history reaches the engine, the R clamp, the CTX
 rejection, SSE behaviour); throughput lives in [Performance](#performance).
@@ -261,7 +258,9 @@ rejection, SSE behaviour); throughput lives in [Performance](#performance).
 
 ```bash
 PY=$PWD/engines/vllm/.venv/bin/python
-for t in tests/*_test.py; do PYTHONPATH="build/python:src:plugin" $PY "$t"; done   # 39, all PASS
+for t in tests/*_test.py; do PYTHONPATH="build/python:src:plugin" $PY "$t"; done   # 59 files
+# the core contract suite (9) must stay green: quiescent_compact position_books store_semantics
+# commit_guard sched_gate sparse_runtime sparse_concurrency session_clip bridge_capture
 python3 scripts/check_integration_surface.py        # 28/28 vLLM/kvmem touch points
 ./run-gpu-tests.sh                                  # GPU mode (stop the service first)
 ```
@@ -283,17 +282,26 @@ INTEGRATION-SURFACE.md      touch-point list and source-change registry
 
 ## Known limitations
 
-- **Entry-side text selection is a stopgap** (vLLM cannot truncate KV mid-request), not kvmem's own
-  policy; when history and question share one message the trailing-paragraph heuristic is used, so a
-  very long question whose topic sits in an earlier paragraph may lose blocks
+- **Entry-side text selection is a stopgap for the classic path only**; with the default resident
+  entry the whole prompt reaches the engine and page choice is made by the in-engine mean-K scorer
 - **In-request compaction is the default path** and is more delicate than the plain one: it forces
-  prefix caching off, the working set must stay inside the pool (a beyond-pool prompt relies on
-  prefill-time compaction), retrieval has no score for freshly generated blocks (the runtime keeps
-  the recent tail mandatory), and a step that carries speculative drafts is not compacted. A single
-  long text request is validated; concurrency is not
-- `SESSIONS` splits H into shares and must cover `N` active requests. Normally a finished request
-  releases its share; opt-in, unqualified session checkpoints retain one share until evicted, and a
-  new cold request evicts an idle checkpoint before acquiring another. Reuse remains off by default
+  prefix caching off and synchronous scheduling (compaction rewrites the block table mid-request;
+  the async-scheduler ban is a correctness decision, re-evaluate only if throughput ever drops
+  below the reference band again), retrieval has no score for freshly generated blocks (the recent
+  tail is force-kept), and a step carrying speculative drafts is never compacted mid-request
+- **Resume-vs-cold byte equality is not a contract of this design.** Each path is deterministic
+  (cold×2 byte-equal; resume output stable across reboots and eager/graph switches) and both answer
+  the needle, but the restored turn replays the parked page selection while a cold turn re-scores
+  pages for its own query - different physical context sets, by retrieval design (measured:
+  chosen-page heads differ at identical total page counts). The stored prefix KV is FP8
+  round-tripped verbatim; a cold prefill re-quantises it. Greedy sampling can flip wherever those
+  logits gaps cross a decision boundary
+- **Session checkpoints are one-shot** (a resumed turn does not re-park the same frontier; a third
+  turn re-prefills), and the store keeps `SESSIONS` records with LRU eviction - a third parked
+  session evicts the oldest
+- **First-turn needle misses** remain possible when the compaction scorer does not select the
+  needle page (independent of speculation; scorer quality work, backlog)
+- A single long text request is validated end-to-end; **concurrency with compaction + reuse is not**
 - No tiered disk / session cold store (`nvme-gb`, `session-cache-dir`) and no NVMe page tier
 - UI features that rely on llama.cpp/ninfer server extensions (`/v1/chat/completions/control`,
   `/v1/stream`, `/slots`) return 404 here

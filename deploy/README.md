@@ -3,14 +3,14 @@
 两层，仓库自带的默认值就是可用的起点——**不需要站点脚本**，clone 下来直接跑：
 
 ```
-start-kvmem-vllm.sh    ← 0.3.0 站点配置（kvmem 为主、vLLM 为辅）
+start-kvmem-vllm.sh    ← 0.4.0 生产默认配置（kvmem 为主、vLLM 为辅）
 run-current.sh         ← 通用启动入口，不含任何站点参数
         │ exec
         ▼
 run-kvmem-vllm.sh      ← 实现：拼参数、调 worker.py（默认值都在这里的 ${VAR:-default}）
 ```
 
-默认值：`B=36864 R=16384 N=1 GPU_UTIL=0.97`，profile 用仓库自带的
+默认值：`B=36864 R=16384 N=1 GPU_UTIL=0.972`（+ v0.4.0 生产默认组合，见 `docs/DELIVERY.md` 第一节），profile 用仓库自带的
 `2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env`。唯一必须由你提供的是 `MODEL`（权重目录）；模型没有内置 chat template 时再加 `CHAT_TEMPLATE_FILE`：
 
 ```bash
@@ -37,15 +37,6 @@ sudo systemctl daemon-reload && sudo systemctl enable --now kvmem-vllm
 要在一台机器上并存多套配置（fp8 / text-only / 不同并发档），各自写一个 env 文件，用
 `ExecStart=<repo>/start-kvmem-vllm.sh` + `EnvironmentFile=` 指过去即可——
 这属于使用者的习惯，不是仓库的要求。
-
-## 与本机其它几套的对照
-
-| 单元 | Type | 启动脚本 | 日志 |
-|---|---|---|---|
-| `kvmem.service`（llama.cpp）| `simple` | `start-kvmem-coder390-q6.sh`：`export VAR=${VAR:-默认}` + `exec "$BIN"`（前台）| `StandardOutput=append:~/kvmem.log` |
-| `kvmem-ninfer.service` | `simple` | `start-kvmem-ninfer-22g.sh`，同套路 | `append:~/kvmem-ninfer.log` |
-| `vllm.service`（旧）| `oneshot` | `start-vllm.sh`：先清理残留进程，再调 `run-current.sh` | — |
-| **`kvmem-vllm.service.in`（本仓库）** | **`forking` + `PIDFile`** | `start-kvmem-vllm.sh`（0.3.0 配置） | 仓库内 `run-logs/kvmem-vllm.log` |
 
 三处刻意的差异：
 
