@@ -281,3 +281,47 @@ with their evidence recorded in this amendment. Known, out-of-scope boundary: a 
 needle can still MISS on a first turn when the compaction scorer does not select its page
 (this round's turn1 missed QX-9931-LM2; the second mention in the query retrieves it). That is
 scorer quality on the compaction path, independent of speculation, unchanged from before.
+
+## Amendment 5 (2026-11-02): CUDA-graph compatibility - the compiled path is production
+
+The forced-eager workaround (46 tok/s vs Definitive's 70-80 band) is lifted. Root cause of
+`cudaErrorStreamCaptureInvalidated` (boots 19:28/23:15/23:26/23:33): the scoring bridge allocated
+NEW tensors inside capture - `.to(torch.float32)`, expression temporaries in `x1*cos + x2*sin`,
+`index_select` return values, lazy `torch.zeros`, and (fixed at the same time) a host `.tolist()`
+probe window. Engine chain dfd952d..c4ac09a: eager-first named `_scratch` buffers (allocated on
+first warmup step, pointer-stable for every replay), `out=`/in-place everywhere with EXACT-shape
+slices (a full-size `out=` triggers a silent RESIZE - deprecated, and an allocation if captured),
+rotation math kept BIT-EXACT to the original unfused expression (an `addcmul_` FMA shortcut
+changes fp32 rounding, hence mean-K scores, hence compaction page selection - guarded offline by
+adapter `tests/bridge_capture_test.py`, 13 checks), and the q buffer MUST be float32 (a src.dtype
+buffer added a second FP8 truncation between rotation writeback and publish, engine ddf3cf0).
+
+Pool geometry changed with graphs: the captured buffers eat ~2.5K tokens of KV pool. At
+GPU_UTIL=0.97 the pool measured 198,561 tokens < MAX_MODEL_LEN 200,000 (concurrency 0.99x) and
+one 85K turn2 OOM-killed both workers (logits all_gather, 486 MiB short). The util->pool curve on
+this machine: 0.93->152K, 0.95->175K, 0.97->198.6K, 0.972->201.4K (1.01x). Production pins
+GPU_UTIL=0.972, VLLM_SM75_SPEC_SYNC_MODE=nosync, VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=1
+(the launcher's `--mode fast` defaults `safe`, which the fork's own comments say is debug-only
+for spec graphs; an explicit value in /etc/default beats the derived default).
+
+Acceptance on the compiled instance: countdown 85.0 tok/s (target >=65), short A/B byte-equal to
+the eager baselines (c2f36446/42675199), 88K NEEDLE ZX-4417-QJ7 correct, 2500-token countdown
+survival across the 1616 boundary (b3789d7 policy), offline suite 9/9, and the park/resume chain
+end to end: `session_checkpoint_retired frontier=32320` -> `resume_decided hit=32320` ->
+`session_resumed` x2 ranks -> prefill resumes at 32320+4096 and turn2 answers `QX-9931-LM2`,
+saving ~35s versus the same-prompt cold run.
+
+One metric correction, recorded honestly: the round-15 claim "resume is BYTE-IDENTICAL to cold"
+does not survive retesting on later builds - and it cannot be a contract of this design. The
+resume path replays turn1's STORED FP8 page bytes (re-rotated by `_baked_delta` into the new
+ranks), while the cold path requantises the prompt through a fresh forward and re-selects pages
+by the CURRENT query; those are different computational graphs, and fp32/fp8 arithmetic is not
+associative, so a greedy sample can flip wherever their logits gap crosses a decision boundary
+(measured: divergence at char 0 of a long turn2 on the 01:xx build, char 428 of another - while
+BOTH paths are individually byte-stable across reboots, eager-vs-compiled, and bridge rewrites:
+RESUME sha 6f56aadf and COLD sha 2d01050d reproduce exactly). What round-15 actually proved is
+per-path determinism plus cold-run determinism (both still true and still checked); the 115.7 vs
+149.8s numbers in that record are evidence the resume DID hit, independent of the sha claim.
+The losslessness gate for this project is therefore: (1) each path deterministic, (2) cold x2
+byte-equal, (3) the needle content answered identically through either path - all three hold on
+the compiled production instance.
