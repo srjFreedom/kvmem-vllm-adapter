@@ -95,7 +95,8 @@ def main(argv=None) -> int:
         # from it instead of prefilling the whole conversation again. Opt-in: each parked session
         # keeps its share of the host budget until it is evicted.
         if _env_flag("KVMEM_SESSION_REUSE"):
-            if int(getattr(ns, "speculative_tokens", -1)) != 0:
+            if int(getattr(ns, "speculative_tokens", -1)) != 0 and os.environ.get(
+                    "KVMEM_REUSE_MTP_EXPERIMENT", "0") != "1":
                 raise SystemExit(
                     "KVMEM_SESSION_REUSE + SPECULATIVE_TOKENS!=0 is not yet combinable: "
                     "the prefill-boundary StateImage capture works under MTP (measured "

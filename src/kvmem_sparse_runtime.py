@@ -708,7 +708,9 @@ class VllmSparseRuntime:
         """Capture a completed, pre-pressure prompt prefix before the next forward."""
         if (not self.session_reuse or req in self._session_checkpoints
                 or self.capture_state is None or not self.kv_block_size
-                or int(self.session_checkpoint_speculative_tokens) > 0
+                or (int(self.session_checkpoint_speculative_tokens) > 0
+                    and not __import__("os").environ.get(
+                        "KVMEM_REUSE_MTP_EXPERIMENT", "0") == "1")
                 or self.session_checkpoint_executed_frontier is None):
             # KVMem (round-10 evidence): with spec>0 the prefill-boundary capture ITSELF
             # succeeds (measured: `session_checkpoint_captured` at the frontier, NEEDLE
