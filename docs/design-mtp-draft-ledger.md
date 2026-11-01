@@ -251,3 +251,33 @@ for a request whose final step carried drafts). Until then: production combo rem
 spec=0 x reuse=1 (milestone stage3-session-reuse), and MTP runs without reuse
 (validated this milestone: short requests byte-equal + ~2.9x, 88K beyond-pool NEEDLE
 correct, offline suite green).
+
+## Amendment 4 (2026-11-01, round 15): the composition is VALIDATED - mutual exclusion lifted
+
+Root cause of the round-10 park abort (proven): the scheduler's checkpoint chunk-clip carried
+`self.num_spec_tokens == 0`; under MTP the prefill chunk ladder never stopped at the frontier,
+so no capture, so the terminal park answered False on every rank. Engine 1a0508a makes the clip
+unconditional (safe: the boundary gate keeps every prefill step draft-free by construction).
+
+Decisive GPU evidence (spec=4, reuse=1, host rebooted; 85,575-token archive with a needle at
+token ~27,300 - INSIDE the restored prefix (frontier 32,320), a question that can only be
+answered from the parked KV/StateImage):
+- turn1 publishes through the TP barrier (`session_checkpoint_retired frontier=32320 blocks=20`).
+- turn2 with the same `X-Session-ID`: `resume_decided hit=32320`, answers `QX-9931-LM2`, and is
+  BYTE-IDENTICAL to the same-prompt cold prefill run on the same instance (sha 32680fa82c6ca91f
+  both ways; resume 115.7s vs cold 149.8s).
+- Determinism control: two cold runs of the same prompt are byte-equal, so the equality above is
+  a real coordinate proof, not noise. (The round-14 "mismatch" was an experiment flaw: turn1 is
+  non-deterministic across reboots, so the assistant text embedded into turn2 differed - the
+  prompts were never the same.)
+- Cross-check spec0 x reuse1 with the same flow: resume == cold byte-equal (sha a86398a28cb8a5f4,
+  106.9s vs 140.3s) - the stage3 invariant is unbroken by the lifted code.
+- Short-request losslessness holds with reuse ON (A c2f36446, B 42675199).
+Offline suite 8/8 (quiescent_compact, position_books, store_semantics, commit_guard, sched_gate,
+sparse_runtime, sparse_concurrency, session_clip).
+
+Both refusals (worker SystemExit, seal gate spec>0 term) are now REMOVED as production code -
+with their evidence recorded in this amendment. Known, out-of-scope boundary: a mid-archive
+needle can still MISS on a first turn when the compaction scorer does not select its page
+(this round's turn1 missed QX-9931-LM2; the second mention in the query retrieves it). That is
+scorer quality on the compaction path, independent of speculation, unchanged from before.

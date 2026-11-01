@@ -95,18 +95,15 @@ def main(argv=None) -> int:
         # from it instead of prefilling the whole conversation again. Opt-in: each parked session
         # keeps its share of the host budget until it is evicted.
         if _env_flag("KVMEM_SESSION_REUSE"):
-            if int(getattr(ns, "speculative_tokens", -1)) != 0 and os.environ.get(
-                    "KVMEM_REUSE_MTP_EXPERIMENT", "0") != "1":
-                raise SystemExit(
-                    "KVMEM_SESSION_REUSE + SPECULATIVE_TOKENS!=0 is not yet combinable: "
-                    "the prefill-boundary StateImage capture works under MTP (measured "
-                    "2026-11-01: checkpoint captured at the frontier, NEEDLE correct, "
-                    "turn2 right), but the terminal PARK fails the TP barrier "
-                    "(prepare_session_checkpoint returns non-dict records on a rank -> "
-                    "'TP workers did not all prepare a checkpoint' -> nothing parks and "
-                    "every next turn silently re-prefills). Run reuse at --speculative-"
-                    "tokens 0 (milestone stage3-session-reuse) or MTP without reuse "
-                    "(stage4 candidate) until the park protocol lands.")
+            # KVMem (validated 2026-11-01, round 15): speculation and session reuse COMPOSE.
+            # The prefill-boundary gate makes every checkpoint-eligible step draft-free, the
+            # chunk clip aligns the executed frontier exactly (engine 1a0508a), and the
+            # terminal park publishes through the TP barrier (retired frontier=32320). The
+            # decisive proof: a needle INSIDE the restored prefix (token 27300 < 32320) is
+            # answered with a byte-identical continuation under resume and cold prefill on
+            # the same instance (sha 32680fa82c6ca91f both ways; cold is deterministic -
+            # two cold runs byte-equal). GDN draft isolation (spec_state_indices scratch
+            # slots) keeps the parked StateImage at the accepted prefix.
             cfg['session_reuse'] = True
             cfg['session_reuse'] = True
         if _env_flag("KVMEM_DRAFT_LEDGER"):
