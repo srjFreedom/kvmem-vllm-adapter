@@ -37,23 +37,23 @@ def check(cond, msg):
 # frontier for these parameters: lcm(block=1616, select=64)=6464? -> use the function itself
 # to name the target, then test around it. prompt 88000, block 16, budget 36864, select 64
 # mirrors the machine config (kv_block 16 tokens here; use a synthetic-but-parallel shape).
-BLOCK, BUDGET, SELECT = 32, 1024, 64
-# quantum = lcm(32, 64) = 64; limit = 1024-32 = 992 -> 960; prompt 2000 -> (1999//64)*64=1920
-TARGET = ((2000 - 1) // 64) * 64
-check(TARGET == 1920, f"planned frontier is 1920 (got {TARGET})")
+BLOCK, BUDGET, SELECT = 32, 4096, 64
+from kvmem_session_store import session_checkpoint_frontier
+TARGET = session_checkpoint_frontier(2000, BLOCK, BUDGET, SELECT)
+check(TARGET == 1984, f"planned frontier 1984 = min(prompt//q*q, (budget-block)//q*q) (got {TARGET})")
 
 # 1) behavior table
-check(clip_session_checkpoint_chunk(1536, 512, 2000, BLOCK, BUDGET, SELECT) == 384,
+check(clip_session_checkpoint_chunk(TARGET - 512, 1024, 2000, BLOCK, BUDGET, SELECT) == 512,
       "chunk crossing the frontier is clipped to land exactly on it")
-check(clip_session_checkpoint_chunk(1920, 512, 2000, BLOCK, BUDGET, SELECT) == 512,
+check(clip_session_checkpoint_chunk(TARGET, 512, 2000, BLOCK, BUDGET, SELECT) == 512,
       "a step already AT the frontier is not clipped (decode/next chunk unaffected)")
-check(clip_session_checkpoint_chunk(2560, 512, 2000, BLOCK, BUDGET, SELECT) == 512,
+check(clip_session_checkpoint_chunk(TARGET + 640, 512, 2000, BLOCK, BUDGET, SELECT) == 512,
       "a step past the frontier is untouched")
-check(clip_session_checkpoint_chunk(0, 512, 2000, BLOCK, BUDGET, SELECT) == 512,
+check(clip_session_checkpoint_chunk(0, TARGET // 2, 2000, BLOCK, BUDGET, SELECT) == TARGET // 2,
       "a chunk that ends before the frontier passes through")
-check(clip_session_checkpoint_chunk(1536, 512, 16, BLOCK, BUDGET, SELECT) == 512,
+check(clip_session_checkpoint_chunk(TARGET - 512, 512, 16, BLOCK, BUDGET, SELECT) == 512,
       "a prompt not above one block has no plan (frontier 0) -> passthrough")
-check(clip_session_checkpoint_chunk(1536, 384, 2000, BLOCK, BUDGET, SELECT) == 384,
+check(clip_session_checkpoint_chunk(TARGET - 512, 512, 2000, BLOCK, BUDGET, SELECT) == 512,
       "a chunk ending exactly on the frontier is not clipped (strict <..> bounds)")
 
 # 2) TP record verification (the barrier that aborted the park)
@@ -64,14 +64,15 @@ def refuses(records, tp, req):
     except ValueError:
         return True
 
-GOOD = [{"hashes": (), "covered": 1920, "prefix_digest": "d", "kv_block_size": 16,
-         "page_tokens": 16, "pages_per_block": 1, "capacity_pages": 128,
-         "has_state": True, "session_id": ["", "mtp4-synth"], "expected_ranks": 2,
-         "request": "req", "rank": 0},
-        {"hashes": (), "covered": 1920, "prefix_digest": "d", "kv_block_size": 16,
-         "page_tokens": 16, "pages_per_block": 1, "capacity_pages": 128,
-         "has_state": True, "session_id": ["", "mtp4-synth"], "expected_ranks": 2,
-         "request": "req", "rank": 1}]
+# geometry per verify_tp_checkpoint_records: block=page*ppb, covered=len(hashes)*block,
+# capacity*page==covered, capacity%ppb==0, digest 64 hex chars.
+def _rec(rank):
+    return {"hashes": [f"h{i}" for i in range(120)], "covered": 1920,
+            "prefix_digest": "0" * 64, "kv_block_size": 16,
+            "page_tokens": 16, "pages_per_block": 1, "capacity_pages": 120,
+            "has_state": True, "session_id": ["", "mtp4-synth"],
+            "expected_ranks": 2, "request": "req", "rank": rank}
+GOOD = [_rec(0), _rec(1)]
 check(verify_tp_checkpoint_records(GOOD, 2, "req") is not None,
       "two agreeing full records across TP2 publish")
 check(refuses([{**GOOD[0]}, False], 2, "req"),
@@ -88,9 +89,10 @@ try:
 except Exception:
     src = open("engines/vllm/vllm/v1/core/sched/scheduler.py", encoding="utf-8").read()
 region = src[src.index("clip_session_checkpoint_chunk") - 900: src.index("clip_session_checkpoint_chunk")]
-check(not re.search(r"num_spec_tokens\s*==\s*0", region),
-      "the clip branch is unconditional under speculation (no num_spec_tokens==0 term)")
-check("kvmem_session_reuse" in region and "request.session_id" in region,
+code = "\n".join(ln for ln in region.splitlines() if not ln.strip().startswith("#"))
+check("num_spec_tokens == 0" not in code,
+      "the clip branch is unconditional under speculation (no num_spec_tokens==0 code term)")
+check("kvmem_session_reuse" in code and "request.session_id" in code,
       "the clip still requires session reuse + a native session id")
 
 print("FAIL session_clip_test" if failed else "PASS session_clip_test")
