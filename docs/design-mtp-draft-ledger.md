@@ -325,3 +325,20 @@ per-path determinism plus cold-run determinism (both still true and still checke
 The losslessness gate for this project is therefore: (1) each path deterministic, (2) cold x2
 byte-equal, (3) the needle content answered identically through either path - all three hold on
 the compiled production instance.
+
+## Phase D evaluation (2026-11-02): the sync-scheduling ban STAYS
+
+The ban exists because compaction rewrites the block table mid-request; async scheduling would
+let the engine schedule from a stale table and trip `num_output_placeholders >= 0` (the fork's
+own comment: "not merely slower, it is broken"). Phase D was scoped to "only if the measured
+remaining gap justifies it". Measured on the compiled production instance: countdown 84.3-85.1
+tok/s vs the user's Definitive reference band 70-80 - the gap is CLOSED and slightly exceeded,
+so the protocol-level async+compaction reconciliation is NOT worth its correctness risk.
+Status: fail-closed retained by decision, not by accident; revisit only if a future workload
+shows decode-bound throughput below the reference band while graphs are on.
+
+Same-instance final validation set (compiled + MTP4 + bridge + nosync + REUSE=1 + GPU_UTIL=0.972):
+countdown 85.0/84.3 tok/s, 3000-token session survival across the 1616 boundary twice at 84.7
+tok/s (b3789d7 two-tier capacity policy intact), short A c2f36446 byte-equal, 88K NEEDLE
+ZX-4417-QJ7 correct, park/retire/resume chain intact with a 34.4s wall-clock saving on turn2
+(hit 32320, both paths answer QX-9931-LM2), offline suite 9/9.
