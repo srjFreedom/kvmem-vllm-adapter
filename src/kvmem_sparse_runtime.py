@@ -1550,10 +1550,31 @@ class VllmSparseRuntime:
         # all - the engine book is authoritative. The clamp below only ever mattered for
         # compacted rows (rewound seq_len < logical), where `applied_view_coord` is set.
         capacity = len(st.row) * int(self.page_tokens)
-        if st.seq_len < 0 or step_end > capacity:
+        if st.seq_len < 0:
             raise SparseViewCapacityError(
                 f"request {req}: sparse attention needs {step_end} tokens "
                 f"but {len(st.row)} published pages cover only {capacity}")
+        if step_end > capacity and bool(getattr(st, "applied_view_coord", False)):
+            # A COMPACTED request's pages are the only truth: over-capacity means the view
+            # is genuinely short of the tokens attention must read - fail closed (the
+            # position_books regression owns this contract).
+            raise SparseViewCapacityError(
+                f"request {req}: sparse attention needs {step_end} tokens "
+                f"but {len(st.row)} published pages cover only {capacity}")
+        elif step_end > capacity:
+            # KVMem (measured 2026-11-01, user 283-token request at 15:39): under speculation
+            # the lagged books (`st.seq_len`, driven by the PREVIOUS step's rows) can sit up
+            # to K tokens below the freshly-synced engine row while the committed book
+            # catches up - `step_end = st.seq_len + rows` then overshoots the published pages
+            # by a handful (measured 1619 vs 1616). Clamping to capacity keeps attention on
+            # pages that actually exist; the missing draft rows are covered by the next
+            # steps' book catch-up. The engine's own seq_lens stay untouched for un-compacted
+            # requests (the applied_view_coord gate below), so this clamp only bounds the
+            # rewind-override book, never the kernel read.
+            self.log({"kind": "capacity_clamped", "req": req, "step_end": step_end,
+                      "capacity": capacity, "seq_len": int(st.seq_len),
+                      "rows": len(position_slots) if position_slots is not None else 0})
+            step_end = capacity
         if rows_only:
             # Pre-gather phase: only the block table row must be in place (the kernel's gathered
             # copy is taken from it). seq_lens/positions MUST be written after the engine's own
