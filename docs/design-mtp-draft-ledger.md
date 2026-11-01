@@ -342,3 +342,19 @@ countdown 85.0/84.3 tok/s, 3000-token session survival across the 1616 boundary 
 tok/s (b3789d7 two-tier capacity policy intact), short A c2f36446 byte-equal, 88K NEEDLE
 ZX-4417-QJ7 correct, park/retire/resume chain intact with a 34.4s wall-clock saving on turn2
 (hit 32320, both paths answer QX-9931-LM2), offline suite 9/9.
+
+## Amendment 5b (2026-11-02, gate7): the resume-vs-cold byte equality is refuted BY PAGE SETS
+
+A same-instance turn1 -> {turn2-resume, turn2-cold} run captured the rebuild diagnostics for
+all three requests. The RESUME path rebuilds with a chosen-page head of [7,8,9,10,11,12,...]
+(the PARKED selection replayed); the COLD path rebuilds with [7,8,9,12,13,14,16,...] - pages
+10, 11 and 15 are NOT chosen, because the compaction scorer selects by the CURRENT query
+vector, and turn2's question changes it. Both want/packed counts match (2123 pages), the SETS
+differ. So the two paths feed the model different physical context BY DESIGN (per-request
+retrieval is the product), and identical greedy text would be coincidence, not an invariant.
+Byte-equality of resume vs cold is therefore not a measurable contract of this architecture;
+what IS verifiable and verified: (a) each path deterministic (RESUME 6f56aadf / COLD 2d01050d
+reproduce across boots, eager and compiled, bridge rewrites), (b) cold x2 byte-equal, (c) the
+needle inside the restored prefix answered identically by content through both paths, (d) the
+resume saves the prefix prefill (110.0s vs 144.3s). Phase B's "resume byte-equal" item is
+CLOSED as REFUTED-WITH-EVIDENCE, pending the user's wording choice (A/B/C).
