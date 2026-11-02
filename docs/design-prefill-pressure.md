@@ -300,3 +300,20 @@ epoch 与 in-flight 门）。
   位置或 verify）；
 - 仍错 → 只剩**设备块池位置类**（物理 slot → kernel 数值路径）——届时做
   "同 child 连跑两池位置对比"实验。
+
+## 6.13 Round 9 判别：spec0 判负；want=847 现象暴露块粒度异动
+
+1. **spec0 × 压缩 × FORCE 实验**：`SPECULATIVE_TOKENS=0` 下压缩臂+强制块集，88K 仍
+   "no code recorded"（128.0s）→ **MTP/draft 边界与压缩轮的交互出局**。
+2. **新异常**：本轮 rebuild diag `chosen=18, want=847`（此前恒定 chosen=17/1680）——
+   847 = 18 × **49** 页——`block_pages` 的语义在轮间从 101（1616tok 引擎块）变成了 49
+   （=kv 原生 784？），且本轮 (c) 压缩水位也变了（gate seq 31904/48288/64672 = 非整块，
+   pool=226240 时代）。**子 prompt 从 30974 缩到 ~13.5K——needle 块仍在 chosen、pack
+   成功、答案仍错**。候选联系：pool 变大（226240=140 块）后 `cap_engine_blocks` /
+   `block_pages` 推导与压缩轮的 q 不再一致——若 bp 换算在 (c) 块视图里错位，
+   **`(c) 选块 × finalize 选块` 用的页→块除法可能不同源**，needle 句的 token pack 顺序
+   或 RoPE rank 在子请求里被打乱（子 prompt 文本 = select_tokens(logical pages) 升序，
+   若 logical 与设备块换算错位，文本仍在但 **pack 给子请求的 rank/rot 错位**——子文本
+   dump 已证句在——但 rank 错会毁读序）。
+3. 下一轮定罪实验：**对比压缩臂 vs 无压缩臂的 rebuild diag 的 `want/bp/dest` 与
+   child pack 的 logical→rank 映射表**（同 FORCE 集）；若 rank 序列错位 = 定罪块换算。
