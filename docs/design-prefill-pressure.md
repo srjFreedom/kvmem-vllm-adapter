@@ -317,3 +317,15 @@ epoch 与 in-flight 门）。
    dump 已证句在——但 rank 错会毁读序）。
 3. 下一轮定罪实验：**对比压缩臂 vs 无压缩臂的 rebuild diag 的 `want/bp/dest` 与
    child pack 的 logical→rank 映射表**（同 FORCE 集）；若 rank 序列错位 = 定罪块换算。
+
+## 6.14 Round 9 收束：运行时几何常量在实例间漂移（重要运维事实）
+
+diag (want,chosen) 历史分布（上）与 pool/engine-block 页数 `runtime.block_pages =
+max(_bpk)`（plugin:836，随 kv_cache_config 组形态变）共同表明：**同一二进制不同 boot
+下 pool 大小（201438→226240）与 bp（101/98）都会变**——
+1. round-7 的 FORCE 判决（1680/bp101 时代、与正确臂同代几何）**结论保持**；
+2. 本轮 spec0 run 的 FORCE 数字是"旧块号 × 新 bp=98"的错代产物（want 847=8.6×98），
+   **"draft 边界判负"存疑待复测**（要同代几何重跑）；
+3. **goal 验收前必须钉死启动几何**（GPU_UTIL 固定 + 启动后打印并校验 bp/pool 常量，
+   不一致 fail-closed）——写进 E 阶段清单；实验纪律更新：跨 boot 比较必须先对表
+   (want,chosen,bp,pool) 四元组。
