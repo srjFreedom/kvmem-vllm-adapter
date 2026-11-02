@@ -2496,14 +2496,26 @@ def _install(cls, module_name, probe, smoke, state):
                     if _rid is None:
                         continue
                     _ids = getattr(_nr, "prompt_token_ids", None)
-                    _rt0.note_prompt_ids(_rid, _ids)
-                    _rt0.note_session_id(_rid, getattr(_nr, "session_id", None),
-                                         getattr(_nr, "cache_salt", None))
-                    if getattr(_nr, "kvmem_rebuilt", False):
+                    # rebuilt truth: the runtime `_await_child` mark (set by the worker
+                    # when it handed Core the reconstruction) is authoritative; the
+                    # request attribute may or may not survive serialization (measured
+                    # both sightings). Note AFTER deciding - a rebuilt admission must
+                    # retire the parent books before any child note re-opens them.
+                    _rebuilt = (bool(getattr(_nr, "kvmem_rebuilt", False))
+                                or _rid in getattr(_rt0, "_await_child", set()))
+                    if not _rebuilt:
+                        _rt0.note_prompt_ids(_rid, _ids)
+                        _rt0.note_session_id(_rid, getattr(_nr, "session_id", None),
+                                             getattr(_nr, "cache_salt", None))
+                    if _rebuilt:
+                        _rt0._await_child.discard(_rid)
                         # stage-2 rebuilt generation: retire the old position space, then keep
-                        # the normal fresh-admission accounting (the ids above are the FULL
+                        # the normal fresh-admission accounting (the ids below are the FULL
                         # rebuilt prompt - the retrieval source for the NEXT round).
                         _rt0.accept_reconstruction(_rid)
+                        _rt0.note_prompt_ids(_rid, _ids)
+                        _rt0.note_session_id(_rid, getattr(_nr, "session_id", None),
+                                             getattr(_nr, "cache_salt", None))
                         state.get("computed_before", {}).pop(_rid, None)
                         state.get("was_decode", {}).pop(_rid, None)
                         # ROOT-CAUSE FIX (goal-7833cb61 round-11): the rebuilt child REUSES

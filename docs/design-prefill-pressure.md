@@ -524,3 +524,20 @@ stale 页"**——pack 写了 1680 页，child 需要 1936 页——中间空洞
    retire 等 8 处）——OFF 生产从未跑过 child，这些抑制从未端到端验证。
    下一轮二分：**KVMEM_REBUILD_HOOKS 开关逐项放开**（先放 step_end 主循环的 2762 continue
    改走正常 advance 路径——child 本质就是 fresh 请求，理应享有完整钩子）。
+
+## 6.25 Round 25：child 与 replay 在引擎面已逐字节等价，剩余差值=生成流连续性
+
+- attr 探针（环境开关版，回退）实测：worker NewRequestData 侧 attr_val **既有 True 也有 False**
+  的 sighting（不同代码路径），`reconstruction_started×4`+`rebuild_row_reset` 事件证明
+  accept/复位**一直正确执行**——attr 理论证伪，但把"note 在 accept 之前"的次序缺陷修成
+  了确定性版本（`_await_child` runtime 标记为唯一事实源；行为等价，属正确性加固，保留）。
+- FULL_HOOKS=1 实验重解读：放开 step_end `is_rebuilt→continue` 后行为不变的真实原因——
+  child 的 st 不存在（`_ensure` 缺席），钩子链在 continue 之前的 `runtime.state(req)`
+  短路路径里也没执行任何东西，实验**未真正放开**任何 child 钩子，证据力作废。
+- **至此 child vs replay 的可枚举差值全部闭合**：ids 逐字节（30975=30974+1 个逃逸样本
+  token，其语义=生成起点，见下）、块行纯净、账本归零、state 判定、身份（NEW_RID）、
+  采样参数（top_k=1 亦错）。
+- **唯一结构性残差**：child 的输出流"继承"了父对话（output 连续、outs 拼接）。
+  判决实验（round 26，离线）：把 child ids 去掉尾部 1 token 或替换该 token 重放——
+  若答案随该 token 翻转 ⇒ "No" 源头=父逃逸样本（修复=finalize 前禁止任何样本逃逸 /
+  丢弃 outs）；若不翻转 ⇒ 转真钩子放开二分。

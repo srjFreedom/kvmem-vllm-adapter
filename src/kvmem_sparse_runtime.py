@@ -3268,6 +3268,13 @@ class VllmSparseRuntime:
         self._owned_slots[req] = set(int(p) for p in st.row)
         # 4) hand Core the reconstruction over the channel (rebuild branch -> pending -> fresh
         #    dense admission of `select_tokens(logical)` on the scheduler thread)
+        # worker-side source of truth for the pending rebuilt admission (the
+        # NewRequestData attribute is lost across msgspec serialization on some
+        # paths - measured: attr_val=False with the child prompt length, so the
+        # accept branch silently never ran on that pass).
+        if getattr(self, "_await_child", None) is None:
+            self._await_child = set()
+        self._await_child.add(req)
         try:
             res = ch.compact(req, selected, pt, visible_tokens=0, rebuild=True,
                              block_pages=bp, physical_pages=phys,
