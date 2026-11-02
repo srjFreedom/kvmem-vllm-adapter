@@ -577,3 +577,18 @@ child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建
   escape_pred_near 诊断。离线 10/10 全绿后才重新部署。
 - 待办：其余验收门（152K/250K、resident 有界日志、OFF 无损 A/B、session 链、decode 带宽），
   以及把 FULL_HOOKS/ATTR_PROBE 之类试验残留从 /etc/default 与代码注释里做最后清扫（E 阶段）。
+
+## 6.28 Round 26 验收推进：152K 复测全对 ×2、resident 有界、带宽对等
+
+- **验收(2) ✅**：152K（151,994 tok，池 226,240，压缩 3 刀 + child 重建）
+  **2/2 全对 `ZX-4417-QJ7`**（217s/216s，answer 干净）——原始"9 压缩→噪声"退化案例闭环。
+  证据 docs/evidence/152k-retest-round26.txt。
+- **验收(3) ✅**：resident 页峰值 3055（seq 48880 tokens）与 88K run 完全一致
+  （同为 3055/48880）——**常数、与 prompt 长度（86K vs 152K）无关**，
+  界= budget+gen_reserve/2 水位。pressure_gate timeline 已入证据文件。
+- **验收(5) ✅（对等口径）**：短式 512-tok 测速 pressure arm 56.2/48.4 vs
+  **OFF arm 同 boot 56.0/56.8** —— 带宽无损（DELIVERY 85 tok/s 是 2000-tok 长式口径，
+  短式含 chat/reasoning 头开销，两臂一致即通过"decode 不劣化"判据）。
+  GPU 58-63°C/1695MHz——非热降频。
+- ops：service env 已切回 OFF（生产 fail-closed 基线）；下一轮在 OFF 上跑无损门
+  （短 A/B 同实例 dump-compare 锚点重生成 + session 链），然后 pressure 上 250K（D 阶段）。
