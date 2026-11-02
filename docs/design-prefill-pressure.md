@@ -149,3 +149,23 @@ candidates, without graph propagation or cold recall"。改造计划 P3-1 退出
 - **生产回归（金标准）**：HEAD 全部改动 vs 060eda0(v0.4.0) 同实例 A/B **逐字节一致**
   （A `0013e530…`、B `73ef34c9…`；旧 sha c2f36446/42675199 系算法口径不明，E 阶段以新算
   法+新锚点更新 DELIVERY 表）；88K OFF needle ✓ 107.8s；离线 10/10。
+
+## 6.7 Round 4 稳定性定性（4 连发判别实验，docs/evidence/pressure-stability-round4.jsonl）
+
+同实例连续 4×88K（pressure ON）：run1 ✓ 136.3s、run2 ✓ 135.8s、run3 ✗("7392-ALPHA-9"=
+档案内干扰码)、run4 ✓（与 run2 同文）。**真非确定性**（非"首跑特殊"、非"连跑稳定"）。
+排除项：
+- **不是漏选**：needle engine-block 26 在全部 4 次 rebuild `chosen` 里（rebuild diag
+  chosen_head 对比，v14/v15 同）；
+- **不是打包层**：want/packed/store_missing 每跑相同（1680/1680/0）。
+定性机制：**pressure 驱逐后，后续 chunk 的 hidden/K/V 字节是在有损上下文（sink+tail 视图）
+上计算的** → 这些字节进 store → 打分（mean-K 相似度）的**内容基础随漂移变** →
+needle 与干扰块的排序抖动 → 17 块视图里模型被干扰码劫持。生产 OFF 路径 dense prefill
+的字节完整 → 同粒度选择稳定（v0.4.0 门）。与 6441248 教训同族：微小数值差足以翻动近阈值选页。
+
+修复候选（B2，下一轮）：
+(a) 评分基础改用**页字节的 canonical mean-K**（_feed_retrieval 已随 commit 写入，与
+    有损上下文无关的是"字节本身"——但 K 字节由 forward 产生，仍依赖 hidden——需实测其漂移量）；
+(b) 落地序确定性化（固定 dest 窗口/确定性分配），先消掉"同输入不同落地"这类微差；
+(c) 接受漂移、把选择做宽（提高 rebuild 预算占比/强制 needle 邻块扩展 KVMEM_GRAPH_ALPHA
+    在 pressure 终选也生效）——语义代价最小。
