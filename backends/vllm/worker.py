@@ -135,6 +135,8 @@ def main(argv=None) -> int:
     # silently always-false. `ADDITIONAL_CONFIG_JSON` is the channel that does survive.
     # v0.4.x goal-7833cb61: bounded in-prefill residency (kvmem 0.19 P3-1 alignment).
     # OFF by default: production keeps the whole-prompt dense prefill + prompt-end rebuild.
+    if _env_flag("KVMEM_REBUILD_FULL_HOOKS"):
+        cfg["rebuild_full_hooks"] = True
     if _env_flag("KVMEM_PREFILL_PRESSURE"):
         cfg["prefill_pressure"] = True
         # B2 (goal round 5): pressure releases through the Core quiescent protocol - the

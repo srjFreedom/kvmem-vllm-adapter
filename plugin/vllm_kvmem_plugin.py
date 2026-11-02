@@ -2759,7 +2759,15 @@ def _install(cls, module_name, probe, smoke, state):
                                    "orch": runtime._orch.get(req),
                                    "index": runtime._retrieval.get(req),
                                    "stats": runtime._statistics.get(req)})
-                    if runtime.is_rebuilt(req):
+                    if runtime.is_rebuilt(req) and not getattr(
+                            runtime, "rebuild_full_hooks", False):
+                        # BISECT SWITCH (goal round 24): KVMEM_REBUILD_FULL_HOOKS=1 lets the
+                        # rebuilt child run the SAME step_end bookkeeping as any fresh
+                        # request (advance/commit/statistics). The child IS a fresh prompt;
+                        # the suppression was written when its books still carried the
+                        # parent generation. Never exercised on the OFF arm (no child ever
+                        # ran there), and it is the LAST surviving difference vs a fresh
+                        # replay of the identical ids that answers correctly.
                         continue
                     if cap is not None:
                         cap.note_tokens(int(n_new))

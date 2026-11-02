@@ -489,3 +489,38 @@ stale 页"**——pack 写了 1680 页，child 需要 1936 页——中间空洞
   东西。round-24 取证=child 首 decode 步的 sampled token 概率面（top-k）对表 replay。
 - **运营注**：88K 生产臂（pressure OFF）不受影响（round-3 起从未走过 child 协议——全历史
   OFF boot 零 rebuild 事件，round-18 事件扫描证）；child 协议迄今**从未端到端成功过一次**。
+
+## 6.23 Round 24：排除法收口——罪在 child 专属运行路径，不在压缩轮
+
+- 新 bp 全被吞的根因自查：**`hits:0` = 触发 0 次**（`_left<=0` skip）——第 18/20 轮
+  XFER/RESID 的成功命中都是**旧 .bp 残留**；本轮 console（n_new==1 命中 child decode 步）
+  恢复正常取证。logits 不在 execute_model_state 驻留（logits_present=false），改打
+  `runner._kvmem_req_ids` 路径（child 步 end 可见 rid 列表）——下一轮。
+- child rid 事件时间线（markerAN boot 最后 run）：父两刀压缩（45056→24048、73728→13936）
+  → finalize@86016 → **quiescent_compact_empty tokens=0 ×2 = child 首步 fresh 账本**
+  （非风暴，无 revert 记录）→ rebuild_queued → row_reset ✓。协议执行面全绿。
+- **4 连 replay（同 boot、压缩轮之后）= 4/4 ✓ ZX-4417-QJ7**：
+  **压缩后的实例状态对 fresh 请求完全无害**（数据面/位置面/池面洗清）。
+- ⇒ 排除法闭合：同 ids/同 boot/同采样下 fresh ✓ vs child ✗，且身份面（NEW_RID）已排除
+  ⇒ **唯一幸存变量=child 运行期间 runtime 因 rebuilt 标记而抑制的钩子组**
+  （step_end 主循环 `is_rebuilt → continue`、prepare pin 跳过、advance 缺席）。
+  OFF 生产从未跑过 child ⇒ 这些抑制从未被端到端验证过。
+  下一轮：child 步内 runtime/orch 注册面 dump + 逐项解禁二分。
+
+## 6.24 Round 24 收官记录（含两处自纠）
+
+1. **hits:0 陷阱**：kvmem_dbg 的 `hits` 语义=触发次数（0=永不）——第 18/20 轮的 XFER/RESID
+   成功来自**旧 .bp 残留**，本轮新写的 hits:0 四条全部静默。四个 130s run 浪费在此。
+   教训入 USER 协议：**新断点先跑 smoke 级请求验证命中，再上贵实验**。
+2. **父子同 rid 时间线误读撤回**：按 rid 过滤 child 事件时，`note_prompt_ids n=86670`、
+   `row_synced 4096`、`resume_skip` 都发生在 rebuild_queued **之前**=父的 admission 记录。
+   child 的真实事件面自 rebuild_queued 起：empty 提案×2（fresh 账本，无害）、
+   row_reset ✓、reconstruction_started ✓——协议执行无异常。
+3. **本轮净事实（两条硬）**：
+   - 压缩轮之后的同 boot：**4/4 replay 全对** ⇒ 压缩实例的池/数据面对后续请求无害。
+   - `quiescent_compact_empty tokens=0 ×2/run`=child 首步 Core 触发面正常拒绝，无 revert 风暴。
+4. **残余唯一变量**（承 23 轮）：child 与 fresh replay 之间只剩 "rebuild 标记抑制的钩子组"
+   （step_end `is_rebuilt→continue` 全家：capture_slot_mapping、statistics、reselect、
+   retire 等 8 处）——OFF 生产从未跑过 child，这些抑制从未端到端验证。
+   下一轮二分：**KVMEM_REBUILD_HOOKS 开关逐项放开**（先放 step_end 主循环的 2762 continue
+   改走正常 advance 路径——child 本质就是 fresh 请求，理应享有完整钩子）。
