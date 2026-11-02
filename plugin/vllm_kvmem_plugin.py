@@ -1999,6 +1999,19 @@ def register():
                         break
                 if old is None:
                     return {"ok": False, "error": "unknown request"}
+                # EARLY PURGE (goal round 25, completes 9dbf877): this runs at the
+                # finalize-consumption schedule round - ONE ROUND BEFORE the prompt-
+                # complete step emits its sample. Suppress output processing for the
+                # rid so the escape never reaches the client accumulator (measured:
+                # late purge at requeue was after "No" had already streamed; the
+                # escaped token still poisoned `old.output_token_ids` -> outs).
+                try:
+                    _sp = getattr(self, "kvmem_suppress_output", None)
+                    if _sp is None:
+                        _sp = self.kvmem_suppress_output = set()
+                    _sp.add(request_id)
+                except Exception:
+                    pass
                 ids = [int(t) for t in (token_ids or ())]
                 if not ids:
                     return {"ok": False, "error": "empty rebuild token list"}
@@ -2120,6 +2133,60 @@ def register():
                 return {"ok": False, "error": str(exc)[:200]}
 
         Scheduler.queue_kvmem_reconstruction = queue_kvmem_reconstruction
+
+        # ESCAPED-SAMPLE SUPPRESSION (goal-7833cb61 round 25, completes 9dbf877): the
+        # step that completes the prompt of an over-budget request samples a token that
+        # streams to the client TWO rounds before the requeue lands - "No" polluted the
+        # chat answer text even after the outs=[] fix (measured 'NoZX-4417-QJ7'). Drop
+        # the new tokens of EXACTLY that crossing step: books still advance (the child
+        # replaces the whole generation stream anyway), the client simply never sees it.
+        _orig_ufo = Scheduler.update_from_output
+        if not getattr(_orig_ufo, "_kvmem_escape_patch", False):
+            def update_from_output(self, scheduler_output, model_runner_output):
+                cfg = _sched_cfg(self)
+                _sup = set()
+                if cfg.get("prefill_pressure") and cfg.get("compact_rebuild"):
+                    _bud = int(cfg.get("budget_tokens", 36864))
+                    for rid, n_new in (scheduler_output.num_scheduled_tokens or {}).items():
+                        req = self.requests.get(rid)
+                        if req is None or bool(getattr(req, "kvmem_rebuilt", False)):
+                            continue
+                        _pl = int(req.num_prompt_tokens)
+                        _nl = int(getattr(req, "num_logical_tokens", 0) or 0)
+                        _pre = _nl - int(n_new)
+                        # The crossing predicate must read the LOGICAL book: the
+                        # prompt-complete step is ALSO the finalize step (the (b) trigger
+                        # rewinds `num_computed_tokens` to the compacted view BEFORE
+                        # update_from_output runs - measured: the 654-step arrives at ufo
+                        # with computed=26878), so any computed-based test misses it.
+                        # `num_logical_tokens` is monotone and lands exactly on 86670
+                        # here; the rebuilt child's own logical restarts at 0 and never
+                        # collides with its 30975 prompt.
+                        _nl = int(getattr(req, "num_logical_tokens", 0) or 0)
+                        if (_pl > _bud and _nl == _pl and _pre < _pl
+                                and int(getattr(req, "num_output_tokens", 0) or 0) == 0):
+                            _sup.add(rid)
+                result = _orig_ufo(self, scheduler_output, model_runner_output)
+                if _sup:
+                    try:
+                        for _eco in (result or {}).values():
+                            for o in (getattr(_eco, "outputs", None) or ()):
+                                if o.request_id in _sup and not o.finish_reason:
+                                    o.new_token_ids = ()
+                                    o.new_logprobs = (None if o.new_logprobs is None
+                                                      else o.new_logprobs[:0])
+                                    _append(_channel_state.get("probe_log")
+                                            or "/tmp/kvmem_sparse.jsonl",
+                                            {"kind": "escape_suppressed", "req": o.request_id,
+                                             "pid": os.getpid()})
+                    except Exception:
+                        _append(_channel_state.get("probe_log")
+                                or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "escape_suppress_error",
+                                 "error": traceback.format_exc()[-300:]})
+                return result
+            update_from_output._kvmem_escape_patch = True
+            Scheduler.update_from_output = update_from_output
 
         import itertools
         from vllm.v1.engine.core import EngineCore

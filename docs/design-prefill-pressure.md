@@ -561,3 +561,19 @@ child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建
 130s 稳定。**残留卫生缺陷**：逃逸的 "No" 已流入客户端累积器（detach 不截断 SSE 已发
 部分）——流抑制=下一刀（schedule 时识别 prompt-complete 步 → update_from_output
 丢弃该 rid 该步样本；判定式 `num_computed+n_new == num_prompt_tokens and prompt>budget`）。
+
+## 6.27 Round 25 【END-TO-END GREEN】：逃逸样本流抑制落地，88K 压缩臂首次全对
+
+- 机制补全（6.26 之后）：`escape_pred_near` 探针实测 prompt-complete 步进入
+  update_from_output 时 `num_computed_tokens` 已被 finalize 的 (b) 触发**回卷到 26878**
+  （视图坐标），任何 computed 基判定永不命中——**判据必须读逻辑账本**（num_logical 单调，
+  恰在本步落 86670；child 自己的逻辑账本从 0 起，无冲突）。
+- **落地修复**（update_from_output 补丁，压力臂限定）：
+  `_pl > budget and num_logical == _pl and pre_step_logical < _pl and no outputs yet`
+  ⇒ 丢弃该步 `new_token_ids`（账本照常推进；child 代换整条生成流，逃逸样本无权威）。
+- **判决**：boot markerAZ/BA 两轮共 **7/7 全部 `ZX-4417-QJ7` 干净**（needle ✓ 无 No 前缀），
+  每 run ~130s，`escape_suppressed` 事件与答案一致。
+- 已修剪：attr 探针、head_blocks 实验（误诊——碎片头本就是父真实 prompt 开头，B 臂可答）、
+  escape_pred_near 诊断。离线 10/10 全绿后才重新部署。
+- 待办：其余验收门（152K/250K、resident 有界日志、OFF 无损 A/B、session 链、decode 带宽），
+  以及把 FULL_HOOKS/ATTR_PROBE 之类试验残留从 /etc/default 与代码注释里做最后清扫（E 阶段）。
