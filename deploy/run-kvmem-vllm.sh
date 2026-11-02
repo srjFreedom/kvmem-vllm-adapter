@@ -63,6 +63,9 @@ export KVMEM_BLOCKWISE=${KVMEM_BLOCKWISE:-1}
 # 整体重算：prompt prefill 末尾用 TP 汇总评分选定最终工作集并重放一遍（超池正确性的
 # 已验证路径；v0.4.0 起为默认，设 0 退回仅重排不重算的旧行为）。
 export KVMEM_COMPACT_REBUILD=${KVMEM_COMPACT_REBUILD:-1}
+# prefill 期有界常驻（goal-7833cb61 实验路径，验收前保持默认关闭）：
+# 开启后 prefill 高水位改为 budget+64 页，压力点在 chunk 边界做 sink+tail 压缩。
+export KVMEM_PREFILL_PRESSURE=${KVMEM_PREFILL_PRESSURE:-0}
 MODEL=${MODEL:?未设置 MODEL：指向你的权重目录，例如 MODEL=$HOME/models/<你的模型>}
 # 对外模型 id：按你实际部署的权重命名（需与客户端请求里的 model 一致）。
 SERVED_NAME=${SERVED_NAME:-Qwen3.8-27B-FP8-MTP}

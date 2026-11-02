@@ -133,6 +133,10 @@ def main(argv=None) -> int:
     # Experimental switches travel inside the plugin config: the worker processes do NOT inherit
     # KVMEM_* from the API server (the harness filters them), so an env read inside the runtime is
     # silently always-false. `ADDITIONAL_CONFIG_JSON` is the channel that does survive.
+    # v0.4.x goal-7833cb61: bounded in-prefill residency (kvmem 0.19 P3-1 alignment).
+    # OFF by default: production keeps the whole-prompt dense prefill + prompt-end rebuild.
+    if _env_flag("KVMEM_PREFILL_PRESSURE"):
+        cfg["prefill_pressure"] = True
     for _k, _cfgk in (("KVMEM_PROMPT_END_RESELECT", "prompt_end_reselect"),
                       ("KVMEM_CHECKPOINT_REPLAY", "checkpoint_replay"),
                       ("KVMEM_COMPACT_REBUILD", "compact_rebuild")):

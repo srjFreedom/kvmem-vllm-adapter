@@ -779,6 +779,7 @@ def _attach_sparse(runner, log_path):
             # Opt-in: EngineCore compacts at its step boundary; the worker must not also reselect
             # inside the next step's forward, or both paths rewrite the same row.
             runtime.sched_compact = bool(cfg.get("sched_compact", False))
+            runtime.prefill_pressure = bool(cfg.get("prefill_pressure", False))
             import os as _os
             runtime.blockwise_view = bool(int(_os.environ.get("KVMEM_BLOCKWISE", "0") or 0))
             runtime.install_row_in_view = bool(int(_os.environ.get("KVMEM_INSTALL_ROW_VIEW", "0") or 0))

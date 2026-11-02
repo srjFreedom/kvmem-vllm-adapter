@@ -2452,7 +2452,7 @@ class VllmSparseRuntime:
         # prefill-pressure selection). Without this a 200K prefill would consume the whole pool.
         if (prefill and st.tokens and orch.selector is not None
                 and bool(getattr(self, "inrequest_compaction", False))):
-            if self.no_prefill_compact:
+            if self.no_prefill_compact and not getattr(self, "prefill_pressure", False):
                 # Resident prefill: the prompt is written into the WHOLE physical pool with no
                 # mid-prefill compaction (that path is not reliable). The borrowed pool is given
                 # back when the LAST chunk completes the prompt - and it must happen HERE, inside
@@ -2523,8 +2523,12 @@ class VllmSparseRuntime:
                           "prompt": prompt_len, "n_new": int(n_new_tokens or 0)})
                 self._reselect(req, probe=True)
             elif (not bool(getattr(self, "sched_compact", False))
+                  and (getattr(self, "prefill_pressure", False) or not self.no_prefill_compact)
                   and prefill_pressure_due(
-                      st.tokens, max(len(orch.resident), len(st.row)), high,
+                      st.tokens,
+                      max(len(orch.resident), len(st.row),
+                          int(st.tokens) // max(1, int(self.page_tokens))),
+                      high,
                       getattr(orch, "_tokens_at_reselect", 0), self.gen_reserve)):
                 # The ROW is the true residency: pages the engine appended since the last
                 # compaction are in the row immediately (the cursor sync copies them), while
