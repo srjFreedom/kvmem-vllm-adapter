@@ -2180,6 +2180,7 @@ def register():
                     if (scheduler is None or manager is None or executor is None
                             or getattr(executor, "is_failed", False)):
                         return
+                    import os as _os_p
                     from kvmem_sched_compact import (apply_compaction, pick_candidate,
                                                      pressure_due)
                     from kvmem_reconstruction import adopt_attention_blocks, \
@@ -2210,7 +2211,13 @@ def register():
                         # past the working set, long before the pool would (a). Quiescent
                         # condition (no drafts in flight) is exactly safe: the pressure moves
                         # happen between steps, never under speculative verification.
-                        _hi = int(cfg.get("budget_tokens", 36864)) + \
+                        # DIAGNOSTIC (goal-7833cb61 bisect, remove after acceptance):
+                        # KVMEM_PRESSURE_HIGH_TOKENS overrides the watermark - set it above
+                        # any prompt length to disable (c) compaction while KEEPING the
+                        # over-budget finalize, isolating finalize bugs from compaction
+                        # residue.
+                        _hi = int(_os_p.environ.get("KVMEM_PRESSURE_HIGH_TOKENS") or 0) or \
+                            int(cfg.get("budget_tokens", 36864)) + \
                             int(cfg.get("gen_reserve_tokens", 16384)) // 2
                         _step = int(cfg.get("gen_reserve_tokens", 16384)) // 4
                         _last = getattr(scheduler, "kvmem_pressure_last", None)

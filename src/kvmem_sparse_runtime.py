@@ -3144,8 +3144,27 @@ class VllmSparseRuntime:
                         return False
                 return True
             room = max(0, cap_engine_blocks - len(tail_blocks))
-            middle = [b for b in rank_blocks
-                      if b not in tail_blocks and block_ok(b)][:room]
+            # NEIGHBOUR expansion (goal-7833cb61 round-6): a scored block drags the block
+            # right AFTER it when room allows. Measured (88K bisect): the dense-stats arm
+            # kept engine blocks 26-31 (the needle sentence spans the 26/27 boundary and
+            # reads its completion in 31) and answered; after pressure compactions the
+            # lossy-substrate scores dropped block 31, and with the needle text present
+            # but truncated at a block boundary the model consistently answered
+            # "no code recorded" - the follow-on text is the discriminator against the
+            # distractor templates, not an optional nicety.
+            middle = []
+            _mid_set = set()
+            for b in rank_blocks:
+                if len(middle) >= room:
+                    break
+                if b in tail_blocks or b in _mid_set or not block_ok(b):
+                    continue
+                middle.append(b)
+                _mid_set.add(b)
+                if (len(middle) < room and b + 1 not in tail_blocks
+                        and b + 1 not in _mid_set and block_ok(b + 1)):
+                    middle.append(b + 1)
+                    _mid_set.add(b + 1)
             chosen = sorted(set(middle) | tail_blocks)
             logical_pages = sorted({p for b in chosen for p in
                                     range(b * bp, (b + 1) * bp) if p < n_pages})

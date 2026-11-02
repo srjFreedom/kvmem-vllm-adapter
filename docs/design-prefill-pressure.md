@@ -198,3 +198,27 @@ needle 与干扰块的排序抖动 → 17 块视图里模型被干扰码劫持�
 （其余全同），跑 88K：对→定罪压缩轮污染（查 GDN 清零/slot/统计基础）；错→定稿 over_budget
 形态本身问题。候选根因清单：GDN state 清零在压缩后 slot 错位 / 子请求 positions 起点 /
 store 页 rebake delta 在 blockwise rewind 后的 rank 语义。
+
+## 6.9 Round 6 二分定罪 + 邻块扩展（负结果）
+
+**二分**（env `KVMEM_PRESSURE_HIGH_TOKENS=1e8` 禁 (c) 压缩、保留 over_budget finalize，
+其余全同）：88K **✓ ZX-4417-QJ7**（133.9s，无压缩时间线 seq==tokens 全程）。
+**定罪：finalize 执行链无罪；压力压缩轮是充分必要条件级的污染源。**
+
+**两臂 chosen 集对比**：无压缩臂 [7,8,9,11,12,13,14,**26,27,28,29,30,31**,48,51,52,53]
+（needle 邻域连续 26-31）；压缩臂 [7,8,9,12,13,14,26,27,28,29,30,32,35,38,...]
+（**丢 block 31 = needle 句的下一块**）。needle 句跨 26/27 块界，block 31 是 needle 记录的
+"完结上下文"（distractor 模板是单句循环，needle 是多句记录）。
+
+**修复尝试 = 邻块扩展**（`_rebuild_select`：每个入选 middle 块强制带后继 b+1）：
+**已生效**（run chosen=[...,26,27,28,29,30,31,32,33,35,36,38,39,...]——**31 在场**）
+**但仍 4/4 稳定错**（"No special access code recorded." 逐字节一致，129.4s）。
+→ 子请求 prompt 含完整 needle 邻域 + 问句、同机制无压缩臂答对——**输入无罪 ×2 证明**。
+
+**新的定罪面**：污染源不在"选页集"，在**压缩轮的执行残留本身**。待查清单（下一轮判别）：
+1. `reset_state` 无调用者（GDN 清零依赖引擎 fresh admission——压缩轮的 Core 账本回卷
+   是否破坏 child admission 的 state 初始化路径？）；
+2. blockwise 压缩轮 `restore_page_rank` IN PLACE 重旋 + `baked_delta` 字典改写——
+   子请求若复用父的 orch 字典（`slot_of/baked_delta/resident` 未清？）pack 读错源页；
+3. 判别实验：`KVMEM_COMPACT_REBUILD=0` + 压缩（父 view 直答 vs 子重建）+ 对比
+   pack 前后 store 页 sha（trace_pages 已有机制）。
