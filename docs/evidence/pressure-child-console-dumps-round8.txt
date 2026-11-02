@@ -1,0 +1,30 @@
+===== pid=110929 step=295 req=chatcmpl-89548e77ca064e4a-97e6f2d5 =====
+
+===== pid=110928 step=295 req=chatcmpl-89548e77ca064e4a-97e6f2d5 =====
+
+===== pid=110929 step=296 req=chatcmpl-89548e77ca064e4a-97e6f2d5 =====
+
+===== pid=110928 step=296 req=chatcmpl-89548e77ca064e4a-97e6f2d5 =====
+
+===== pid=110928 step=297 req=chatcmpl-89548e77ca064e4a-97e6f2d5 =====
+
+===== pid=110929 step=297 req=chatcmpl-89548e77ca064e4a-97e6f2d5 =====
+
+===== pid=110928 step=298 req=chatcmpl-89548e77ca064e4a-97e6f2d5 =====
+
+===== pid=110929 step=298 req=chatcmpl-89548e77ca064e4a-97e6f2d5 =====
+
+===== pid=110929 step=299 req=chatcmpl-89548e77ca064e4a-97e6f2d5 =====
+
+===== pid=110928 step=299 req=chatcmpl-89548e77ca064e4a-97e6f2d5 =====
+
+===== pid=110929 step=300 req=chatcmpl-89548e77ca064e4a-97e6f2d5 =====
+
+===== pid=110928 step=300 req=chatcmpl-89548e77ca064e4a-97e6f2d5 =====
+
+===== pid=110929 step=301 req=chatcmpl-89548e77ca064e4a-97e6f2d5 =====
+CHILD_DUMP {"pid": 110929, "req": "97e6f2d5", "step": 301, "n_new": 4096, "st": {"tokens": 24576, "seq_len": 24576, "spare": null, "rebuilt": false, "query_reselected": false, "compacted_in_prefill": false, "applied_view_coord": false, "off_pages": 0, "window_src": {}, "row_index": 0}, "st_row": {"len": 1818, "head": [2323, 2324, 2325, 2326, 2327, 2328], "tail": [1307, 1308, 1309, 1310, 1311, 1312]}, "st_logical": {"len": 1818, "head": [0, 1, 2, 3, 4, 5], "tail": [1812, 1813, 1814, 1815, 1816, 1817]}, "slot_of": {"len": 1536, "head": [[0, 2323], [1, 2324], [2, 2325], [3, 2326], [4, 2327], [5, 2328]], "tail": [[1530, 823], [1531, 824], [1532, 825], [1533, 826], [1534, 827], [1535, 828]]}, "baked": {"len": 1536, "head": [[0, 0], [1, 0], [2, 0], [3, 0], [4, 0], [5, 0]], "tail": [[1530, 0], [1531, 0], [1532, 0], [1533, 0], [1534, 0], [1535, 0]]}, "resident": {"len": 1536, "head": [0, 1, 2, 3, 4, 5, 6, 7], "tail": [1528, 1529, 1530, 1531, 1532, 1533, 1534, 1535]}, "needle_store": [false, false, false, false, false, false, false], "captured_present": true, "store_n": 1536, "store_keys": [0, 1200], "resident_window": [0, 1535, 1536], "slot_of_resident_agree": 1536, "baked_nonzero": 0, "input_batch": {"rids_n": 1, "rid_idx": 0, "head_rids": ["97e6f2d5"], "row_blocks": null, "row_blocks_tail": null, "seq_lens": [28672], "num_prompt": []}, "scr": {"len": 1, "head": ["chatcmpl-89548e77ca064e4a-97e6f2d5"], "tail": ["chatcmpl-89548e77ca064e4a-97e6f2d5"]}}
+
+===== pid=110928 step=301 req=chatcmpl-89548e77ca064e4a-97e6f2d5 =====
+CHILD_DUMP {"pid": 110928, "req": "97e6f2d5", "step": 301, "n_new": 4096, "st": {"tokens": 24576, "seq_len": 24576, "spare": null, "rebuilt": false, "query_reselected": false, "compacted_in_prefill": false, "applied_view_coord": false, "off_pages": 0, "window_src": {}, "row_index": 0}, "st_row": {"len": 1818, "head": [2323, 2324, 2325, 2326, 2327, 2328], "tail": [1307, 1308, 1309, 1310, 1311, 1312]}, "st_logical": {"len": 1818, "head": [0, 1, 2, 3, 4, 5], "tail": [1812, 1813, 1814, 1815, 1816, 1817]}, "slot_of": {"len": 1536, "head": [[0, 2323], [1, 2324], [2, 2325], [3, 2326], [4, 2327], [5, 2328]], "tail": [[1530, 823], [1531, 824], [1532, 825], [1533, 826], [1534, 827], [1535, 828]]}, "baked": {"len": 1536, "head": [[0, 0], [1, 0], [2, 0], [3, 0], [4, 0], [5, 0]], "tail": [[1530, 0], [1531, 0], [1532, 0], [1533, 0], [1534, 0], [1535, 0]]}, "resident": {"len": 1536, "head": [0, 1, 2, 3, 4, 5, 6, 7], "tail": [1528, 1529, 1530, 1531, 1532, 1533, 1534, 1535]}, "needle_store": [false, false, false, false, false, false, false], "captured_present": true, "store_n": 1536, "store_keys": [0, 1200], "resident_window": [0, 1535, 1536], "slot_of_resident_agree": 1536, "baked_nonzero": 0, "input_batch": {"rids_n": 1, "rid_idx": 0, "head_rids": ["97e6f2d5"], "row_blocks": null, "row_blocks_tail": null, "seq_lens": [28672], "num_prompt": []}, "scr": {"len": 1, "head": ["chatcmpl-89548e77ca064e4a-97e6f2d5"], "tail": ["chatcmpl-89548e77ca064e4a-97e6f2d5"]}}
+

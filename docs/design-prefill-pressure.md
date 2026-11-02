@@ -250,3 +250,32 @@ orch/store/commit 坐标链）或子请求 first-step 的 block_table 状态。*
 **下一轮判别（设计好）**：worker 侧 console/dump 对比 child 前向第一步的
 `slot_mapping 目标页 vs 引擎 block_table` 与无压缩臂同位置——若写地址错位=定罪 commit
 坐标链；同步把 force env 撤掉恢复纯压缩臂基线（当前 :18200 配置）。
+
+## 6.11 Round 8 console 取证：两本账不变量疑似被 blockwise 回卷破坏
+
+worker console（自举 re-arm，热挂，零重启）抓到 (c) 压缩后父请求 mid-prefill 状态
+（step 301，两 rank 逐字段一致；docs/evidence/pressure-child-console-dumps-round8.txt）：
+
+    st.tokens=24576  st.seq_len=24576  off_pages=0  applied_view_coord=False
+    row=1818 pages  logical=0..1817  slot_of/resident=0..1535（1536 页）
+    store_n=1536   store keys 覆盖到 1200..1535 段   needle_store=[false×7]
+    input_batch seq_lens=[28672]
+
+**震撼点（对照 goal 红线）**：
+1. **`store_n == resident == 1536`**：host store 只镜像 resident 窗口——**被驱逐页没有
+   落进 host store**（goal 语义要求 evicted pages stay recallable by the same scorer）。
+   若 finalize 时 store 仍是 resident 镜像，`_rebuild_select` 的 `block_ok`/
+   `restore_page_rank` 对 2626..2726 这类页 should fail——但 diag 报 packed=1680/sm=0
+   ——**pack 可能"假成功"（restore 到错误页源）——下一轮定罪点**。
+2. **`st.tokens == st.seq_len`（逻辑账追平了 resident 账）**：blockwise apply 后 worker
+   逻辑账不再是"单调逻辑流"——两本账被合并回卷（num_logical 单调不变量在本 fork 的
+   quiescent 语义里本就与 vLLM 原版不同——Core 侧 dbg 抓到的 logical 序列 49152→53248→
+   ...→86670 仍单调，但 worker 侧 tokens 已按回卷记账）——**两本账的"账本语义"需要
+   在本设计里重新钉死**。
+3. console 条件时序修正：本轮 dump 触发窗（_pl-65536）打在压缩中期；**finalize/child
+   时点的同表取证是下一轮第一件事**（判据：store keys vs chosen pages 覆盖、
+   needle_store 真值、baked_nonzero）。
+
+**另排除**：child 由 `is_rebuilt→continue` 完全跳过 runtime（1136-1141 注释亦写明），
+**"runtime 同 rid 残留毒执行"出局**——child 纯引擎 native；问题在**进入 child 之前**
+（store 数据面/pack 面）的残留。
