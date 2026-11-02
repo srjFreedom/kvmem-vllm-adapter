@@ -598,3 +598,17 @@ child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建
 - **OFF 88K needle ✓ `ZX-4417-QJ7` 107.8s**（比历史 150s 更快——stream 抑制补丁在
   OFF 完全休眠，无副作用）；
 - 短式 decode 带宽 56.0/56.8 tok/s（见上，两臂对等）。
+
+## 6.29 Round 27 【验收(1)达成】250K 超池+超窗端到端全对 ×2
+
+- D 阶段核实：fork RoPE cos/sin 表按**模型原生 262144** 分配（base.py:97），
+  max_model_len 不是位置表面——提升窗口只需启动参数 + `KVMEM_SKIP_KV_CHECK=1`
+  （池 226,240 < 250K 的容量校验绕过，10-29 已有先例）。
+- 服务配置：`MAX_MODEL_LEN=250000` + `KVMEM_SKIP_KV_CHECK=1` + `KVMEM_PREFILL_PRESSURE=1`。
+- **判决 2/2**：249,994-token 请求（超池 226,240 且超原窗口 200,000）
+  中档 needle **`ZX-4417-QJ7` 干净**（349.7s / 346.8s）。
+  usage.prompt_tokens=249994（真实长度，入口未裁）。
+- **验收(3) 复核**：250K 两 run resident_pages_max=4323 / seq 69168 **完全相同**
+  （88K/152K 时代 3055/48880——水位随窗口抬升但仍是 prompt 长度无关的常数）；
+  5 压缩刀/run + escape_suppressed + child 重建，事件链全绿。
+  证据 docs/evidence/250k-e2e-round27.txt。
