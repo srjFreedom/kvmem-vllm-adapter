@@ -329,3 +329,18 @@ max(_bpk)`（plugin:836，随 kv_cache_config 组形态变）共同表明：**�
 3. **goal 验收前必须钉死启动几何**（GPU_UTIL 固定 + 启动后打印并校验 bp/pool 常量，
    不一致 fail-closed）——写进 E 阶段清单；实验纪律更新：跨 boot 比较必须先对表
    (want,chosen,bp,pool) 四元组。
+
+## 6.15 Round 11 守卫版验证：两修复实锤、主缺陷仍开放 + 新取证面
+
+- **starvation 修复实锤**：child 最后步 `n_new=2303/654` 都正常调度（此前父永远卡在 86016）；
+  `block_table_updates` 对 child 为空、new_block_ids=[[],[],[],[39,9]]（末步 2 新块，正常）。
+- **child 输入第 N 次确认干净**：30974 ids，needle 句完整、问句逐字在尾、tail_blocks 齐全。
+- **4 连发仍 4/4 稳定错**（guard 版）→ revert 风暴与 starvation 都是真 bug 但**都不是**
+  稳定错的主根因。
+- **新取证面（本 round 发现但未完成）**：fork 有 `kv_cache_block_copies` 引擎通道
+  （gpu/model_runner.py:1262 + worker/utils.py:743：device→device **块内容拷贝**语义）——
+  压缩轮若走这条通道，块视图的 KV 由引擎搬运，与 worker 侧 pack 的写序交互从未核对。
+  下一轮：dump child 每步 `kv_cache_block_copies` + `block_table_updates` 全量，并核对
+  `apply_compaction` 走哪条（channel adopt vs Core copies）。
+- V2 runner 的块表访问面：`input_batch.block_table[gid].get_cpu_tensor()`（非 V1 属性名，
+  前两轮 dump 空手而归即此因）——child 行的实际块 id 序列仍未直接看过。
