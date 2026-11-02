@@ -2434,85 +2434,13 @@ class VllmSparseRuntime:
                 if st.spare == slot:
                     st.spare = None
             if refused and self.log is not None:
-                # The zero guard converted store poisoning into MISSING pages: the page is absent,
-                # the selection cannot offer it, and Core (rightly) refuses a view without the
-                # tail. This is the live signature of "commit reads a page the engine wrote
-                # elsewhere" - the sample gives logical/slot/rank to compare with the map probe.
-                # B1b decisive probe (goal-7833cb61): where DID the bytes of this chunk land?
-                # Reduce every page's layer-0 byte sum and report, for each refused page, the
-                # READ slot vs the true-position slot (the dense id the engine would have used
-                # without the write-address offset) vs logical/rank. A nonzero sum anywhere
-                # EXCEPT sum_at_slot pins the kernel's address ahead of the commit's read.
-                # FULLY guarded: this runs on the forward thread of a compiled engine, and an
-                # escaping exception kills the step's commit (measured: v5 lost the whole run).
-                try:
-                    import torch as _t
-                    _dev0 = orch.kvs[0]
-                    _base = 0
-                    if refused:
-                        _base = int(refused[0][1]) - int(refused[0][0])
-                    _sample = []
-                    for lg, sl, rk in refused[:4]:
-                        def _ps(page):
-                            if page is None or page < 0 or page >= _dev0.shape[0]:
-                                return None
-                            return int(_dev0[int(page)].view(_t.uint8)
-                                       .to(_t.int16).sum().item())
-                        _rs = int(st.row[rk]) if rk < len(st.row) else None
-                        _sample.append({"logical": int(lg), "slot": int(sl), "rank": int(rk),
-                                        "row_slot": _rs,
-                                        "sum_at_slot": _ps(sl),
-                                        "sum_at_row_slot": _ps(_rs),
-                                        "sum_at_true_pos": _ps(lg + _base),
-                                        "sum_at_logical_id": _ps(lg)})
-                    # Where is the written cluster? Scan a WINDOW (bounded memory) around the
-                    # read slots: the page offsets of the nonzero run tell the address shift.
-                    _lo = max(0, (min(int(x[1]) for x in refused) - 200))
-                    _hi = min(int(_dev0.shape[0]), _lo + 1200)
-                    _w = _dev0[_lo:_hi].view(_t.uint8).to(_t.int16).sum(dim=(1, 2, 3)).tolist()
-                    _nz = [_lo + i for i, v in enumerate(_w) if v > 1000]
-                    self.log({"kind": "refused_probe", "req": req,
-                              "tokens": int(st.tokens), "seq_len": int(st.seq_len),
-                              "base": _base, "win": [_lo, _hi],
-                              "nz_in_win": len(_nz), "nz_head": _nz[:8], "nz_tail": _nz[-8:],
-                              "row_len": len(st.row), "sample": _sample})
-                except Exception:
-                    try:
-                        import traceback as _tb2
-                        self.log({"kind": "refused_probe_error", "req": req,
-                                  "error": _tb2.format_exc()[-400:]})
-                    except Exception:
-                        pass
+                # The zero guard converted store poisoning into MISSING pages: the page
+                # is absent from the selection (resident-only view), so Core refuses a
+                # view without the tail. Bisection-era device probes REMOVED after the
+                # round-25 root cause closed (they ran on the forward thread).
                 entry = {"kind": "commit_refused_zero", "req": req, "dense": False,
                          "count": len(refused), "sample": refused[:8],
-                         "tokens": int(st.tokens), "seq_len": int(st.seq_len),
-                         # B1b: did the kernel-authoritative slot mapping exist for this step,
-                         # and did the refused pages' q-positions hit it? (Remove after fix.)
-                         "smap": bool(_smap), "span": list(_sm_span) if _sm_span else None,
-                         "hits": sum(1 for lg, _, _ in refused[:8]
-                                     if _smap and (_sm_span[0] + max(
-                                         0, lg * self.page_tokens - int(st.tokens))) in _smap),
-                         "skeys": (sorted(_smap)[:6] + ["..."] + sorted(_smap)[-3:]
-                                   if _smap else None),
-                         "want_q": [_sm_span[0] + max(0, int(lg) * self.page_tokens
-                                                      - int(st.tokens))
-                                    for lg, _, _ in refused[:4]] if _sm_span else None,
-                         "tb_at": [touched[lg][2] for lg, _, _ in refused[:4]
-                                   if lg in touched and len(touched[lg]) > 2],
-                         "row_at": [int(st.row[rr]) if rr < len(st.row) else None
-                                    for _, rr, _ in [tuple(x) for x in refused[:4]]]}
-                try:
-                    import torch as _t
-                    dev0 = list(self._orch[req].kvs)[0]
-                    sums = dev0.view(_t.uint8).to(_t.int32).sum(dim=(1, 2, 3)).to("cpu").tolist()
-                    entry["nonzero_pages"] = int(sum(1 for v in sums if v > 1000))
-                    want = {}
-                    for lg_, sl_, rk_ in refused[:4]:
-                        want[f"slot_{lg_}"] = sums[sl_] if sl_ < len(sums) else None
-                        want[f"rank_{lg_}"] = sums[rk_] if rk_ < len(sums) else None
-                    entry["sums_at_refused"] = want
-                except Exception:
-                    pass
+                         "tokens": int(st.tokens), "seq_len": int(st.seq_len)}
                 self.log(entry)
             st.tokens += n_new_tokens
             st.seq_len += n_new_tokens
@@ -3133,18 +3061,6 @@ class VllmSparseRuntime:
                     eng_scores[eng] = fv
             rank_blocks = sorted(eng_scores, key=lambda b: -eng_scores[b])
             # DIAGNOSTIC (goal-7833cb61 round-7 bisect, remove after acceptance):
-            # KVMEM_REBUILD_FORCE_BLOCKS replaces the score-ranked middle with a fixed
-            # comma-separated engine-block list - replay the KNOWN-GOOD (no-compaction)
-            # selection on a compacted run. Correct answer => child execution is innocent
-            # and the lossy scoring substrate is guilty; wrong answer => the residue is in
-            # the child execution path itself.
-            import os as _os_rb
-            _fb = _os_rb.environ.get("KVMEM_REBUILD_FORCE_BLOCKS", "")
-            if _fb:
-                rank_blocks = [int(x) for x in _fb.split(",") if x.strip()]
-                if self.log is not None:
-                    self.log({"kind": "rebuild_force_blocks", "req": req,
-                              "blocks": rank_blocks})
             tail_blocks = {p // bp for p in forced_tail}
             # a block enters the pack ONLY when every page inside it is complete AND has
             # canonical store bytes (or is the engine-resident tail): a hole would shift
@@ -3174,7 +3090,7 @@ class VllmSparseRuntime:
                     continue
                 middle.append(b)
                 _mid_set.add(b)
-                if (not _fb and len(middle) < room and b + 1 not in tail_blocks
+                if (len(middle) < room and b + 1 not in tail_blocks
                         and b + 1 not in _mid_set and block_ok(b + 1)):
                     middle.append(b + 1)
                     _mid_set.add(b + 1)
@@ -3227,12 +3143,6 @@ class VllmSparseRuntime:
         if max(selected) < n_pages - 1:
             return False, "selection lost the question tail"
         # 3) validate the packed physical row: ascending pool pages, unique, block-aligned
-        if self.log is not None:
-            self.log({"kind": "rebuild_phys_diag", "req": req,
-                      "n": len(phys), "sel_head": selected[:4], "sel_tail": selected[-4:],
-                      "phys_head": phys[:4], "phys_tail": phys[-4:],
-                      "block_first": [p // bp for p in phys[:4]],
-                      "block_tail": [p // bp for p in phys[-4:]]})
         if len(phys) != len(selected) or min(phys) <= 0 or len(set(phys)) != len(phys):
             return False, f"packed row invalid (pages={len(selected)}, uniq={len(set(phys))})"
         # The packed destination runs over CONSECUTIVE pool pages starting at a block base

@@ -796,6 +796,23 @@ def _attach_sparse(runner, log_path):
                 # do not test for "prefix" first (measured: the tested guard never matched,
                 # every pressure trigger died as an empty proposal).
                 runtime.compact_mode = "quiescent"
+                # GEOMETRY FAIL-CLOSED (goal-7833cb61 round 29): boot pool geometry
+                # drifts (201,438 / 226,240 measured across boots at the same GPU_UTIL).
+                # The pressure watermark must FIT the pool with the full final-chunk
+                # margin (one chunk of 4096); otherwise compaction triggers late or not
+                # at all and the run stalls at the pool ceiling - so a misfit pool
+                # disables the pressure arm and falls back to the production (OFF)
+                # semantics instead of starting a doomed experiment.
+                _wm = int(cfg.get("budget_tokens", 36864)) + \
+                    int(cfg.get("gen_reserve_tokens", 16384)) // 2
+                if runtime.pool_ceiling_tokens < _wm + 4096:
+                    runtime.prefill_pressure = False
+                    runtime.compact_mode = ""
+                    _append(log_path, {"kind": "pressure_disabled_geometry", "pid": os.getpid(),
+                                       "ceiling": int(runtime.pool_ceiling_tokens),
+                                       "watermark": _wm})
+                    print(f"[kvmem] PRESSURE DISABLED: pool ceiling "
+                          f"{runtime.pool_ceiling_tokens} < watermark+margin {_wm + 4096}")
             import os as _os
             runtime.blockwise_view = bool(int(_os.environ.get("KVMEM_BLOCKWISE", "0") or 0))
             runtime.install_row_in_view = bool(int(_os.environ.get("KVMEM_INSTALL_ROW_VIEW", "0") or 0))
@@ -1756,7 +1773,7 @@ def register():
                 try:
                     import os as _os2
                     _df = "/tmp/kvmem_child_prompt.json"
-                    if True:
+                    if _os2.environ.get("KVMEM_CHILD_DUMP", "") in ("1", "true"):
                         with open(_df, "w") as _fj:
                             _fj.write(json.dumps({"pages": list(pages)[:8] + ["..."] +
                                                   list(pages)[-4:], "ids": token_ids}))
@@ -2381,13 +2398,10 @@ def register():
                         # past the working set, long before the pool would (a). Quiescent
                         # condition (no drafts in flight) is exactly safe: the pressure moves
                         # happen between steps, never under speculative verification.
-                        # DIAGNOSTIC (goal-7833cb61 bisect, remove after acceptance):
-                        # KVMEM_PRESSURE_HIGH_TOKENS overrides the watermark - set it above
-                        # any prompt length to disable (c) compaction while KEEPING the
-                        # over-budget finalize, isolating finalize bugs from compaction
-                        # residue.
-                        _hi = int(_os_p.environ.get("KVMEM_PRESSURE_HIGH_TOKENS") or 0) or \
-                            int(cfg.get("budget_tokens", 36864)) + \
+                        # watermark = budget + half the generation reserve: compaction
+                        # fires with room to spare, and the bounded resident book peaks at
+                        # the watermark (acceptance (3) evidence via pressure_gate).
+                        _hi = int(cfg.get("budget_tokens", 36864)) + \
                             int(cfg.get("gen_reserve_tokens", 16384)) // 2
                         _step = int(cfg.get("gen_reserve_tokens", 16384)) // 4
                         _last = getattr(scheduler, "kvmem_pressure_last", None)
@@ -2845,15 +2859,13 @@ def _install(cls, module_name, probe, smoke, state):
                                    "orch": runtime._orch.get(req),
                                    "index": runtime._retrieval.get(req),
                                    "stats": runtime._statistics.get(req)})
-                    if runtime.is_rebuilt(req) and not getattr(
-                            runtime, "rebuild_full_hooks", False):
-                        # BISECT SWITCH (goal round 24): KVMEM_REBUILD_FULL_HOOKS=1 lets the
-                        # rebuilt child run the SAME step_end bookkeeping as any fresh
-                        # request (advance/commit/statistics). The child IS a fresh prompt;
-                        # the suppression was written when its books still carried the
-                        # parent generation. Never exercised on the OFF arm (no child ever
-                        # ran there), and it is the LAST surviving difference vs a fresh
-                        # replay of the identical ids that answers correctly.
+                    if runtime.is_rebuilt(req):
+                        # rebuilt children run FULLY engine-native: no worker bookkeeping
+                        # on top of the engine's own dense prefill (the reconstruction
+                        # requeues a fresh request whose prompt ids ARE the full view;
+                        # accept_reconstruction already retired the parent generation).
+                        # The round-24 bisect switch (rebuild_full_hooks) was proven inert
+                        # - the child never had a runtime state to hook - and is removed.
                         continue
                     if cap is not None:
                         cap.note_tokens(int(n_new))
