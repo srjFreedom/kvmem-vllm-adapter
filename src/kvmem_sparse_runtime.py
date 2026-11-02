@@ -343,7 +343,8 @@ class VllmSparseRuntime:
         except Exception:
             return False
         return bool(self.compact_rebuild and st.compacted_in_prefill and not st.rebuilt
-                    and not self.is_rebuilt(req))
+                    and not self.is_rebuilt(req)
+                    and not getattr(self, "prefill_pressure", False))
 
     def finish_prompt_for_reconstruction(self, req, n_new, logical_end, resident_end):
         """Commit the final forward and queue its selected tokens before any sample escapes."""
@@ -2522,7 +2523,23 @@ class VllmSparseRuntime:
                 self.log({"kind": "query_reselect", "req": req, "tokens": int(st.tokens),
                           "prompt": prompt_len, "n_new": int(n_new_tokens or 0)})
                 self._reselect(req, probe=True)
-            elif (not bool(getattr(self, "sched_compact", False))
+            elif True:
+                # DIAGNOSTIC (goal-7833cb61 B1): log the gate state once per 16K tokens so a
+                # silent non-firing is distinguishable from a throttled one. Remove after the
+                # pressure path lands acceptance.
+                if (getattr(self, "prefill_pressure", False)
+                        and int(st.tokens) % 16384 < 4096 and self.log is not None):
+                    self.log({"kind": "pressure_gate", "req": req,
+                              "tokens": int(st.tokens), "seq_len": int(st.seq_len),
+                              "row": len(st.row), "resident": len(orch.resident),
+                              "high": int(high), "sched": bool(getattr(self, "sched_compact", False)),
+                              "flag": bool(getattr(self, "prefill_pressure", False)),
+                              "npc": bool(self.no_prefill_compact),
+                              "hw": int(self.prefill_high_watermark),
+                              "bp": int(self.selector.budget_pages()),
+                              "bt": int(self.budget_tokens),
+                              "pc": int(self.pool_ceiling_tokens)})
+            if (not bool(getattr(self, "sched_compact", False))
                   and (getattr(self, "prefill_pressure", False) or not self.no_prefill_compact)
                   and prefill_pressure_due(
                       st.tokens,

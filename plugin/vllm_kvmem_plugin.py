@@ -425,6 +425,11 @@ def _attach_adapter(runner, log_path):
     cfg = _config()
     budget = cfg.get("resident_tokens")
     budget = int(budget) if budget else None
+    if budget is None and bool(cfg.get("prefill_pressure", False)):
+        # Bounded in-prefill residency (goal-7833cb61, kvmem 0.19 P3-1): the core default
+        # (pool-wide budget) makes the pressure watermark unreachable for prompts below the
+        # pool; scale the host-store budget with the entry window instead.
+        budget = int(cfg.get("budget_tokens") or 0) or None
     _append(log_path, {"kind": "geometry", "pid": os.getpid(),
                        "paged_tensors": len(paged), "shape": list(sample.shape),
                        "block_tokens": block_tokens, "page_tokens": page_tokens,
@@ -619,7 +624,9 @@ def _attach_sparse(runner, log_path):
         # The kvmem contract parameters: the planner needs B/R verbatim (defaults would plan a
         # 32768-token view and drive the R cadence from 16384, both wrong for this site).
         select_block_tokens=int(cfg.get("select_block_tokens", 128)),
-        budget_tokens=int(cfg.get("budget_tokens", 32768)),
+        budget_tokens=(max(4096, int(cfg.get("budget_tokens", 32768)) - 8192)
+                       if cfg.get("prefill_pressure")
+                       else int(cfg.get("budget_tokens", 32768))),
         gen_reserve=int(cfg.get("gen_reserve_tokens", 16384)),
         recent_tokens=int(cfg.get("recent_tokens", 1024)),
         host_mib=int(cfg.get("host_mib", 16384)),
@@ -797,7 +804,11 @@ def _attach_sparse(runner, log_path):
                 # Resident prefill borrows the physical pool for its first pass. The old B-derived
                 # watermark compacted repeatedly inside a 161K pool and faulted near token 81K;
                 # after the first physical-pressure compaction, R still drives later selections.
-                if not runtime.no_prefill_compact:
+                if not runtime.no_prefill_compact and not getattr(
+                        runtime, "prefill_pressure", False):
+                    # Bounded residency (goal-7833cb61): with the pressure flag the watermark
+                    # STAYS budget-derived (bp+64) - "resident scales with budget, not T" is the
+                    # kvmem 0.19 P3-1 exit criterion. Pool borrowing stays the default (OFF) path.
                     runtime.prefill_high_watermark = _cap
             except Exception:
                 pass
