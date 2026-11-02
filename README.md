@@ -215,6 +215,16 @@ Session reuse rides the same switch (`KVMEM_SESSION_REUSE=1` default): pass
 `X-Session-ID: <id>` on chat requests and a finished conversation parks its prefix at the
 checkpoint frontier; the next turn with the same id resumes from it.
 
+Bounded in-prefill residency (experimental, default OFF): `KVMEM_PREFILL_PRESSURE=1`
+makes prefill itself roll a watermark compaction (sink+tail+scored blocks, unselected pages
+spilled to host) and rebuilds the selected view from host storage at prompt completion -
+verified 2/2 at 250K tokens, beyond both the physical pool (226,240) and the historical
+200,000 window (`ZX-4417-QJ7`, see docs/design-prefill-pressure.md §6.25-6.29). The arm is
+fail-closed at boot: a pool too small for watermark+margin disables it automatically
+(`pressure_disabled_geometry` in the sparse log). Production keeps the end-of-prompt rebuild
+above. Long prompts additionally need `MAX_MODEL_LEN` above the prompt and
+`KVMEM_SKIP_KV_CHECK=1` (the RoPE table itself sizes at the model's native 262,144).
+
 The constraint that bites: **engine window = `N × (B + R)` must fit the KV pool** (201,438 tokens on
 this box at `GPU_UTIL=0.972`; CUDA-graph buffers cost ~2.5K tokens versus eager, and 0.97 drops the
 pool below `MAX_MODEL_LEN=200000` - measured OOM). Defaults (`N=1, B+R=53,248`) leave a large margin; `N=2` → 106,496, `N=3` → 159,744,

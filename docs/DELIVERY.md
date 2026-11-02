@@ -8,6 +8,18 @@
 > 被迫 eager 时代）见 git log 与 `docs/design-mtp-draft-ledger.md`（工程账本，含各
 > Amendment 的失败证据链）。
 
+## A/B 锚点方法（round-28 定案）
+
+响应 JSON 去 `id`/`created` 两个 volatile 字段、递归去 null、`sort_keys` 序列化 →
+sha256 前 16 位。**模型 FP8 文件重生成必须与锚点配对重生成**。
+- v0.4.0 时代归档对（`gate-round3-head/old`）在该口径下 A=`abb9428febcc224f`、
+  B=`633ffee075d59cde` **逐字节一致**（当时金标准成立）；旧记法 c2f36446/42675199
+  与 0013e530 系算法口径不一，作废。
+- 当前模型代（v0.4.0 后重量化）round-28 重放锚点：A=`a382bb147d58c82b`、
+  B=`8ddab0947b003860`（请求=zh「用一句话解释 KV cache 是什么。」mt=100 /
+  en「List three prime numbers greater than 100.」mt=64，temperature=0，同 boot
+  内除 id/created 外全字段逐字节稳）。
+
 ## 摘要
 
 **v0.4.0 = 编译 + CUDA graph + MTP4 + 会话复用的生产形态**，单实例端到端验收全绿：
@@ -29,6 +41,18 @@
 5. **无损门（每轮复测）**：短请求 A/B 输出与 eager/spec0 基线逐字节一致
    （sha `c2f3644600da41bb` / `426751992d476adc`）；冷×2 逐字节一致；恢复路径输出
    跨重启、跨 eager/graph、跨桥重写稳定（sha `6f56aadf80e4d4b4`）。
+
+6. **有界常驻压缩（实验开关 `KVMEM_PREFILL_PRESSURE=1`，默认关=生产不经过）**：
+   prefill 期间按水位（budget+gen_reserve/2）滚动压缩——sink+尾块+评分选块、未选页
+   回写主机；**prompt 完成时用主机存储重建选中视图并重排队**（同一请求 id 的全新引擎
+   代），生成流逃逸样本在 update_from_output 处按**单调逻辑账本**判据抑制。端到端实测
+   （2026-11-02 rounds 25-27）：88K 7/7、152K 2/2、**250K（超池 226,240 且超原窗
+   200,000）2/2 全部干净答出 `ZX-4417-QJ7`**；resident 峰值 88/152K=3055 页、
+   250K=4323 页——**随窗口常数、与 prompt 长度无关**（`pressure_gate` 事件为证）。
+   启动几何 fail-closed：池顶 < 水位+4096 时自动禁用该臂回落生产语义
+   （`pressure_disabled_geometry` 事件）。RoPE 位置表按模型原生 262,144 分配，
+   加长窗口只需 `MAX_MODEL_LEN` + `KVMEM_SKIP_KV_CHECK=1`。设计与验收全程见
+   `docs/design-prefill-pressure.md` §6.1-6.31、`docs/evidence/`。
 
 ## 一、克隆即可运行
 

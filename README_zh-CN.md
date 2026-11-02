@@ -150,6 +150,14 @@ CUDA-graph 缓冲比 eager 多吃约 2.5K token，0.97 会把池压到 `MAX_MODE
 
 `THINKING_BUDGET` 默认为空 = **思考 token 无上限**；填数字才会限制推理长度。
 
+有界常驻压缩（实验开关，默认关）：`KVMEM_PREFILL_PRESSURE=1` 让 prefill 期间按水位
+（B+R/2）滚动压缩——sink+尾块+评分选块、未选页回写主机，prompt 完成时用主机存储重建
+选中视图并重排队。实测 250K token（超池 226,240 且超原窗 200,000）端到端 2/2 答对
+`ZX-4417-QJ7`（详见 docs/design-prefill-pressure.md §6.25-6.29）。该臂启动即
+fail-closed：池顶不足水位+余量时自动禁用并回落生产语义（`pressure_disabled_geometry`
+事件）。超长 prompt 另需 `MAX_MODEL_LEN` 高于 prompt 且 `KVMEM_SKIP_KV_CHECK=1`
+（RoPE 位置表本身按模型原生 262,144 分配，不是瓶颈）。
+
 改完 `sudo systemctl restart kvmem-vllm` 生效（无热改），`kvmem-params.env` 记录本次生效值。
 
 ## 运维
