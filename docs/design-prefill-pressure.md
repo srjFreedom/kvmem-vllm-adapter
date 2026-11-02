@@ -369,3 +369,18 @@ child 复用父的 row index（同 rid），**父的块行从未清空**：child
 **修复方案（下一轮实施）**：worker `execute_model` 入口的 rebuilt-admission 钩子处
 （scheduled_new_reqs + kvmem_rebuilt，本在 forward 之前）清掉 child row 的
 group-3 块行并按 `_nr.new_block_ids` 重装 child 自己的块；配套 dump 验证 nz==1936 级别。
+
+## 6.17 Round 11 收官：行复位修复落地并实测生效（但主缺陷未全闭）
+
+- `rebuild_row_reset` 事件 ×8（4 run × 2 rank）；child 最后步块行实测 **5454→2020**
+  （=20 块×101 页，head 连续 1212…，groups 0-2 各 5 块为 child 自己的 state 块）——
+  stale-row 污染是**真 bug、已修、已验证生效**。
+- 但答案仍 4/4 稳定错 → stale row 是**必要条件之一而非唯一根因**。child 现在：
+  文本正确（解码证）、块行纯净（实测）、Core 账本干净（dbg）、runtime 不碰 child（console）、
+  GDN groups 行干净——**剩余未直接观测面：GDN 运行态 slot 的字节内容**（has_initial_states
+  理论保护，但本 fork 有 fast_prefill/valid_state_slots 自定义路径，1617 行附近）；
+  以及 **child 第一步（forward 中）的 slot_mapping**（本 dump 是 step_end 视角，
+  第一步 append 前 reset 已生效，但首步 forward 用的镜像顺序未逐 token 核过）。
+- 本轮累计修复三个真缺陷（revert 风暴、last-chunk starvation、stale block row），
+  pressure 臂行为已从"玄学抖动"收敛为"确定性、输入完整、行纯净、仍错"——
+  每一层都比上一层更接近真相。

@@ -2421,6 +2421,34 @@ def _install(cls, module_name, probe, smoke, state):
                         _rt0.accept_reconstruction(_rid)
                         state.get("computed_before", {}).pop(_rid, None)
                         state.get("was_decode", {}).pop(_rid, None)
+                        # ROOT-CAUSE FIX (goal-7833cb61 round-11): the rebuilt child REUSES
+                        # the parent's row in V2's BlockTables (same request_id). The engine
+                        # tracks the append offset PER ROW (`num_blocks.np`), which the
+                        # detach/requeue never resets - so the child's blocks were APPENDED
+                        # at the parent's stale offset (measured: the child's attention row
+                        # held 5454 nonzero entries - the parent compaction-era block view -
+                        # with its own 20 blocks only at the tail; the child attended over
+                        # the parent's fragments and answered fluently and wrongly,
+                        # deterministically). Reset the row counter and zero the row here,
+                        # before this step's append; the engine then installs the child's
+                        # fresh block ids from column 0 exactly like a brand-new request.
+                        try:
+                            _bt = getattr(self, "block_tables", None)
+                            _rs = getattr(self, "req_states", None)
+                            _idx = _rs.req_id_to_index.get(_rid) if _rs else None
+                            if _bt is not None and _idx is not None:
+                                for _g in range(int(getattr(_bt, "num_kv_cache_groups", 0))):
+                                    _bt.num_blocks.np[_g, _idx] = 0
+                                    _row = _bt.block_tables[_g].gpu
+                                    _row[_idx].zero_()
+                                _bt.num_blocks.copy_to_uva()
+                                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                        {"kind": "rebuild_row_reset", "req": _rid,
+                                         "idx": int(_idx), "pid": os.getpid()})
+                        except Exception:
+                            _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                    {"kind": "rebuild_row_reset_error", "req": _rid,
+                                     "error": traceback.format_exc()[-300:]})
                         continue
                     _nlg = int(getattr(_nr, "num_logical_tokens", 0) or 0)
                     _npc = int(getattr(_nr, "num_computed_tokens", 0) or 0)
