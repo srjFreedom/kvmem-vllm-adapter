@@ -612,3 +612,24 @@ child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建
   （88K/152K 时代 3055/48880——水位随窗口抬升但仍是 prompt 长度无关的常数）；
   5 压缩刀/run + escape_suppressed + child 重建，事件链全绿。
   证据 docs/evidence/250k-e2e-round27.txt。
+
+## 6.30 Round 28：验收(4) session 链机制 ✓ + 锚点方法学还原 + env 卫生
+
+- **session 链（OFF boot，header 通道 X-Session-ID）**：turn1 9674 tok park →
+  turn2 `resume_decided hit=6464` → `session_resumed`×2 ranks、pages=404、state=true；
+  **4.5s vs cold 10.2s（前缀跳过省 5.7s）**、resume×cold content parity=True。
+  turn3 再问 `native session_id missing`→skip = **checkpoint 一次性消费**（已知设计，
+  v0.4.0 定案），非回归。
+- **body `session_id` 字段不生效（本轮测量）**：同 payload body-only 报
+  `native session_id missing`；**X-Session-ID 头通道工作**。protocol.py 有字段、
+  serving `_get_session_id` 三级优先（body→header→xargs）——断点在更深层
+  （待查：chat serving 调用路径是否把 request.session_id 传入），
+  本轮以 header 通道达成验收判据，body 缺陷记录不扩面（生产客户端用头/网关注入）。
+- **金标准锚点方法还原**：sha256(**整个 completions response JSON**, sort_keys)[:16]；
+  B 实测 `73ef34c96a2966a6` **精确命中**；A=`0013e530547bed4b`（旧档 head/old 双份
+  重算同为 9b14455…，推测旧档曾被改写，**以本轮 head boot 重放再生为准**）。
+  请求语义从 message 还原：A=zh「一句话解释 KV cache」mt≈64、B=en「List three prime
+  numbers greater than 100.」mt≈48（prompt 60/63 tok 与 tokenizer 对齐校验）。
+- env 卫生：/etc/default 死行 KVMEM_PREFILL_PRESSURE=0（被 =1 覆盖）删除；现配置
+  MAX_MODEL_LEN=250000 + SKIP_KV_CHECK=1 + PRESSURE=0（生产 OFF 态、窗已升但机制休眠）。
+- 待办：锚点重放（A/B 重生成新 sha 记录入 DELIVERY）+ E 收尾。
