@@ -126,3 +126,26 @@ candidates, without graph propagation or cold recall"。改造计划 P3-1 退出
   为 lagged commit 准备的 kernel slot-mapping 通道在 prefill 步全部查空，退到过期 stage 镜像。
 - 修复方向：prefill commit 改用捕获的 slot_mappings（或 bridge 同一张量）寻址；
   禁止再信任 dense 延续预测。诊断（pressure_gate/refused_probe/nblocks）验收后移除。
+
+## 6.6 Round 3 落地（B1c/C/D 接通，88K pressure 端到端首过）
+
+- **B1c（地址）**：lagged commit 读块表镜像会踩 allocator 池头复用（"logical+base" 预测失效）；
+  kernel 权威 tensor 在 compiled 管线里读时已被重填（实测 skeys=[0], hits=0）。
+  修复 = step_end 快照 `capture_slot_mapping`（仅 pressure 的 prefill 步，OFF 零成本），
+  commit 地址链优先快照。效果：每轮压力压缩选满 1792 页，`commit_refused_zero` 清零，
+  常驻恒定 28672（峰 40960=预算+chunk），P3-1 账面达成。
+- **Phase C（final reselect）**：pressure 分支 prompt 末跑 query 重选
+  （`pressure_final_reselect`），needle 页 2704-2712 召回进视图、旋转 24/24 自洽。
+  但**仅 reselect 不够**：GDN/hidden 状态是在有损压缩视图上流算出来的，答案复读
+  `MID-KEY`（表示层丢针）——与原版 P1/P2 注记一致（P1 召不回中间针，需重算定稿）。
+- **Phase D（finalize）**：`finish_prompt_for_reconstruction` 在 pressure 档改走
+  `_rebuild_queue` → Core quiescent 边界的 `_rebuild_select`（store 逻辑坐标、n_pages 守卫、
+  TP2 共识）→ 全新 admission 重算选中视图（1680 页, store_missing=0）→ 状态与视图一致。
+  v12 崩溃根因 = 旧入口 `_reselect(rebuild=True)` 把**压缩视图坐标页**送进按**原始 prompt**
+  校验的 `select_tokens`（两坐标混用即死，注释在案）。
+- **实测**：v14 88K pressure `ZX-4417-QJ7` 正确 136.8s。
+  v15 同输入事件链逐字段一致（选页/打包确定）但输出翻错——**落地 slot 受分配器复用顺序
+  影响 → kernel 数值路径变 → 近阈值 needle 不稳**。开放缺口=pressure 稳定性（下轮）。
+- **生产回归（金标准）**：HEAD 全部改动 vs 060eda0(v0.4.0) 同实例 A/B **逐字节一致**
+  （A `0013e530…`、B `73ef34c9…`；旧 sha c2f36446/42675199 系算法口径不明，E 阶段以新算
+  法+新锚点更新 DELIVERY 表）；88K OFF needle ✓ 107.8s；离线 10/10。
