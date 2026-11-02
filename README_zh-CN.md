@@ -133,7 +133,7 @@ run-kvmem-vllm.sh   实现（每个参数都是 ${VAR:-default}）
 ```
 
 默认：`B=36864 R=16384 N=1 GPU_UTIL=0.972`（并带 `KVMEM_SESSION_REUSE=1`、
-`KVMEM_MAX_MODEL_LEN=200000`、`VLLM_SM75_SPEC_SYNC_MODE=nosync`、MTP `spec=4`——
+引擎窗口跟 CTX 推导（clamp 到模型原生 262,144）、`VLLM_SM75_SPEC_SYNC_MODE=nosync`、MTP `spec=4`——
 v0.4.0 端到端验证过的组合），profile 用仓库自带的
 `2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env`。唯一必须提供的是 `MODEL`（权重目录）；只有模型没有内置 chat template 时才需要给 `CHAT_TEMPLATE_FILE`；其余参数用环境变量覆盖，或写进 `~/.config/kvmem-vllm.env`
 （单元存在则加载）：

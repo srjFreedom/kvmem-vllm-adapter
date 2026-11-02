@@ -182,7 +182,7 @@ run-kvmem-vllm.sh   implementation (every knob is ${VAR:-default})
 ```
 
 Defaults: `B=36864 R=16384 N=1 GPU_UTIL=0.972` (with `KVMEM_SESSION_REUSE=1`,
-`KVMEM_MAX_MODEL_LEN=200000`, `VLLM_SM75_SPEC_SYNC_MODE=nosync` and MTP `spec=4` - the
+the engine window follows CTX (clamped at the model-native 262,144), `VLLM_SM75_SPEC_SYNC_MODE=nosync` and MTP `spec=4` - the
 combination validated end-to-end in v0.4.0) with the shipped
 `2x2080Ti/qwen27b/w8a16/mtp4-fp8kv-1x184K-text-image.env` profile. The only required input is
 `MODEL` (your weights directory); set `CHAT_TEMPLATE_FILE` only when the model ships no built-in
