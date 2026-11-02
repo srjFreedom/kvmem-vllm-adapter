@@ -469,3 +469,23 @@ stale 页"**——pack 写了 1680 页，child 需要 1936 页——中间空洞
 半成品期间 reserver 骨架保持 no-op（range(1,1)）。
 
 **运维**：NEW_RID env 已撤（实验开关默认 OFF，fail-closed 语义恢复）。
+
+## 6.22 Round 23 交叉判决（最硬证据）：同 boot 同轮同 ids——requeue child ✗ / fresh replay ✓
+
+- pack-follows-allocation 已实施并**实测无效**（restored=303/err 修光/同步门加上仍错）；
+  本 round 整体回退（工作树回到 96c593d，离线 6/6 绿）。原因事后清晰：child 的
+  prefill 对全 prompt **逐 token 重算 KV**，pack 字节对它本来就是死数据——round-20 的
+  "pack 空洞"理论**由本轮判决取代**。
+- **判决实验（干净版 boot markerAN，同轮三步）**：
+  1. STEP1 chat 88K（压缩+(c)+finalize+requeue child）→ `No special access code recorded.`
+  2. STEP2 **同一 boot 同一实例**用**本轮 child 的精确 ids** 走 fresh completions →
+     **✓ `ZX-4417-QJ7`**（31.4s）
+  3. 本轮 child 文本：needle 句 ✓（frac 0.251）、真问句 ✓（frac 0.867）——选择质量达标。
+- **推论（排除法闭合）**：同实例/同池状态/同字节 ids/同采样参数，唯一差值=
+  **请求进入引擎的方式**（requeue-with-detach vs native admission）。
+  NEW_RID 实验（round 20）已把"同一身份的残表"排除，剩下的差值在 **requeue 时序本身**
+  （detach 与 re-add 同轮原子性、kv_cache_manager 对父块的回收 vs child 分配的顺序耦合、
+  update_from_output 观察面）——child 生成的前缀里模型"看见了"某种未被 replay 复刻的
+  东西。round-24 取证=child 首 decode 步的 sampled token 概率面（top-k）对表 replay。
+- **运营注**：88K 生产臂（pressure OFF）不受影响（round-3 起从未走过 child 协议——全历史
+  OFF boot 零 rebuild 事件，round-18 事件扫描证）；child 协议迄今**从未端到端成功过一次**。
