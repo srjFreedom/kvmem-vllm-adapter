@@ -573,6 +573,23 @@ class VllmSparseRuntime:
                                   - int(self.budget_tokens)})
                     except Exception:
                         pass
+                    # CTX IS A VIRTUAL CEILING (2026-11-03, user architecture note): with
+                    # bounded residency the GPU working set is the watermark B (+R) - it
+                    # never needs the window; what actually bounds CTX is host memory.
+                    # Without a disk tier, a prompt whose pages exceed the session's H
+                    # share DROPS the spilled pages silently, and the rebuild/recall path
+                    # loses exactly the bytes its correctness depends on. Self-limit the
+                    # ceiling to what H fits instead of answering wrong later.
+                    try:
+                        if (int(getattr(self, "disk_mib", 0) or 0) <= 0
+                                and int(getattr(self, "ctx_tokens", 0) or 0) > int(share_tokens)):
+                            self.log({"kind": "host_capacity_short", "req": req,
+                                      "ctx_tokens": int(self.ctx_tokens),
+                                      "share_tokens": int(share_tokens),
+                                      "action": "ctx self-limited to the H share"})
+                            self.ctx_tokens = int(share_tokens)
+                    except Exception:
+                        pass
                 except Exception as exc:
                     from kvmem_session_budget import BudgetError
                     if isinstance(exc, BudgetError):

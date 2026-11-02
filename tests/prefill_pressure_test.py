@@ -59,5 +59,11 @@ dp = src(os.path.join(ROOT, "deploy", "run-kvmem-vllm.sh"))
 check("deploy default is OFF (fail-closed)",
       "KVMEM_PREFILL_PRESSURE=${KVMEM_PREFILL_PRESSURE:-0}" in dp)
 
+# v0.5.x architecture note: CTX is a VIRTUAL ceiling; with no disk tier it must
+# self-limit to the host share (spilled pages the rebuild needs cannot be dropped).
+_rs = src("src/kvmem_sparse_runtime.py")
+check("CTX self-limits to the H share without a disk tier",
+      "host_capacity_short" in _rs and "self.ctx_tokens = int(share_tokens)" in _rs)
+
 print(("PASS " if not failed[0] else "FAIL ") + "prefill_pressure_test")
 sys.exit(1 if failed[0] else 0)
