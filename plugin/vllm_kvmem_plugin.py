@@ -2002,11 +2002,18 @@ def register():
                 ids = [int(t) for t in (token_ids or ())]
                 if not ids:
                     return {"ok": False, "error": "empty rebuild token list"}
-                outs = list(getattr(old, "output_token_ids", ()) or ())
-                n_out = getattr(old, "num_output_tokens", None)
-                if n_out is not None:
-                    outs = outs[:max(0, int(n_out))]
-                new_prompt = ids + outs
+                # THE ESCAPED-SEED FIX (goal-7833cb61 round 25 ROOT CAUSE): a sample can
+                # escape the parent between the finalize queue and the requeue landing in
+                # schedule() (measured: the parent emitted "No" - completion_tokens=7
+                # beginning with it). The three-arm replay of the child ids settled it:
+                # plain ids -> ZX-4417-QJ7; ids + the escaped "No" -> " special access
+                # code recorded." (the exact production child answer); ids + "The" ->
+                # correct. The escape POISONS the rebuilt prompt. On rebuild the old
+                # generation stream is REPLACED wholesale by the selected pages - the
+                # parent's samples carry no authority - so drop them (fail-closed: the
+                # client stream continues from the child's first sample).
+                outs = []
+                new_prompt = ids
                 if len(new_prompt) >= int(getattr(old, "num_prompt_tokens", 0) or 0):
                     return {"ok": False, "error": "rebuild not shrinking",
                             "new": len(new_prompt),

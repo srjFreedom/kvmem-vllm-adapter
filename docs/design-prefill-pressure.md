@@ -541,3 +541,23 @@ stale 页"**——pack 写了 1680 页，child 需要 1936 页——中间空洞
   判决实验（round 26，离线）：把 child ids 去掉尾部 1 token 或替换该 token 重放——
   若答案随该 token 翻转 ⇒ "No" 源头=父逃逸样本（修复=finalize 前禁止任何样本逃逸 /
   丢弃 outs）；若不翻转 ⇒ 转真钩子放开二分。
+
+## 6.26 Round 25 【根因定罪 + 首次端到端通过】：逃逸样本毒化 child prompt
+
+**三臂 replay 判决（同 boot，离线零引擎介入）**：
+| 臂 | prompt | 结果 |
+|---|---|---|
+| A | child ids 原样 30974 | ✓ `ZX-4417-QJ7` |
+| B | + 逃逸 token "No"(2665) | ✗ ` special access code recorded.`（**逐字复现生产 child 答案**）|
+| C | + 替代 token "The" | ✓ 含码 |
+
+**根因**：父 prompt-complete 步的采样在 finalize/requeue 前 2 个 round 逃逸
+（654 末步：schedule 时 unknown-complete，update_from_output 即发出 "No"）→
+`queue_kvmem_reconstruction` 把它拼进 child prompt（nids=30975=dump+1）→
+child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建代换整条生成流，
+父样本无权威——设计语义本就是"替换"）。
+
+**验证（同 boot 4 连发）**：needle=**True ×4**（'NoZX-4417-QJ7'）——内容含正确码，
+130s 稳定。**残留卫生缺陷**：逃逸的 "No" 已流入客户端累积器（detach 不截断 SSE 已发
+部分）——流抑制=下一刀（schedule 时识别 prompt-complete 步 → update_from_output
+丢弃该 rid 该步样本；判定式 `num_computed+n_new == num_prompt_tokens and prompt>budget`）。
