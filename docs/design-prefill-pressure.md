@@ -646,3 +646,17 @@ child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建
   模型文件被重生成，前缀 cache/OOM 排障期间）——非适配器代码。
   **今后锚点纪律**：模型文件变（sha256sum config+safetensors index）⇒ 锚点必重生成，
   记录配对（模型代 → 锚点集）。E 阶段 DELIVERY 更新按此写。
+
+## 6.32 Round 30：引擎窗口改由 CTX 推导（用户指令）
+
+- `backends/vllm/worker.py`：`KVMEM_MAX_MODEL_LEN` 未显式给时 **MAX_MODEL_LEN =
+  min(CTX, 模型原生 max_position_embeddings)**（本模型 524,288→262,144；读 config.json
+  含 text_config 嵌套）。fork 语义核验（config/model.py:2518-2545）：显式窗口超模型上限
+  直接 ValueError——clamp 是必须项，不是保守项。
+- deploy/run-kvmem-vllm.sh 默认 200000 → **透传空**（显式给值才钉窗）；
+  站点 launcher line 33 默认 200000 → 透传空；/etc/default 删 MAX_MODEL_LEN=250000。
+- 实测（CTX 窗口 boot）：`--max-model-len 262144` ✓；88K pressure 130.9s ✓、
+  250K pressure 350.2s ✓ 全干净；短 A/B 同 boot 逐字节稳（A=7cbd5fec679a43c6、
+  B=2e33994b033185cd——与 r28 值差=窗口参数变（250000 是 r28 中途注入、从未跑过 boot），
+  锚点纪律"配置变→锚点配对重生成"的又一次应用）；OFF 88K 回归 ✓ 107.8s 带内。
+- KVMEM_SKIP_KV_CHECK=1 仍必需（窗口 262,144 > 池 226,240 的容量校验）。

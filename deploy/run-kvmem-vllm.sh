@@ -52,7 +52,10 @@ export KVMEM_SESSION_REUSE=${KVMEM_SESSION_REUSE:-1}
 # 显式引擎窗口上界（resident 模式）：auto-fit(-1) 会把 rotary 等缓冲压到池以下，
 # 更长的 prompt 变成非法访问而不是干净报错（worker.py 注释记录过实测）。2x22G SM75
 # + GPU_UTIL=0.972（池 201,438 tokens）的安全上界是 200000；显存不同的机器请覆盖。
-export KVMEM_MAX_MODEL_LEN=${KVMEM_MAX_MODEL_LEN:-200000}
+# Bounded residency (2026-11-03): the engine window FOLLOWS CTX, clamped at the
+# model-native position limit inside backends/vllm/worker.py; only set this to
+# override (e.g. pin a smaller window on a shared box).
+export KVMEM_MAX_MODEL_LEN=${KVMEM_MAX_MODEL_LEN:-}
 # 压缩路径的三个运行时形态（v0.4.0 生产验证组合；unset 会走不同代码分支）：
 #   REBAKE=1 页迁回视图时按视图位置重旋 RoPE（混合模型 + 块内重排必须）
 #   COMPACT_MODE=prefix 前缀式压缩（sink/recent 保序，中间按分数换出）

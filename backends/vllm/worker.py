@@ -275,6 +275,27 @@ def main(argv=None) -> int:
         # 203,616-token pool), and every buffer sized by max_model_len - including the rotary cache -
         # then rejects a longer prompt with an illegal access instead of a clean error.
         _mm = int(env.get("KVMEM_MAX_MODEL_LEN", "0") or 0)
+        if _mm <= 0:
+            # CTX-FOLLOWING WINDOW (2026-11-03): with bounded in-prefill residency the
+            # engine no longer needs a hand-pinned window - MAX_MODEL_LEN = CTX, clamped
+            # at the model's own position limit (the RoPE/position tables size there;
+            # the fork hard-errors a user window above it without VLLM_ALLOW_LONG_MAX_MODEL_LEN,
+            # config/model.py:2518-2545). 524,288 CTX -> 262,144 on this model.
+            _ctxw = int(str(env.get("CTX") or env.get("KVMEM_ENTRY_CTX") or "0") or 0)
+            _native = 0
+            try:
+                import json as _json_w
+                _mpath = os.path.join(str(getattr(ns, "model", "") or ""), "config.json")
+                _mc = _json_w.load(open(_mpath))
+                _native = int(_mc.get("max_position_embeddings")
+                              or (_mc.get("text_config") or {}).get("max_position_embeddings")
+                              or 0)
+            except Exception:
+                _native = 0
+            if _ctxw > 0 and _native > 0:
+                _mm = min(_ctxw, _native)
+                print(f"[kvmem backends/vllm] MAX_MODEL_LEN follows CTX: "
+                      f"min({_ctxw}, model-native {_native}) = {_mm}")
         if _mm > 0:
             args += ["--set", f"MAX_MODEL_LEN={_mm}"]
             env["MAX_MODEL_LEN"] = str(_mm)
