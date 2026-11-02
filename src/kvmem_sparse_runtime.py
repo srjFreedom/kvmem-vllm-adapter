@@ -2376,9 +2376,60 @@ class VllmSparseRuntime:
                 # the selection cannot offer it, and Core (rightly) refuses a view without the
                 # tail. This is the live signature of "commit reads a page the engine wrote
                 # elsewhere" - the sample gives logical/slot/rank to compare with the map probe.
+                # B1b decisive probe (goal-7833cb61): where DID the bytes of this chunk land?
+                # Reduce every page's layer-0 byte sum and report, for each refused page, the
+                # READ slot vs the true-position slot (the dense id the engine would have used
+                # without the write-address offset) vs logical/rank. A nonzero sum anywhere
+                # EXCEPT sum_at_slot pins the kernel's address ahead of the commit's read.
+                # FULLY guarded: this runs on the forward thread of a compiled engine, and an
+                # escaping exception kills the step's commit (measured: v5 lost the whole run).
+                try:
+                    import torch as _t
+                    _dev0 = orch.kvs[0]
+                    _base = 0
+                    if refused:
+                        _base = int(refused[0][1]) - int(refused[0][0])
+                    _sample = []
+                    for lg, sl, rk in refused[:4]:
+                        def _ps(page):
+                            if page is None or page < 0 or page >= _dev0.shape[0]:
+                                return None
+                            return int(_dev0[int(page)].view(_t.uint8)
+                                       .to(_t.int16).sum().item())
+                        _rs = int(st.row[rk]) if rk < len(st.row) else None
+                        _sample.append({"logical": int(lg), "slot": int(sl), "rank": int(rk),
+                                        "row_slot": _rs,
+                                        "sum_at_slot": _ps(sl),
+                                        "sum_at_row_slot": _ps(_rs),
+                                        "sum_at_true_pos": _ps(lg + _base),
+                                        "sum_at_logical_id": _ps(lg)})
+                    # Where is the written cluster? Scan a WINDOW (bounded memory) around the
+                    # read slots: the page offsets of the nonzero run tell the address shift.
+                    _lo = max(0, (min(int(x[1]) for x in refused) - 200))
+                    _hi = min(int(_dev0.shape[0]), _lo + 1200)
+                    _w = _dev0[_lo:_hi].view(_t.uint8).to(_t.int16).sum(dim=(1, 2, 3)).tolist()
+                    _nz = [_lo + i for i, v in enumerate(_w) if v > 1000]
+                    self.log({"kind": "refused_probe", "req": req,
+                              "tokens": int(st.tokens), "seq_len": int(st.seq_len),
+                              "base": _base, "win": [_lo, _hi],
+                              "nz_in_win": len(_nz), "nz_head": _nz[:8], "nz_tail": _nz[-8:],
+                              "row_len": len(st.row), "sample": _sample})
+                except Exception:
+                    try:
+                        import traceback as _tb2
+                        self.log({"kind": "refused_probe_error", "req": req,
+                                  "error": _tb2.format_exc()[-400:]})
+                    except Exception:
+                        pass
                 entry = {"kind": "commit_refused_zero", "req": req, "dense": False,
                          "count": len(refused), "sample": refused[:8],
                          "tokens": int(st.tokens), "seq_len": int(st.seq_len),
+                         # B1b: did the kernel-authoritative slot mapping exist for this step,
+                         # and did the refused pages' q-positions hit it? (Remove after fix.)
+                         "smap": bool(_smap), "span": list(_sm_span) if _sm_span else None,
+                         "hits": sum(1 for lg, _, _ in refused[:8]
+                                     if _smap and (_sm_span[0] + max(
+                                         0, lg * self.page_tokens - int(st.tokens))) in _smap),
                          "tb_at": [touched[lg][2] for lg, _, _ in refused[:4]
                                    if lg in touched and len(touched[lg]) > 2],
                          "row_at": [int(st.row[rr]) if rr < len(st.row) else None
@@ -3839,6 +3890,14 @@ class VllmSparseRuntime:
                   # Diagnostic: the chosen logical pages, so a known needle page can be checked
                   # against what the compacted view actually kept.
                   "selected_pages": [int(p) for p in selected]}
+        # B1b probe (goal-7833cb61): pick_prefill_ungrouped returns ALL store blocks when
+        # block_count <= prefill budget - a shrinking selection with a stuck nblocks proves
+        # the commit stalled after the first mid-prefill compaction. Remove after acceptance.
+        try:
+            record["nblocks"] = int(orch.selector.selection_blocks())
+            record["budget_pages"] = int(orch.selector.budget_pages())
+        except Exception:
+            pass
         cap = getattr(self, "capture", None)
         if cap is not None:
             record["capture"] = {"calls": cap.calls, "wants": cap.wants,
