@@ -279,3 +279,24 @@ worker console（自举 re-arm，热挂，零重启）抓到 (c) 压缩后父请
 **另排除**：child 由 `is_rebuilt→continue` 完全跳过 runtime（1136-1141 注释亦写明），
 **"runtime 同 rid 残留毒执行"出局**——child 纯引擎 native；问题在**进入 child 之前**
 （store 数据面/pack 面）的残留。
+
+## 6.12 Round 9 更正 6.11：那份 dump 是 child prefill 段——child 状态完全干净
+
+逐字段复核：dump 的触发窗 `tokens >= _pl-65536` 对 child 恒成立（30975-65536<0）——
+step 301 抓的是 **child 的 prefill 中期**（tokens=24576），不是压缩中的父：
+- `store_n=1536 = 24576/16 = child 已提交页数`（child 用 accept_reconstruction 退休后的
+  **新 store**，单调增长中）——6.11 的"驱逐页没进 host store"论断 **撤回**：父的 store
+  是否覆盖驱逐页，`_rebuild_select` 的 `block_ok + store_missing=0` 已反证 **覆盖**
+  （chosen 含 26..31 全部内部页 `store.has(p)`==True）。
+- `seq_lens=28672 = 24576+4096` 引擎账 ✓、`baked=0`（child dense 位置）✓、
+  `slot_of==resident` ✓、row=引擎 dense 行 ✓ ——**child 执行面无罪实锤**。
+
+**当前矛盾表述**：child 输入正确（select_tokens dump 解码 needle 全句在）、child 执行
+干净（本节）、两臂唯一差异=父是否被 (c) 压缩——但 child 与父共享的物理实体只剩
+**设备块池的分配位置**（父压缩轮改变 free 链形态）与 **MTP/draft 边界账**（父压缩轮
+epoch 与 in-flight 门）。
+**本轮判别（零代码改动）**：压缩臂 + `KVMEM_SPEC_TOKENS=0`（禁 MTP）跑 88K：
+- 对 → 定罪"draft 边界 × 压缩轮"交互（压缩轮改写的 in-flight/ledger 面影响 child 采样
+  位置或 verify）；
+- 仍错 → 只剩**设备块池位置类**（物理 slot → kernel 数值路径）——届时做
+  "同 child 连跑两池位置对比"实验。
