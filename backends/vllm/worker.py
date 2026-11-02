@@ -137,12 +137,14 @@ def main(argv=None) -> int:
     # OFF by default: production keeps the whole-prompt dense prefill + prompt-end rebuild.
     if _env_flag("KVMEM_PREFILL_PRESSURE"):
         cfg["prefill_pressure"] = True
-        # B2 (goal round 5): pressure releases through the Core quiescent protocol
-        # (sched_compact) - Core adopts the proposal and frees the evicted blocks INSIDE
-        # schedule(), so the allocator hands the next chunk a DETERMINISTIC pool state.
-        # The worker-channel version raced Core's frees (run-to-run), which drifted the
-        # post-eviction bytes and hijacked near-threshold needles (docs 6.7).
-        cfg["sched_compact"] = True
+        # B2 (goal round 5): pressure releases through the Core quiescent protocol - the
+        # (c) watermark trigger self-gates on cfg["prefill_pressure"], so it does NOT
+        # need the global sched_compact switch. Decisive bisect (round-16): turning
+        # sched_compact ON alongside pressure made even UNCOMPACTED replays of the
+        # child prompt degrade on a freshly booted instance (same ids answered CORRECTLY
+        # with the switch off) - the (a) pool trigger / global no_preempt / report-mode
+        # semantics are the instance-wide side the goal does not ask for. (c) keeps the
+        # deterministic Core-side release that killed the run-to-run drift.
     for _k, _cfgk in (("KVMEM_PROMPT_END_RESELECT", "prompt_end_reselect"),
                       ("KVMEM_CHECKPOINT_REPLAY", "checkpoint_replay"),
                       ("KVMEM_COMPACT_REBUILD", "compact_rebuild")):

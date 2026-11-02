@@ -785,7 +785,8 @@ def _attach_sparse(runner, log_path):
             runtime.pool_ceiling_tokens = max(0, (_nb - _reserve) * _bs)
             # Opt-in: EngineCore compacts at its step boundary; the worker must not also reselect
             # inside the next step's forward, or both paths rewrite the same row.
-            runtime.sched_compact = bool(cfg.get("sched_compact", False))
+            runtime.sched_compact = bool(cfg.get("sched_compact", False)
+                                           or cfg.get("prefill_pressure", False))
             runtime.prefill_pressure = bool(cfg.get("prefill_pressure", False))
             if runtime.prefill_pressure:
                 # prefix mode PROPOSES NOTHING to Core (retirement reporting only); the
@@ -2186,7 +2187,10 @@ def register():
                     path) runs after that schedule and leaves the next chunk on a stale offset.
                     """
                     cfg = _sched_cfg(getattr(core, "scheduler", None))
-                    if not cfg.get("sched_compact"):
+                    if not (cfg.get("sched_compact") or cfg.get("prefill_pressure")):
+                        # (c) self-gates below on prefill_pressure: pressure boots reach the
+                        # loop for the watermark trigger alone, WITHOUT inheriting the (a)
+                        # pool-pressure / report-mode / global no_preempt semantics.
                         return
                     scheduler = getattr(core, "scheduler", None)
                     manager = getattr(scheduler, "kv_cache_manager", None)
@@ -2211,10 +2215,23 @@ def register():
                     # repeated "access" tail instead of the code).
                     running = [r for r in getattr(scheduler, "running", ())
                                if not bool(getattr(r, "kvmem_rebuilt", False))]
+                    _bud = int(cfg.get("budget_tokens", 36864))
                     final = [r for r in running
                              if int(getattr(r, "num_in_flight_tokens", 0) or 0) == 0
                              and int(getattr(r, "num_logical_tokens", 0) or 0)
                              >= int(getattr(r, "num_prompt_tokens", 0) or 0)
+                             # A pressure boot must behave EXACTLY like the OFF
+                             # production instance for every request that fits the
+                             # window. Measured (round 17): replaying the rebuilt-child
+                             # prompt (30,974 tokens < budget) as a plain /v1/completions
+                             # request got blockwise-compacted by the bare (b) trigger
+                             # (no budget predicate) and degraded to ';;;;' on a FRESH
+                             # pressure boot, while the identical ids answered
+                             # ZX-4417-QJ7 on the OFF boot - the (b) rewound its books
+                             # to 16,430. The OFF finalize never goes through this
+                             # function (it returns at the gate for OFF boots), so the
+                             # window test here is what restores per-request parity.
+                             and int(getattr(r, "num_prompt_tokens", 0) or 0) > _bud
                              and not getattr(r, "kvmem_final_reselect", False)]
                     pressure = pressure_due(free, reserve)
                     request = None
@@ -2253,7 +2270,11 @@ def register():
                             request = max(_cands, key=lambda r: int(r.num_computed_tokens))
                             _last[request.request_id] = int(request.num_computed_tokens)
                             scheduler.kvmem_pressure_last = _last
-                    if request is None and pressure:
+                    if (request is None and pressure
+                            and cfg.get("sched_compact")):
+                        # (a) pool pressure belongs to the FULL sched_compact protocol;
+                        # a pressure-only boot keeps the OFF production admission
+                        # behaviour for every request that has not hit its watermark.
                         request = pick_candidate(running, reserve)
                     if request is None:
                         return

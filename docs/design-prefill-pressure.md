@@ -384,3 +384,22 @@ group-3 块行并按 `_nr.new_block_ids` 重装 child 自己的块；配套 dump
 - 本轮累计修复三个真缺陷（revert 风暴、last-chunk starvation、stale block row），
   pressure 臂行为已从"玄学抖动"收敛为"确定性、输入完整、行纯净、仍错"——
   每一层都比上一层更接近真相。
+
+## 6.18 Round 16-17 转折：child 文本无罪被推翻，真缺陷=乱序拼接（OFF 臂同病待复核）
+
+三组纯 replay（零 kvmem 路径参与时）：
+- OFF boot replay child ids（30,974）→ **✓ ZX-4417-QJ7** —— 子文本可答（此前"文本中毒"
+  推断作废）；乱序拼接的文本模型能检索回 needle。
+- pressure boot（未加平价门）replay 同一 ids → 'ZX no;;;;' 乱码 —— 事件链实锤
+  **(b) final 无预算门**：30,974<budget 的普通请求被 blockwise 压缩（books 回卷 16,430）
+  后乱码。**修复**：(b) 候选加 `num_prompt > budget_tokens`（plugin 2218 区，注释含测量）
+  ⇒ 重启后 replay ✓ ZX-4417-QJ7（**per-request 平价恢复**）。
+- 88K chat 四连发仍 4/4 "no code"（needle=False）。
+
+**统一新模型（待验）**：finalize 重建出的子 prompt = sink 块 + **按分数排序的中段块** +
+尾块——**文本顺序被打乱**，needle 落在 0.25 位置而 **真 ask（"What is the access code
+for KEY-MID?"）在 block122 被裁掉**，模型看到的问句是块拼接出的
+"…no special access code recorded.\n\nWhat is the…"——它答 "No special access code
+recorded." **是在错误引用下的合理回答**！OFF 生产臂走同一 pack 序 ⇒ 若 OFF 88K 现也错
+= 乱序拼接是 finalize 固有缺陷（非 pressure 专属）；若 OFF 仍对 = pressure 专属差异。
+**下一轮判决实验：OFF boot（平价门不影响 OFF 分支）跑 88K chat。**
