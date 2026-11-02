@@ -1,0 +1,94 @@
+===== pid=142822 step=115 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=115 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=116 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=116 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=117 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=117 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=118 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=118 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=119 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=119 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=120 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=120 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=121 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=121 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=122 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=122 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=123 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=123 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=124 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=124 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=125 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=125 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=126 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=126 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=127 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=127 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=128 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=128 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=129 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=129 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=130 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=130 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=131 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=131 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=132 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=132 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=133 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=133 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=134 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=134 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=135 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=135 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=136 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142821 step=136 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+
+===== pid=142822 step=137 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+STEP2RESID {"pid": 142822, "req": "85d92a37", "n_new": 4096, "idx": 0, "nb_np": [5, 5, 5, 303], "g0": {"len": 5, "head": [19, 40, 17, 42, 21], "tail": [17, 42, 21]}, "g3": {"len": 303, "head": [909, 910, 911, 912, 913, 914], "tail": [1209, 1210, 1211]}, "ncomp_np": 0, "nlogic_np": 0, "am_type": "dict", "gdn_has_init": "tensor([False], device='cuda:1')", "gdn_ctx": "None", "st_seq": null, "st_row": null, "st_logical": null, "orch_store_n": null}
+
+===== pid=142821 step=137 req=chatcmpl-b7333b277dfca0a9-85d92a37 =====
+STEP2RESID {"pid": 142821, "req": "85d92a37", "n_new": 4096, "idx": 0, "nb_np": [5, 5, 5, 303], "g0": {"len": 5, "head": [19, 40, 17, 42, 21], "tail": [17, 42, 21]}, "g3": {"len": 303, "head": [909, 910, 911, 912, 913, 914], "tail": [1209, 1210, 1211]}, "ncomp_np": 0, "nlogic_np": 0, "am_type": "dict", "gdn_has_init": "tensor([False], device='cuda:0')", "gdn_ctx": "None", "st_seq": null, "st_row": null, "st_logical": null, "orch_store_n": null}
+

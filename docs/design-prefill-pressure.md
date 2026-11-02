@@ -424,3 +424,24 @@ stage-1 语义下压缩轮的选择没有真问句参与，needle 块未被选�
 rope_state 的 per-idx 残值）。诊断：child 首步 console dump 上述 per-idx 缓冲 +
 `model_state` 句柄字节；若引擎在 re-add 前没做 remove（同 rid 短路），所有 per-idx 状态
 都是父代残值——**修复方向 = requeue 用内部新 rid + output 转接（rid 解耦）**。
+
+## 6.20 Round 19 收官：child 首步引擎侧全净，唯一罪面=pack 写序 × 引擎分配序碰撞
+
+STEP2RESID（child 步2，两 rank 一致）：
+    nb_np=[5,5,5,303]  g3 head 909..1211 连续  idx=0  ncomp/nlogic_np=0
+    gdn_has_init=[False]  ✓（GDN 理论排除：kernel 从零写）
+    runtime st=None（child 不注册，符合设计）
+⇒ child 的**行/账本/state 决策全部干净**——引擎视角它是一个标准 fresh admission。
+⇒ 但它只有 303 块（30975/16≈1936 页=19.2 块？——303×101=30603 页远超 1936：行容量按
+  MAX_MODEL_LEN=200000 分配，nz=303 是**当前已 append 的块数**，4096 步时 303 块已覆盖
+  前 4096 所需——不是异常）。
+**最后交汇点 = pack 数据面**：`_rebuild_select` 的 dest 窗口是**全池 block-aligned**
+（first=1..num_blocks，pool_pages 升序），`logical_pages` 升序映射 dest——而 child 的
+fresh 分配由**引擎 free 队列顺序**决定。**replay 实验（同 ids 全对）恰好覆盖同一批物理块
+并重写** ⇒ 内容无罪、字节有罪：**child attention 读的是 pack 写序与引擎分配序不一致时
+落在行内的旧字节**。验证实验（round 20，env-only）：
+`KVMEM_RESIDENT_PREFILL_COMPACT=0` + `KVMEM_PREFILL_PRESSURE=1`
+→ (c) 触发面死（prefill 零压缩）→ finalize 经 `_over_budget` 仍选页+pack+child requeue
+→ **若 needle ✓**：压缩轮与 child 协议联手缺陷=压缩轮 store/统计残值；
+→ **若仍 ✗**：pack dest 顺序 bug 实锤（child 从未自写而被 pack 字节污染），
+   修复=child 首步前清掉 pack dest 区间或按引擎分配序重排 pack。
