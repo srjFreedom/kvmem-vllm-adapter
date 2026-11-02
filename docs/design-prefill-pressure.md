@@ -222,3 +222,31 @@ store 页 rebake delta 在 blockwise rewind 后的 rank 语义。
    子请求若复用父的 orch 字典（`slot_of/baked_delta/resident` 未清？）pack 读错源页；
 3. 判别实验：`KVMEM_COMPACT_REBUILD=0` + 压缩（父 view 直答 vs 子重建）+ 对比
    pack 前后 store 页 sha（trace_pages 已有机制）。
+
+## 6.10 Round 7 判决实验：FORCE-BLOCKS 回放 + Core 账本无罪
+
+**实验一（决定性）**：`KVMEM_REBUILD_FORCE_BLOCKS=7,8,9,11,12,13,14,26,27,28,29,30,31,48`
+（= 无压缩正确臂的精确 middle 集，尾块 51-53 由 forced_tail 自动带上；force 开启时跳过邻块
+扩展保证精确性）在**压缩正常发生**（gate 时间线 49152→28144、77824→18032、81920→22128）
+的 run 里回放：diag 确认 chosen=17、packed=1680/1680、store_missing=0，**仍答
+"No special access code recorded."（130.7s）**。
+→ **选页质量假设出局：子请求 prompt 与正确臂逐 token 相同的块集，输出仍错。
+污染在压缩轮的执行残留，不在 lossy 统计选页。**
+
+**实验二（热断点，零重启）**：kvmem_dbg 落在 `Scheduler.schedule` 返回点（45 hits），
+子请求段账本：
+`(4096,4096,True,4096) → (8192,8192) → … → (30975,30975,True,2303) → decode 1/step`
+**core 侧完全干净**：child num_computed 从 0、dense、无回卷残留、kvmem_rebuilt=True 在位。
+父请求回卷仅存在于父的账本历史（协议使然），child admission 是全新 Request。
+→ **Core 账本/引擎调度面无罪。残留锁定在 worker runtime 侧（同 rid 复用的
+orch/store/commit 坐标链）或子请求 first-step 的 block_table 状态。**
+
+**排除清单更新**：选页质量 ✗（实验一）、Core 账本 ✗（实验二）、GDN 状态槽 ✗
+（has_initial_states 由 num_computed 决定，child=0 从零开始）、pack 目标冲突 ✗
+（child dense 重算不读 pack 字节）。**剩余主嫌疑：worker runtime 对同 rid 的状态复用
+（accept_reconstruction 清理面 vs 压缩轮写入面）——特别是 B1c 快照链/`slot_of`/
+`baked_delta` 在"父被 (c) 压缩过"之后、child commit 的坐标算术**。
+
+**下一轮判别（设计好）**：worker 侧 console/dump 对比 child 前向第一步的
+`slot_mapping 目标页 vs 引擎 block_table` 与无压缩臂同位置——若写地址错位=定罪 commit
+坐标链；同步把 force env 撤掉恢复纯压缩臂基线（当前 :18200 配置）。

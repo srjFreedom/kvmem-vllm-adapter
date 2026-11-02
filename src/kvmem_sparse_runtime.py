@@ -3132,6 +3132,19 @@ class VllmSparseRuntime:
                 if fv > eng_scores.get(eng, 0.0):
                     eng_scores[eng] = fv
             rank_blocks = sorted(eng_scores, key=lambda b: -eng_scores[b])
+            # DIAGNOSTIC (goal-7833cb61 round-7 bisect, remove after acceptance):
+            # KVMEM_REBUILD_FORCE_BLOCKS replaces the score-ranked middle with a fixed
+            # comma-separated engine-block list - replay the KNOWN-GOOD (no-compaction)
+            # selection on a compacted run. Correct answer => child execution is innocent
+            # and the lossy scoring substrate is guilty; wrong answer => the residue is in
+            # the child execution path itself.
+            import os as _os_rb
+            _fb = _os_rb.environ.get("KVMEM_REBUILD_FORCE_BLOCKS", "")
+            if _fb:
+                rank_blocks = [int(x) for x in _fb.split(",") if x.strip()]
+                if self.log is not None:
+                    self.log({"kind": "rebuild_force_blocks", "req": req,
+                              "blocks": rank_blocks})
             tail_blocks = {p // bp for p in forced_tail}
             # a block enters the pack ONLY when every page inside it is complete AND has
             # canonical store bytes (or is the engine-resident tail): a hole would shift
@@ -3161,7 +3174,7 @@ class VllmSparseRuntime:
                     continue
                 middle.append(b)
                 _mid_set.add(b)
-                if (len(middle) < room and b + 1 not in tail_blocks
+                if (not _fb and len(middle) < room and b + 1 not in tail_blocks
                         and b + 1 not in _mid_set and block_ok(b + 1)):
                     middle.append(b + 1)
                     _mid_set.add(b + 1)
