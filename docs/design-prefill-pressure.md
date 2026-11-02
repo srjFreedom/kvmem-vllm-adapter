@@ -112,3 +112,17 @@ evict-before-stage-in）；`spill_outgoing`（GPU→CPU 拷贝，暂不释放槽
 "prefill and decode pressure use accumulated accepted attention over resident
 candidates, without graph propagation or cold recall"。改造计划 P3-1 退出标准即
 本 goal 验收 (3)。
+
+## 6.5 B1b 根因记录（2026-11-02 实测，goal round 2）
+
+压力触发/打包/水位/互斥全部正确后，剩余缺口 = **mid-prefill 流式 commit 的地址一致性**：
+- 第一层（planner 没问题）：`reselect.plan.sel_pages` 每轮都是满预算 1792 页；缩水发生在
+  orchestrator 的 missing 过滤（`store.has` 失败 ~450 页/轮被丢弃）。
+- 第二层（写点≠读点）：`refused_probe` 字节和窗口显示 kernel 把上一个 chunk 写进了
+  **比 commit 读取点靠前 200 页**的簇（nz 簇 4042-4241，读的却是 4242+ = logical+base 预测）。
+  原因：pressure spill 释放的块回到分配器池头，下一 chunk 的新块 id 来自池头复用，
+  "dense base 延续"假设失效。
+- 第三层（权威通道在场但 miss）：`commit_refused_zero.smap=true, span=[0,4096], hits=0`——
+  为 lagged commit 准备的 kernel slot-mapping 通道在 prefill 步全部查空，退到过期 stage 镜像。
+- 修复方向：prefill commit 改用捕获的 slot_mappings（或 bridge 同一张量）寻址；
+  禁止再信任 dense 延续预测。诊断（pressure_gate/refused_probe/nblocks）验收后移除。
