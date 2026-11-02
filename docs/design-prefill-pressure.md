@@ -592,3 +592,9 @@ child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建
   GPU 58-63°C/1695MHz——非热降频。
 - ops：service env 已切回 OFF（生产 fail-closed 基线）；下一轮在 OFF 上跑无损门
   （短 A/B 同实例 dump-compare 锚点重生成 + session 链），然后 pressure 上 250K（D 阶段）。
+
+### 6.28.1 Round 26 OFF 无损门（同 boot）
+- 短 A/B 双请求逐字节一致 ✓；
+- **OFF 88K needle ✓ `ZX-4417-QJ7` 107.8s**（比历史 150s 更快——stream 抑制补丁在
+  OFF 完全休眠，无副作用）；
+- 短式 decode 带宽 56.0/56.8 tok/s（见上，两臂对等）。
