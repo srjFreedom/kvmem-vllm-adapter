@@ -1,0 +1,122 @@
+===== pid=128264 step=403 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=403 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=404 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=404 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=405 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=405 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=406 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=406 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=407 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=407 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=408 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=408 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=409 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=409 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=410 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=410 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=411 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=411 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=412 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=412 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=413 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=413 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=414 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=414 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=415 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=415 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=416 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=416 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=417 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=417 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=418 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=418 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=419 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=419 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=420 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=420 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=421 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=421 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=422 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=422 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=423 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=423 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=424 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=424 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=425 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=425 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=426 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=426 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=427 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=427 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=428 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=428 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=429 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=429 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=430 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=430 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=431 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128263 step=431 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+
+===== pid=128264 step=432 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+GROWDUMP {"pid": 128264, "req": "97f5901c", "n_new": 2303, "ri": 0, "mgbt": "BlockTables", "mgbt_attrs": ["append_block_ids", "apply_staged_writes", "block_sizes", "block_sizes_tensor", "block_table_ptrs", "block_table_strides", "block_tables", "blocks_per_kv_block", "compute_slot_mappings", "cp_interleave", "cp_rank", "cp_size", "device", "fused_writer", "gather_block_tables", "get_dummy_block_tables"], "g0": {"nz": 5, "head": [28, 22, 34, 30, 26], "tail": [28, 22, 34, 30, 26]}, "g1": {"nz": 5, "head": [23, 24, 43, 25, 29], "tail": [23, 24, 43, 25, 29]}, "g2": {"nz": 5, "head": [20, 21, 42, 17, 18], "tail": [20, 21, 42, 17, 18]}, "g3": {"nz": 5454, "head": [4141, 4142, 4143, 4144, 4145, 4146, 4147, 4148, 4149, 4150], "tail": [2923, 2924, 2925, 2926, 2927, 2928]}, "copies": "None", "seq_lens": "tensor([30975], device='cuda:1', dtype=torch.int32)"}
+
+===== pid=128263 step=432 req=chatcmpl-b0c2b8baa5fafcb4-97f5901c =====
+GROWDUMP {"pid": 128263, "req": "97f5901c", "n_new": 2303, "ri": 0, "mgbt": "BlockTables", "mgbt_attrs": ["append_block_ids", "apply_staged_writes", "block_sizes", "block_sizes_tensor", "block_table_ptrs", "block_table_strides", "block_tables", "blocks_per_kv_block", "compute_slot_mappings", "cp_interleave", "cp_rank", "cp_size", "device", "fused_writer", "gather_block_tables", "get_dummy_block_tables"], "g0": {"nz": 5, "head": [28, 22, 34, 30, 26], "tail": [28, 22, 34, 30, 26]}, "g1": {"nz": 5, "head": [23, 24, 43, 25, 29], "tail": [23, 24, 43, 25, 29]}, "g2": {"nz": 5, "head": [20, 21, 42, 17, 18], "tail": [20, 21, 42, 17, 18]}, "g3": {"nz": 5454, "head": [4141, 4142, 4143, 4144, 4145, 4146, 4147, 4148, 4149, 4150], "tail": [2923, 2924, 2925, 2926, 2927, 2928]}, "copies": "None", "seq_lens": "tensor([30975], device='cuda:0', dtype=torch.int32)"}
+

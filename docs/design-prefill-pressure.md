@@ -344,3 +344,28 @@ max(_bpk)`（plugin:836，随 kv_cache_config 组形态变）共同表明：**�
   `apply_compaction` 走哪条（channel adopt vs Core copies）。
 - V2 runner 的块表访问面：`input_batch.block_table[gid].get_cpu_tensor()`（非 V1 属性名，
   前两轮 dump 空手而归即此因）——child 行的实际块 id 序列仍未直接看过。
+
+## 6.16 Round 11 根因实锤：child 复用父的引擎块行（stale row）
+
+热 console（正确 accessor `runner.block_tables.block_tables[gid].gpu[ri]`）抓 child 最后步
+（n_new=2303，seq_lens=30975 两 rank 一致）的 attention 块行（group 3）：
+
+    g3: nz=5454, head=[4141,4142,4143,...] tail=[...,2923,2928]
+    groups 0-2 (mamba): 各 5 块（child 自己的）
+
+**解读**：child 的 prompt 只需 1936 页（30975/16）≈20 块，行内却有 **5454 个非零项**——
+**恰为父请求（86670 tokens→5417+pad≈5454）的块行数**。V2 的块行是 append 语义，
+child 复用父的 row index（同 rid），**父的块行从未清空**：child 的 attention 于是读
+**父压缩时代的块视图 + 自己新写的小尾巴**——模型在错误 KV 上产生流畅但错误的回答
+（"no code recorded"），确定性来自行内容的确定性。
+
+**统一解释全部历史现象**：
+- OFF/无压缩臂 child 正确：父行是 dense 连续物理块，child 重算恰好把这些块重新写满
+  （同 base 分配顺序），stale 行被新数据覆盖 → 无害；
+- 压缩臂 child 错：父行=碎片化的视图块（非 child 的块号），child 只重写了自己的 20 块，
+  前 5400+ 条指向别处旧字节 → attention 大半错读；
+- revert 风暴/starvation 都是真 bug（已修）但不是主根因；4/4 逐字节稳定 = 行确定。
+
+**修复方案（下一轮实施）**：worker `execute_model` 入口的 rebuilt-admission 钩子处
+（scheduled_new_reqs + kvmem_rebuilt，本在 forward 之前）清掉 child row 的
+group-3 块行并按 `_nr.new_block_ids` 重装 child 自己的块；配套 dump 验证 nz==1936 级别。
