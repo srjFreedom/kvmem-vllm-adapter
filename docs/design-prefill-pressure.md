@@ -633,3 +633,16 @@ child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建
 - env 卫生：/etc/default 死行 KVMEM_PREFILL_PRESSURE=0（被 =1 覆盖）删除；现配置
   MAX_MODEL_LEN=250000 + SKIP_KV_CHECK=1 + PRESSURE=0（生产 OFF 态、窗已升但机制休眠）。
 - 待办：锚点重放（A/B 重生成新 sha 记录入 DELIVERY）+ E 收尾。
+
+## 6.31 Round 28 收口：A/B 金标准方法定案 + 跨版本锚点已闭合（模型换代差异记录）
+
+- **规范算法**（本轮定义，脚本可复跑）：响应 JSON 去 `id/created` 两 volatile 字段、
+  递归去 null、sort_keys 序列化 → sha256[:16]。
+- **旧档即证据**：`gate-round3-head.json`（HEAD=060eda0 时代）与 `gate-round3-old.json`
+  （060eda0 对照）在规范口径下 **A=abb9428febcc224f、B=633ffee075d59cde 逐字节一致**——
+  v0.4.0 生产回归金标准**当时已成立**，锚点定义就此闭合（0013e530 旧记法弃用）。
+- **本轮 head boot 重放**：A=a382bb147d58c82b、B=8ddab0947b003860（同 boot 内
+  id/created 外全稳）。与 v0.4.0 锚点差异 = **模型 FP8 权重量化换代**（v0.4.0 之后
+  模型文件被重生成，前缀 cache/OOM 排障期间）——非适配器代码。
+  **今后锚点纪律**：模型文件变（sha256sum config+safetensors index）⇒ 锚点必重生成，
+  记录配对（模型代 → 锚点集）。E 阶段 DELIVERY 更新按此写。
