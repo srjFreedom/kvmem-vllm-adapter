@@ -403,3 +403,24 @@ for KEY-MID?"）在 block122 被裁掉**，模型看到的问句是块拼接出�
 recorded." **是在错误引用下的合理回答**！OFF 生产臂走同一 pack 序 ⇒ 若 OFF 88K 现也错
 = 乱序拼接是 finalize 固有缺陷（非 pressure 专属）；若 OFF 仍对 = pressure 专属差异。
 **下一轮判决实验：OFF boot（平价门不影响 OFF 分支）跑 88K chat。**
+## 6.19 Round 19：requeue 专属定罪 + 隔离实验的正确解读（自纠）
+
+**同轮三段对照（同 boot、同 ids）**：
+1. chat 88K（压缩+(c)+finalize child）→ ✗ "No special access code recorded."（3/3+1/1 稳定）
+2. completions FRESH replay 同 child ids → ✓ **ZX-4417-QJ7**
+3. chat FRESH admission（child 文本重套模板）→ ✓ 答对
+⇒ **ids/内容/模板/sampling 全部无罪；定罪面 = requeue child 的执行状态本身**。
+- 附加事实：child 文本从半句 `' special access code recorded.'` 开头（模板结构不在 ids 里）
+  ——模型仍答对（replay 证），检索鲁棒性足够；"乱序文本不可答"理论作废。
+
+**REBUILD=0 隔离实验（本 round 早期）解读修正**：`(c) 压缩 on + compact_rebuild=0` → 答 "No"
+（104.7s，applied epoch1 visible=24048/epoch2 visible=13936）——**这不是 view 损坏**：
+stage-1 语义下压缩轮的选择没有真问句参与，needle 块未被选入即永久丢失，"No" 是该配置的
+**预期语义损失**。该实验只证明：(c) 通路工作正常 + 单独压缩不解决检索正确性
+（正是 child 协议存在的理由）。误读当场收回。
+
+**下一刀（唯一残面对象）**：requeue child 与 fresh admission 的执行差 = 同 rid 复用面
+（worker 观察 remove 与 child add 的时序、GDN state slot/`is_prefilling`/`num_accepted`/
+rope_state 的 per-idx 残值）。诊断：child 首步 console dump 上述 per-idx 缓冲 +
+`model_state` 句柄字节；若引擎在 re-add 前没做 remove（同 rid 短路），所有 per-idx 状态
+都是父代残值——**修复方向 = requeue 用内部新 rid + output 转接（rid 解耦）**。

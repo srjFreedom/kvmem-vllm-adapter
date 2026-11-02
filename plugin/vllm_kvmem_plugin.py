@@ -1756,7 +1756,7 @@ def register():
                 try:
                     import os as _os2
                     _df = "/tmp/kvmem_child_prompt.json"
-                    if not _os2.path.exists(_df):
+                    if True:
                         with open(_df, "w") as _fj:
                             _fj.write(json.dumps({"pages": list(pages)[:8] + ["..."] +
                                                   list(pages)[-4:], "ids": token_ids}))
