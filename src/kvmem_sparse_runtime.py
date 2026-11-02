@@ -160,6 +160,7 @@ class VllmSparseRuntime:
         self._last_report_tokens = {}
         self._install_row_now = {}
         self._slot_span = {}
+        self._slot_captured: dict = {}
         self._slot_span_prev = {}
         self._pending_frontier = {}
         self._pending_new = {}
@@ -342,9 +343,16 @@ class VllmSparseRuntime:
             st = self.state(req)
         except Exception:
             return False
+        # FAIL-CLOSED under the pressure flag (2026-11-02, goal round 3, measured): the
+        # prompt-end rebuild calls _reselect(rebuild=True), whose `selected` page ids are
+        # POST-COMPACTION view coordinates; select_tokens then validates them against the
+        # ORIGINAL prompt frame and raises "reconstruction page lies outside the original
+        # prompt" (engine death, v12). The pressure path therefore finalizes with the
+        # prompt-end QUERY reselect (Phase C, correct pages: needle 2704-2712 in the view,
+        # rotation 24/24 ok) and leaves the dense-prefill GDN state as-is. Aligning rebuild
+        # with a pressure-compacted request is a separate, not-yet-designed protocol.
         return bool(self.compact_rebuild and st.compacted_in_prefill and not st.rebuilt
-                    and not self.is_rebuilt(req)
-                    and not getattr(self, "prefill_pressure", False))
+                    and not self.is_rebuilt(req))
 
     def finish_prompt_for_reconstruction(self, req, n_new, logical_end, resident_end):
         """Commit the final forward and queue its selected tokens before any sample escapes."""
@@ -353,6 +361,22 @@ class VllmSparseRuntime:
         st = self.state(req)
         if st.rebuilt:
             return False
+        if getattr(self, "prefill_pressure", False):
+            # PHASE D entry split (goal-7833cb61, v12 postmortem): the resident path finishes
+            # via _reselect(rebuild=True) - fine while the view is dense. After a pressure
+            # compaction its `selected` names pages in the COMPACTED frame, and the channel
+            # rejects them against the ORIGINAL prompt ("reconstruction page lies outside the
+            # original prompt" - engine death). The pressure epoch instead queues the
+            # dedicated store-based selection (_rebuild_select: logical ids from the core
+            # score grid, n_pages-guarded, packed to destination slots, consumed at the Core
+            # quiescent boundary before the next schedule - TP2-consistent by construction).
+            if getattr(self, "_rebuild_queue", None) is None:
+                self._rebuild_queue = {}
+            self._rebuild_queue[req] = int(st.tokens) + int(n_new or 0)
+            if self.log is not None:
+                self.log({"kind": "pressure_rebuild_queued", "req": req,
+                          "tokens": int(st.tokens), "n_new": int(n_new or 0)})
+            return True
         runner = getattr(self.view, "runner", None)
         if runner is not None:
             batch = runner.execute_model_state.input_batch
@@ -374,6 +398,28 @@ class VllmSparseRuntime:
         return True
 
     # --- state -------------------------------------------------------------------------
+    def capture_slot_mapping(self, req):
+        """B1c (goal-7833cb61): snapshot THIS step's kernel write addresses right after the
+        forward, while the static slot_mappings buffer still holds them. The lagged commit
+        cannot read the tensor at its own entry - by then the compiled pipeline has re-filled
+        it and only padding (-1) survives (measured: skeys=[0], hits=0 on every prefill step).
+        One bounded D2H copy per pressure step; OFF elsewhere."""
+        try:
+            if not getattr(self, "prefill_pressure", False):
+                return
+            span = self._slot_span.get(req)
+            if not span:
+                return
+            sm = self.view.runner.block_tables.slot_mappings
+            g = self.view.attn_groups[0]
+            row = sm[g]
+            p0, p1 = int(span[0]), min(int(span[1]), int(row.shape[0]))
+            if p1 <= p0:
+                return
+            self._slot_captured[req] = (p0, row[p0:p1].tolist())
+        except Exception:
+            pass
+
     def slot_pages_for(self, req):
         """Physical page ids the LAST forward wrote, per query token, from the attention
         kernels' own slot mapping (the ONLY address that is by construction where the bytes
@@ -2245,6 +2291,14 @@ class VllmSparseRuntime:
             touched = {}
             _sm_span = getattr(self, "_slot_span_prev", {}).get(req)
             _smap = self.slot_pages_for(req) if _sm_span else None
+            # B1c: the tensor read above is unreliable for prefill steps (buffer recycling);
+            # prefer the snapshot captured right after the writing step's forward.
+            _cap = getattr(self, "_slot_captured", {}).pop(req, None)
+            if _cap is not None:
+                _cp0, _cvals = _cap
+                _sm_span = (_cp0, _cp0 + len(_cvals))
+                _pt = int(self.page_tokens)
+                _smap = {_cp0 + k: v // _pt for k, v in enumerate(_cvals) if v >= 0} or _smap
             for i in range(n_new_tokens):
                 logical = (st.tokens + i) // self.page_tokens
                 rank = (start + i) // self.page_tokens
@@ -2430,6 +2484,11 @@ class VllmSparseRuntime:
                          "hits": sum(1 for lg, _, _ in refused[:8]
                                      if _smap and (_sm_span[0] + max(
                                          0, lg * self.page_tokens - int(st.tokens))) in _smap),
+                         "skeys": (sorted(_smap)[:6] + ["..."] + sorted(_smap)[-3:]
+                                   if _smap else None),
+                         "want_q": [_sm_span[0] + max(0, int(lg) * self.page_tokens
+                                                      - int(st.tokens))
+                                    for lg, _, _ in refused[:4]] if _sm_span else None,
                          "tb_at": [touched[lg][2] for lg, _, _ in refused[:4]
                                    if lg in touched and len(touched[lg]) > 2],
                          "row_at": [int(st.row[rr]) if rr < len(st.row) else None
@@ -2622,6 +2681,30 @@ class VllmSparseRuntime:
                 if int(getattr(self, "needle_trace", 0)) > 0:
                     resident = sorted(orch.resident)
                     self._trace_pages(req, resident[:2] + resident[-2:])
+            # PHASE C (goal-7833cb61): the prompt-end QUERY reselect under the pressure flag.
+            # In resident mode this final selection rode in the prompt-end branch that the
+            # pressure flag skips, and without it a page spilled by a pressure round is never
+            # recalled: the answer said "no key mentioned" while the selection stats proved the
+            # store held it. Scores come from the core (bridge mean-K) over the FULL store,
+            # spilled host pages included, so mid-archive content returns to the view.
+            if (getattr(self, "prefill_pressure", False)
+                    and not bool(getattr(self, "sched_compact", False))):
+                _plen3 = int(self._prompt_len.get(req, 0) or 0)
+                if (_plen3 and int(st.tokens) >= _plen3
+                        and not bool(getattr(st, "query_reselected", False))
+                        and (getattr(orch, "retrieval_index", None) is not None
+                             or getattr(orch, "core_stats_source", None) is not None)):
+                    st.query_reselected = True
+                    if self.log is not None:
+                        self.log({"kind": "pressure_final_reselect", "req": req,
+                                  "tokens": int(st.tokens), "prompt": _plen3})
+                    try:
+                        self._reselect(req)
+                    except Exception:
+                        if self.log is not None:
+                            import traceback as _tb3
+                            self.log({"kind": "pressure_final_reselect_error", "req": req,
+                                      "error": _tb3.format_exc()[-500:]})
             return st
         due = orch.should_reselect()
         if self.log is not None and req not in self._adv_logged and st.tokens > 10000:

@@ -2562,6 +2562,14 @@ def _install(cls, module_name, probe, smoke, state):
                 cap = getattr(runtime, "capture", None)
                 state["steps"] = state.get("steps", 0) + 1
                 for req, n_new in scheduled.items():
+                    # B1c (goal-7833cb61): snapshot the kernel's write addresses while the
+                    # static buffer still holds this step's values (the lagged commit reads
+                    # it AFTER the compiled pipeline refills the tensor). Gate lives inside.
+                    if int(n_new) >= int(getattr(runtime, "page_tokens", 16)):
+                        try:
+                            runtime.capture_slot_mapping(req)
+                        except Exception:
+                            pass
                     _console_step({"runtime": runtime, "req": req, "runner": self,
                                    "state": state, "scheduler_output": scheduler_output,
                                    "step": state.get("steps"), "n_new": int(n_new),
