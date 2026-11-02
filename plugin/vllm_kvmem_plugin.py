@@ -787,6 +787,14 @@ def _attach_sparse(runner, log_path):
             # inside the next step's forward, or both paths rewrite the same row.
             runtime.sched_compact = bool(cfg.get("sched_compact", False))
             runtime.prefill_pressure = bool(cfg.get("prefill_pressure", False))
+            if runtime.prefill_pressure:
+                # prefix mode PROPOSES NOTHING to Core (retirement reporting only); the
+                # pressure watermark trigger needs the real blockwise proposal channel.
+                # The runtime may have NO compact_mode attribute at all (the dispatch then
+                # falls back to env KVMEM_COMPACT_MODE = prefix) - so FORCE the value here,
+                # do not test for "prefix" first (measured: the tested guard never matched,
+                # every pressure trigger died as an empty proposal).
+                runtime.compact_mode = "quiescent"
             import os as _os
             runtime.blockwise_view = bool(int(_os.environ.get("KVMEM_BLOCKWISE", "0") or 0))
             runtime.install_row_in_view = bool(int(_os.environ.get("KVMEM_INSTALL_ROW_VIEW", "0") or 0))
@@ -1727,6 +1735,18 @@ def register():
                     token_ids = token_ids + prompt_all[-tail_n:]
                 # `_compact` is a plain closure, NOT a method: the scheduler object is the
                 # local `scheduler` we resolved above - never `self` (NameError, measured).
+                # DIAGNOSTIC (goal-7833cb61 B2): dump the child prompt ids ONCE for
+                # offline decode - is the needle sentence actually in the re-prefilled
+                # text? Remove after the systematic-wrong-answer is closed.
+                try:
+                    import os as _os2
+                    _df = "/tmp/kvmem_child_prompt.json"
+                    if not _os2.path.exists(_df):
+                        with open(_df, "w") as _fj:
+                            _fj.write(json.dumps({"pages": list(pages)[:8] + ["..."] +
+                                                  list(pages)[-4:], "ids": token_ids}))
+                except Exception:
+                    pass
                 pending = getattr(scheduler, "kvmem_rebuild_pending", None)
                 if pending is None:
                     pending = scheduler.kvmem_rebuild_pending = {}
@@ -2181,11 +2201,33 @@ def register():
                              >= int(getattr(r, "num_prompt_tokens", 0) or 0)
                              and not getattr(r, "kvmem_final_reselect", False)]
                     pressure = pressure_due(free, reserve)
+                    request = None
                     if final:
                         request = max(final, key=lambda r: int(r.num_logical_tokens))
-                    elif pressure:
+                    if request is None and cfg.get("prefill_pressure"):
+                        # (c) BUDGET watermark (B2, goal-7833cb61): bounded residency means
+                        # the resident BOOK - Core's own num_computed_tokens - never runs far
+                        # past the working set, long before the pool would (a). Quiescent
+                        # condition (no drafts in flight) is exactly safe: the pressure moves
+                        # happen between steps, never under speculative verification.
+                        _hi = int(cfg.get("budget_tokens", 36864)) + \
+                            int(cfg.get("gen_reserve_tokens", 16384)) // 2
+                        _step = int(cfg.get("gen_reserve_tokens", 16384)) // 4
+                        _last = getattr(scheduler, "kvmem_pressure_last", None)
+                        if _last is None:
+                            _last = scheduler.kvmem_pressure_last = {}
+                        _cands = [r for r in running
+                                  if int(getattr(r, "num_computed_tokens", 0) or 0) >= _hi
+                                  and int(getattr(r, "num_in_flight_tokens", 0) or 0) == 0
+                                  and int(getattr(r, "num_computed_tokens", 0) or 0)
+                                  - int(_last.get(r.request_id, -10**9)) >= _step]
+                        if _cands:
+                            request = max(_cands, key=lambda r: int(r.num_computed_tokens))
+                            _last[request.request_id] = int(request.num_computed_tokens)
+                            scheduler.kvmem_pressure_last = _last
+                    if request is None and pressure:
                         request = pick_candidate(running, reserve)
-                    else:
+                    if request is None:
                         return
                     if request is None:
                         return

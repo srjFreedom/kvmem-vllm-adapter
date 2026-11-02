@@ -137,6 +137,12 @@ def main(argv=None) -> int:
     # OFF by default: production keeps the whole-prompt dense prefill + prompt-end rebuild.
     if _env_flag("KVMEM_PREFILL_PRESSURE"):
         cfg["prefill_pressure"] = True
+        # B2 (goal round 5): pressure releases through the Core quiescent protocol
+        # (sched_compact) - Core adopts the proposal and frees the evicted blocks INSIDE
+        # schedule(), so the allocator hands the next chunk a DETERMINISTIC pool state.
+        # The worker-channel version raced Core's frees (run-to-run), which drifted the
+        # post-eviction bytes and hijacked near-threshold needles (docs 6.7).
+        cfg["sched_compact"] = True
     for _k, _cfgk in (("KVMEM_PROMPT_END_RESELECT", "prompt_end_reselect"),
                       ("KVMEM_CHECKPOINT_REPLAY", "checkpoint_replay"),
                       ("KVMEM_COMPACT_REBUILD", "compact_rebuild")):

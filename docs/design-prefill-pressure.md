@@ -169,3 +169,32 @@ needle 与干扰块的排序抖动 → 17 块视图里模型被干扰码劫持�
 (b) 落地序确定性化（固定 dest 窗口/确定性分配），先消掉"同输入不同落地"这类微差；
 (c) 接受漂移、把选择做宽（提高 rebuild 预算占比/强制 needle 邻块扩展 KVMEM_GRAPH_ALPHA
     在 pressure 终选也生效）——语义代价最小。
+
+## 6.8 Round 5 B2（Core 驱动压力协议落地 + 定罪到执行链）
+
+**接线**（全部 fail-closed 于 KVMEM_PREFILL_PRESSURE）：
+- worker.py：pressure ⇒ `cfg["sched_compact"]=True`——释放走 Core quiescent 协议（adopt/free 在
+  schedule() 单线程内），杀掉 round-4 定性的 allocator 竞态漂移。
+- plugin install：**强制** `runtime.compact_mode="quiescent"`（探测发现 runtime 根本没有
+  compact_mode 属性、dispatch 回落到 env prefix——"if ==prefix 才覆盖"的条件永不成立，
+  24 连 empty proposal 就是这个；直接赋值修掉）。
+- `_quiescent_compaction` 新增 (c) **预算水位触发**：`num_computed_tokens >= budget+gen/2`
+  且 in-flight==0（prefill 无 draft，quiescent 边界安全）+ per-req 节流 gen/4。
+- needs_reconstruction 加 `_over_budget` 条件：Core-driven 回卷不置 compacted_in_prefill，
+  水位等价（无它则 88K 稠密走过驱逐窗口直答，"No special access code recorded."）。
+- blockwise_empty_pages 诊断补日志。
+
+**实测（88K, pressure ON）**：
+- (c) 真实生效：seq_len 时间线 45056→28144→44528→22128（**常驻有界 ✓ 整块视图 ✓**）；
+- 4 连发全部 **4/4 逐字节相同**（"No special access code recorded.", 7 tok, 129.4s）
+  ——**Core 驱动确定性达成**（round-4 是 3/4 抖动）；
+- **但稳定错**。定罪实验：dump 子请求 prompt（30974 ids）→ decode 文本
+  **"The unique record KEY-MID has access code ZX-4417-QJ7." 明确在场**、tail 问句逐字在尾
+  ——**输入无罪，bug 在子请求执行链/父压缩轮的残留影响**（不是选页、不是 token 流）。
+- 对照：同 build 下 (c) 被 empty-proposal 挡住时（=纯 dense+final+rebuild）4/4 **全对**
+  （round-5 早前实验，"ZX-4417-QJ7" 逐字节一致）——**差异唯一锁定=压力压缩轮发生与否**。
+
+**下一轮（二分）**：env `KVMEM_PRESSURE_HIGH_TOKENS` 诊断覆盖把 (c) 水位调到永不触发
+（其余全同），跑 88K：对→定罪压缩轮污染（查 GDN 清零/slot/统计基础）；错→定稿 over_budget
+形态本身问题。候选根因清单：GDN state 清零在压缩后 slot 错位 / 子请求 positions 起点 /
+store 页 rebake delta 在 blockwise rewind 后的 rank 语义。

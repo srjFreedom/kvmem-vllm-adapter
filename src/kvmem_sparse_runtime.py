@@ -351,8 +351,16 @@ class VllmSparseRuntime:
         # prompt-end QUERY reselect (Phase C, correct pages: needle 2704-2712 in the view,
         # rotation 24/24 ok) and leaves the dense-prefill GDN state as-is. Aligning rebuild
         # with a pressure-compacted request is a separate, not-yet-designed protocol.
-        return bool(self.compact_rebuild and st.compacted_in_prefill and not st.rebuilt
-                    and not self.is_rebuilt(req))
+        # The pressure trigger for the finalize: worker-channel epochs set
+        # compacted_in_prefill at the reselect; the Core-driven (B2) epoch rewinds the
+        # BOOKS at apply and never touches that flag - the watermark itself (resident
+        # book over the budget) is the equivalent condition there. Without the second
+        # clause an over-budget prompt that never took the worker channel was answered
+        # DENSE through a window of evicted blocks (measured: needle absent, no finalize).
+        _over_budget = bool(getattr(self, "prefill_pressure", False)) and \
+            int(st.tokens) > int(self.budget_tokens)
+        return bool(self.compact_rebuild and (st.compacted_in_prefill or _over_budget)
+                    and not st.rebuilt and not self.is_rebuilt(req))
 
     def finish_prompt_for_reconstruction(self, req, n_new, logical_end, resident_end):
         """Commit the final forward and queue its selected tokens before any sample escapes."""
@@ -3609,6 +3617,11 @@ class VllmSparseRuntime:
                 phys_pages.append(phys)
         if not logical_pages:
             self._last_proposal = None
+            if self.log is not None:
+                self.log({"kind": "blockwise_empty_pages", "req": req,
+                          "kept": kept[:6], "kept_n": len(kept),
+                          "n_pages": n_pages, "n_blocks": n_blocks, "q": q,
+                          "row": len(old_row), "logical": len(old_logical)})
             return st
         visible = sum(min(pt, max(0, tokens - p * pt)) for p in logical_pages)
         if visible <= 0 or visible >= resident_before:
