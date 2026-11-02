@@ -1543,6 +1543,15 @@ def register():
                 runtime = getattr(runner, "kvmem_runtime", None)
                 if runtime is None:
                     return None
+                if bool(runtime.is_rebuilt(str(request_id))):
+                    # THE REBUILT CHILD MUST NEVER PARTICIPATE IN QUIESCENT COMPACTION.
+                    # The child reuses the parent's request_id; a trigger fired for it
+                    # produces an empty proposal (its books start from zero), Core
+                    # "refuses" it, and the refusal RPC restores the PARENT's
+                    # pre-compaction snapshot over the pool slots the child now owns -
+                    # rewriting the child's already-prefilled KV with the parent's old
+                    # bytes (measured: refused+reverted x5 storm on the child rid).
+                    return None
                 try:
                     proposal = runtime.quiescent_compact(
                         str(request_id), int(frontier),
@@ -1570,6 +1579,11 @@ def register():
                 if runtime is None:
                     return False
                 try:
+                    if bool(runtime.is_rebuilt(str(request_id))):
+                        # a rebuilt child has NO pre-proposal snapshot of its own; the
+                        # snap on the runtime belongs to the parent generation and its
+                        # slots are being re-written by the child's fresh prefill.
+                        return False
                     return bool(runtime.revert_quiescent(str(request_id)))
                 except Exception:
                     return False
@@ -2195,7 +2209,8 @@ def register():
                     # query window. Without (b) the compacted view keeps a prefill-time selection
                     # and the needle in the MIDDLE of a long prompt is never ranked (measured:
                     # repeated "access" tail instead of the code).
-                    running = list(getattr(scheduler, "running", ()))
+                    running = [r for r in getattr(scheduler, "running", ())
+                               if not bool(getattr(r, "kvmem_rebuilt", False))]
                     final = [r for r in running
                              if int(getattr(r, "num_in_flight_tokens", 0) or 0) == 0
                              and int(getattr(r, "num_logical_tokens", 0) or 0)
@@ -2226,6 +2241,12 @@ def register():
                         _cands = [r for r in running
                                   if int(getattr(r, "num_computed_tokens", 0) or 0) >= _hi
                                   and int(getattr(r, "num_in_flight_tokens", 0) or 0) == 0
+                                  # prompt-complete requests belong to the FINAL path; a (c)
+                                  # rewind there starves the last chunk (measured: logical
+                                  # stuck at 86016 < 86670, need 4751 > window 4096 forever)
+                                  and not (int(getattr(r, "num_prompt_tokens", 0) or 0) > 0
+                                           and int(getattr(r, "num_logical_tokens", 0) or 0)
+                                           >= int(getattr(r, "num_prompt_tokens", 0) or 0))
                                   and int(getattr(r, "num_computed_tokens", 0) or 0)
                                   - int(_last.get(r.request_id, -10**9)) >= _step]
                         if _cands:

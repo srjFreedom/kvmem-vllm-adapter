@@ -24,6 +24,17 @@ def pick_candidate(running, reserve_blocks):
             continue
         if int(getattr(request, "num_output_placeholders", 0) or 0) != 0:
             continue
+        if (int(getattr(request, "num_prompt_tokens", 0) or 0) > 0
+                and int(getattr(request, "num_logical_tokens", 0) or 0)
+                >= int(getattr(request, "num_prompt_tokens", 0) or 0)):
+            # THE PROMPT IS COMPLETE: pressure compaction is forbidden here, the FINAL
+            # reselect / rebuild owns this request now (goal-7833cb61 round-10).
+            # Measured: (c) firing on the last chunks left the logical book rewound
+            # (tokens 86016 < prompt 86670) with a fragmented resident row; the next
+            # chunk need (prompt+1-resident = 4751) then exceeded the 4096 window and
+            # the FINAL chunk could NEVER be scheduled - the request starved 654 tokens
+            # short of its own prompt end, and finalize rebuilt over a truncated ask.
+            continue
         tokens = int(getattr(request, "num_computed_tokens", 0) or 0)
         if tokens <= 1:
             continue
