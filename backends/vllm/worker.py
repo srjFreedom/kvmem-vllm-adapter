@@ -303,6 +303,13 @@ def main(argv=None) -> int:
         else:
             args += ["--set", "MAX_MODEL_LEN=-1"]
             env["MAX_MODEL_LEN"] = "-1"
+        # The resident scheme's window is routinely ABOVE the physical pool (CTX-following
+        # makes that the default: 262,144 window vs ~201-226K pool). The capacity check it
+        # would trip is the one this design violates ON PURPOSE (bounded residency keeps
+        # GPU KV at the watermark, not the window), so the branch opts into the fork's
+        # explicit skip alongside - a fresh clone boots beyond-pool with zero /etc/default.
+        env.setdefault("KVMEM_SKIP_KV_CHECK", "1")
+        args += ["--set", "KVMEM_SKIP_KV_CHECK=1"]
         print("[kvmem backends/vllm] KVMEM_ENTRY_RESIDENT_PREFILL=1 -> "
               f"MAX_MODEL_LEN={env['MAX_MODEL_LEN']} (full prompt enters the engine; "
               "beyond-pool mode requires prefill compaction)")

@@ -211,6 +211,8 @@ prefix caching is force-disabled, scheduling stays synchronous because compactio
 block table mid-request). `max_tokens` is clamped to `CTX`, not R. Set
 `INREQUEST_COMPACTION=0` only to debug the classic entry-trim path (ceiling then reverts to R).
 
+Try the residency mode without touching any defaults: `KVMEM_PREFILL_PRESSURE=1 ./start-kvmem-vllm.sh`.
+
 Session reuse rides the same switch (`KVMEM_SESSION_REUSE=1` default): pass
 `X-Session-ID: <id>` on chat requests and a finished conversation parks its prefix at the
 checkpoint frontier; the next turn with the same id resumes from it.

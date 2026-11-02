@@ -19,6 +19,10 @@
 #     KVMEM_REPLAY_WINDOW=2048   尾部长度的默认值
 #     KVMEM_COMPACT_REBUILD=1    prompt 结束时 TP 汇总评分并将最终工作集整体重算；
 #                                仅同步 V2 / TP2 / PP1 / 单文本请求，默认关闭。
+#     KVMEM_PREFILL_PRESSURE=1   有界常驻压缩（实验，默认 0=上面整体重算的生产路径）：
+#                                prefill 期间按水位滚动压缩、prompt 末从主机存储重建。
+#                                试用：KVMEM_PREFILL_PRESSURE=1 ./start-kvmem-vllm.sh
+#                                启动几何 fail-closed（池不足水位+余量自动回落生产）。
 # ============================================================================
 set -uo pipefail
 LOG=${LOG:-$HOME/kvmem.log}
@@ -124,13 +128,19 @@ export KVMEM_ENTRY_HISTORY_DISK_PATH=${KVMEM_ENTRY_HISTORY_DISK_PATH:-/tmp/kvmem
 } >> "$LOG"
 
 # 把本次生效的 kvmem 参数落盘（诊断用；可选网关读同一份）
-printf 'CTX=%s\nB=%s\nR=%s\nSINK=%s\nRECENT=%s\nSESSIONS=%s\nHOST_MIB=%s\nN=%s\nPORT=%s\nCAPTURE_TOKENS=%s\n' \
-  "$CTX" "$B" "$R" "$SINK" "$RECENT" "$SESSIONS" "$HOST_MIB" "$N" "$PORT" "$CAPTURE_TOKENS" > "$PARAMS_FILE"
+printf 'CTX=%s\nB=%s\nR=%s\nSINK=%s\nRECENT=%s\nSESSIONS=%s\nHOST_MIB=%s\nN=%s\nPORT=%s\nCAPTURE_TOKENS=%s\nKVMEM_PREFILL_PRESSURE=%s\nKVMEM_SKIP_KV_CHECK=%s\n' \
+  "$CTX" "$B" "$R" "$SINK" "$RECENT" "$SESSIONS" "$HOST_MIB" "$N" "$PORT" "$CAPTURE_TOKENS" \
+  "${KVMEM_PREFILL_PRESSURE:-0}" "${KVMEM_SKIP_KV_CHECK:-0}" > "$PARAMS_FILE"
 
+# bounded residency (v0.5.0): pass the window through ONLY when the operator pinned
+# one; empty means the worker derives it from CTX (clamped at the model-native
+# position limit) - passing 0 or a stale default here previously fought the derivation.
+WINARG=()
+[ -n "${MAX_MODEL_LEN:-}" ] && WINARG=(--max-model-len "$MAX_MODEL_LEN")
 RUN=(env MAX_NUM_SEQS="$N" \
   ${VLLM_PY:-${VLLM_ROOT:-$ADAPTER/engines/vllm}/.venv/bin/python} \
   "$ADAPTER/backends/vllm/worker.py" \
-    --model "$MODEL" --port "$PORT" --served-name "$SERVED_NAME" \
+    --model "$MODEL" --port "$PORT" --served-name "$SERVED_NAME" "${WINARG[@]}" \
     --tensor-parallel-size 2 --max-num-seqs "$N" \
     --kvmem-budget "$B" --kvmem-gen-reserve "$R" \
     --kvmem-sink-tokens "$SINK" --kvmem-recent-tokens "$RECENT" \

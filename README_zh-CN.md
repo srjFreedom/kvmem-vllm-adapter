@@ -158,6 +158,7 @@ fail-closed：池顶不足水位+余量时自动禁用并回落生产语义（`p
 事件）。超长 prompt 另需 `MAX_MODEL_LEN` 高于 prompt 且 `KVMEM_SKIP_KV_CHECK=1`
 （RoPE 位置表本身按模型原生 262,144 分配，不是瓶颈）。
 
+试用有界常驻压缩：`KVMEM_PREFILL_PRESSURE=1 ./start-kvmem-vllm.sh`（超池 needle 端到端，见上）。
 改完 `sudo systemctl restart kvmem-vllm` 生效（无热改），`kvmem-params.env` 记录本次生效值。
 
 ## 运维
