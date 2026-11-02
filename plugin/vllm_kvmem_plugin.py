@@ -2030,8 +2030,20 @@ def register():
                 sampling = getattr(old, "sampling_params", None)
                 arrival = int(getattr(old, "arrival_time", 0) or 0)
                 priority = int(getattr(old, "priority", 0) or 0)
+                # EXPERIMENT SWITCH (goal round 20): a rebuild child on the SAME rid
+                # inherits every per-identity structure the worker never got a chance to
+                # remove (detach + re-add happen inside ONE schedule() round - the worker
+                # sees the rid continuously). KVMEM_REBUILD_NEW_RID=1 gives the child a
+                # fresh engine-side identity to isolate that whole surface; outputs are
+                # mapped back to the original rid in EngineCore.step, so the client stream
+                # is unaffected.
+                _engine_rid = request_id
+                _alias = None
+                if os.environ.get("KVMEM_REBUILD_NEW_RID", "") in ("1", "true", "yes"):
+                    _engine_rid = f"{request_id}#kvmr{next(_rebuild_rid_seq)}"
+                    _alias = {request_id: _engine_rid}
                 req = Request(
-                    request_id=request_id,
+                    request_id=_engine_rid,
                     prompt_token_ids=new_prompt,
                     sampling_params=sampling,
                     pooling_params=getattr(old, "pooling_params", None),
@@ -2054,7 +2066,37 @@ def register():
                 # and enqueues to `waiting` in one go. `waiting.add_request` alone leaves the
                 # dict empty and the very next schedule dies with KeyError (measured).
                 self.add_request(req)
+                # THE PACK-ZONE EXCLUSION (goal round 20 root fix): the worker just packed
+                # the selection into pool pages starting at block `first` (phys_head in
+                # rebuild_phys_diag). Fresh admissions draw blocks from the engine free
+                # queue and CAN land on the pack zone; pages the rebuilt prompt does not
+                # re-cover stay stale garbage INSIDE the child's own attention row - the
+                # child then attends over garbage in the middle of its prompt (measured:
+                # pack blocks 1..17 vs child row starting at block 1; same-rid experiments
+                # excluded every identity-reuse surface but kept failing for exactly this
+                # reason). Reserve the whole pack range until the child retires it.
+                try:
+                    _mm = getattr(self, "kvmem_pack_map", None)
+                    if _mm is None:
+                        _mm = self.kvmem_pack_map = {}
+                    _det = (_channel_state.get("last_pack") or {})
+                    _b0 = int(_det.get("block_first_pool", 1) or 1)
+                    _nb = int(_det.get("pack_blocks", 0) or 0)
+                    _mm[request_id] = list(range(_b0, _b0 + _nb))
+                except Exception:
+                    pass
+                # the runtime keys (worker) and the scheduler's per-request marks must use
+                # the SAME identity the engine sees under the experiment switch.
+                try:
+                    if _alias:
+                        _mr = getattr(self, "kvmem_map", None)
+                        if _mr is None:
+                            _mr = self.kvmem_map = {}
+                        _mr.update(_alias)
+                except Exception:
+                    pass
                 entry = {"kind": "rebuild_queued", "pid": os.getpid(), "req": request_id,
+                         "engine_rid": _engine_rid,
                          "new_prompt": len(new_prompt),
                          "selected_pages_tokens": len(ids), "outputs": len(outs),
                          "old_prompt": int(getattr(old, "num_prompt_tokens", 0) or 0),
@@ -2071,6 +2113,28 @@ def register():
                 return {"ok": False, "error": str(exc)[:200]}
 
         Scheduler.queue_kvmem_reconstruction = queue_kvmem_reconstruction
+
+        import itertools
+        from vllm.v1.engine.core import EngineCore
+        _rebuild_rid_seq = itertools.count(1)
+
+        original_step_c = EngineCore.step
+        if not getattr(original_step_c, "_kvmem_rid_map_patched", False):
+            def step_c(self, *a, **kw):
+                outputs = original_step_c(self, *a, **kw)
+                # reverse-map rebuilt-child engine ids back to the client rid so the
+                # OpenAI server (and the client) sees one continuous generation.
+                _mr = getattr(self.scheduler, "kvmem_map", None)
+                if outputs and _mr:
+                    _inv = {v: k for k, v in _mr.items()}
+                    # step() -> tuple[dict[int, EngineCoreOutputs], bool]
+                    for _eco in (outputs[0] or {}).values():
+                        for o in (getattr(_eco, "outputs", None) or ()):
+                            if o.request_id in _inv:
+                                o.request_id = _inv[o.request_id]
+                return outputs
+            step_c._kvmem_rid_map_patched = True
+            EngineCore.step = step_c
 
         original = Scheduler.schedule
         if not getattr(original, "_kvmem_channel_patched", False):

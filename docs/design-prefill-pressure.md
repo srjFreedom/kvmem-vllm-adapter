@@ -445,3 +445,27 @@ fresh 分配由**引擎 free 队列顺序**决定。**replay 实验（同 ids �
 → **若 needle ✓**：压缩轮与 child 协议联手缺陷=压缩轮 store/统计残值；
 → **若仍 ✗**：pack dest 顺序 bug 实锤（child 从未自写而被 pack 字节污染），
    修复=child 首步前清掉 pack dest 区间或按引擎分配序重排 pack。
+
+## 6.21 Round 20：同 rid 复用面整体排除，根因定案=pack 区 × 引擎分配区交叠
+
+**new-rid 判决实验（`KVMEM_REBUILD_NEW_RID=1` + step 输出反向映射）**：
+- 首轮 wiring 自伤两处（kvmem_map 未初始化；register 内 EngineCore 本地名未导入 → 整个
+  channel 块 UnboundLocalError 崩死）——当场定罪修复；
+- v2 完整跑通：child engine_rid=`...#kvmr1`、输出映射回原 rid、HTTP 130.4s 正常返回、
+  reconstruction_started×4、rebuild_phys_diag n=1680——**仍 4/4 错**。
+⇒ **同 rid 的全部复用面（行/账本/state slot/GDN/draft/output 路由）被"全新引擎身份"
+整体排除**。child 与 fresh replay 至此只剩**一个**差异：
+**fresh replay 的分配从 free 队列拿到的块恰好被自己的 prefill 逐一重写；
+而 child 无论新旧 rid，其行内都会包含 pack 窗口 [101..1780] 中"child prompt 未覆盖到的
+stale 页"**——pack 写了 1680 页，child 需要 1936 页——中间空洞=模型读到邻接垃圾。
+
+**定案修复（round 21 实施）= pack 随分配（pack-follows-allocation）**：
+1. `_rebuild_select` 不再自选 pool 窗口 pack，改为只产出 `logical_pages` 序列并入队
+   （dest 未知，记 `_pending_pack[req]=(logical_pages, prompt_len)`）；
+2. worker execute_model 入口钩子看到 child admission（rebuilt rid + scheduled_new_reqs）
+   取 `new_block_ids` → child 行坐标即目标；**forward 之前**把 store 页写入 child 行
+   （child 首 256 页随后被自己的 prefill 原地重写=同内容覆盖，无害）；
+3. pack 失败 → 明确拒绝 requeue（fail-closed 语义不变）。
+半成品期间 reserver 骨架保持 no-op（range(1,1)）。
+
+**运维**：NEW_RID env 已撤（实验开关默认 OFF，fail-closed 语义恢复）。
