@@ -711,3 +711,17 @@ child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建
     outside the original prompt" 家族，EngineDead 500）——OFF 路径 >池重建上限是
     既有生产边界，opt-in 只开准入不开这条 ⇒ **开关必须配合 pressure 臂**（文档已写明）。
 - 站点已回生产（开关删除 + PRESSURE=0）；回归：300K → 干净 400、boot OK、离线 10/10。
+
+## 6.36 Round 33：v0.5.1 默认翻转为 pressure 臂（用户裁定）
+
+- 用户裁定：默认即 pressure（deploy `KVMEM_PREFILL_PRESSURE:-1`、站点 =1）。理由：
+  适配器存在意义 = 超池上下文 + 多用户分块；**不超池单并发直接用原生 vLLM 更快，
+  没必要用我们**——旧"保守默认 OFF"语义作废（0 保留为对照/兼容回退，非推荐）。
+- 自适应水位方案（上轮 B 选项）**pass**：水位=池边是全局概念，双用户并发时一方
+  prefill 会殃及另一方的池内数据——chunk 转存的第二动机正是多用户隔离（用户明确）。
+  现 45K 水位形态本身是按请求自律的（logical book 判、自家块裁），方向正确；
+  双并发 GPU 验收仍是未来默认语义的加固项（离线 sparse_concurrency 仅模拟）。
+- 默认翻转验收（同 boot）：short 1.6s 正常、88K needle ✓ 130.4s（=历史 pressure 档
+  一致）、250K needle ✓ 348.6s（=349.7/346.8 一致）、pressure_gate flag:true 实锤；
+  离线 10/10（deploy 默认守卫同步翻转）。几何 fail-closed（池<水位+余量自动回 0 语义）
+  保留为保护线。

@@ -216,26 +216,26 @@ Single-prompt length tiers (v0.5.x): the RECOMMENDED default caps one prompt at 
 prompts - the original kvmem engine has NO position table (ggml computes RoPE
 numerically) and admits 300K+ on this same model - opt in with
 `KVMEM_ROPE_TABLE_CTX=<CTX>`: it lifts the RoPE table, engine window and entry
-admission together. USE IT WITH `KVMEM_PREFILL_PRESSURE=1`: a 282,142-token prompt
+admission together. The default arm since v0.5.1 already satisfies this: a 282,142-token prompt
 answered correctly end-to-end (395s) on the pressure arm, while the OFF arm dies at the
 prompt-end rebuild past the pool (a known OFF-path boundary). Honest costs: the bigger
 table takes ~134 MB per rank (KV pool 226,240 -> 214,928 measured) and positions beyond
 the trained range are RoPE extrapolation - quality is the model's, exactly as in the
 original. Remove the switch to return to the clean 0.9s HTTP 400 for oversized prompts.
 
-Try the residency mode without touching any defaults: `KVMEM_PREFILL_PRESSURE=1 ./start-kvmem-vllm.sh`.
+v0.5.1 positioning (user ruling): this adapter exists for beyond-pool context and multi-user chunking - so the pressure arm IS the default. For within-pool single-tenant use plain native vLLM is simply faster; do not use this adapter for it. To fall back to the legacy prompt-end path (comparison/compat, not recommended): `KVMEM_PREFILL_PRESSURE=0 ./start-kvmem-vllm.sh`.
 
 Session reuse rides the same switch (`KVMEM_SESSION_REUSE=1` default): pass
 `X-Session-ID: <id>` on chat requests and a finished conversation parks its prefix at the
 checkpoint frontier; the next turn with the same id resumes from it.
 
-Bounded in-prefill residency (experimental, default OFF): `KVMEM_PREFILL_PRESSURE=1`
+Bounded in-prefill residency (**default ON since v0.5.1**): `KVMEM_PREFILL_PRESSURE`
 makes prefill itself roll a watermark compaction (sink+tail+scored blocks, unselected pages
 spilled to host) and rebuilds the selected view from host storage at prompt completion -
 verified 2/2 at 250K tokens, beyond both the physical pool (226,240) and the historical
 200,000 window (`ZX-4417-QJ7`, see docs/design-prefill-pressure.md §6.25-6.29). The arm is
 fail-closed at boot: a pool too small for watermark+margin disables it automatically
-(`pressure_disabled_geometry` in the sparse log). Production keeps the end-of-prompt rebuild
+(`pressure_disabled_geometry` in the sparse log) and the request falls back to the end-of-prompt rebuild
 above. Long prompts additionally need `MAX_MODEL_LEN` above the prompt and
 `KVMEM_SKIP_KV_CHECK=1` (the RoPE table itself sizes at the model's native 262,144).
 

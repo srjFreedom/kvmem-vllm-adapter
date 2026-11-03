@@ -9,7 +9,7 @@
 #     通过官方 vllm.endpoint_plugins 扩展点加载，不再有旁挂网关。
 #
 #   覆盖：B= R= SINK= RECENT= SESSIONS= HOST_MIB= N= CTX= PORT= ./本脚本
-#   超池相关（默认关闭/默认值，仅供实验）：
+#   超池相关：
 #     SELECT_BLOCK_TOKENS=1616   选择网格 = 引擎块（默认 64 = 统计桶，避免 64→32 重采样劈裂短记录）
 #     KVMEM_BLOCK_SIZE=16        请求 16-token 引擎块；混合模型会按 Mamba 对齐，
 #                                本机实测 attention 原生块仍为 1616 tokens（101 页），
@@ -19,10 +19,11 @@
 #     KVMEM_REPLAY_WINDOW=2048   尾部长度的默认值
 #     KVMEM_COMPACT_REBUILD=1    prompt 结束时 TP 汇总评分并将最终工作集整体重算；
 #                                仅同步 V2 / TP2 / PP1 / 单文本请求，默认关闭。
-#     KVMEM_PREFILL_PRESSURE=1   有界常驻压缩（实验，默认 0=上面整体重算的生产路径）：
-#                                prefill 期间按水位滚动压缩、prompt 末从主机存储重建。
-#                                试用：KVMEM_PREFILL_PRESSURE=1 ./start-kvmem-vllm.sh
-#                                启动几何 fail-closed（池不足水位+余量自动回落生产）。
+#     KVMEM_PREFILL_PRESSURE=1   有界常驻压缩【v0.5.1 起默认开启】：prefill 期间按
+#                                水位滚动压缩、prompt 末从主机存储重建——超池上下文的
+#                                正主形态（不超池单并发场景直接用原生 vLLM 更合适）。
+#                                设 0 回退整体重算的旧生产路径（兼容/对照用途）。
+#                                启动几何 fail-closed（池不足水位+余量自动回退 0 语义）。
 # ============================================================================
 set -uo pipefail
 LOG=${LOG:-$HOME/kvmem.log}
@@ -70,9 +71,9 @@ export KVMEM_BLOCKWISE=${KVMEM_BLOCKWISE:-1}
 # 整体重算：prompt prefill 末尾用 TP 汇总评分选定最终工作集并重放一遍（超池正确性的
 # 已验证路径；v0.4.0 起为默认，设 0 退回仅重排不重算的旧行为）。
 export KVMEM_COMPACT_REBUILD=${KVMEM_COMPACT_REBUILD:-1}
-# prefill 期有界常驻（goal-7833cb61 实验路径，验收前保持默认关闭）：
+# prefill 期有界常驻（v0.5.1 起默认开启的正式形态；设 0 回退旧路径）：
 # 开启后 prefill 高水位改为 budget+64 页，压力点在 chunk 边界做 sink+tail 压缩。
-export KVMEM_PREFILL_PRESSURE=${KVMEM_PREFILL_PRESSURE:-0}
+export KVMEM_PREFILL_PRESSURE=${KVMEM_PREFILL_PRESSURE:-1}
 MODEL=${MODEL:?未设置 MODEL：指向你的权重目录，例如 MODEL=$HOME/models/<你的模型>}
 # 对外模型 id：按你实际部署的权重命名（需与客户端请求里的 model 一致）。
 SERVED_NAME=${SERVED_NAME:-Qwen3.8-27B-FP8-MTP}
@@ -130,7 +131,7 @@ export KVMEM_ENTRY_HISTORY_DISK_PATH=${KVMEM_ENTRY_HISTORY_DISK_PATH:-/tmp/kvmem
 # 把本次生效的 kvmem 参数落盘（诊断用；可选网关读同一份）
 printf 'CTX=%s\nB=%s\nR=%s\nSINK=%s\nRECENT=%s\nSESSIONS=%s\nHOST_MIB=%s\nN=%s\nPORT=%s\nCAPTURE_TOKENS=%s\nKVMEM_PREFILL_PRESSURE=%s\nKVMEM_SKIP_KV_CHECK=%s\n' \
   "$CTX" "$B" "$R" "$SINK" "$RECENT" "$SESSIONS" "$HOST_MIB" "$N" "$PORT" "$CAPTURE_TOKENS" \
-  "${KVMEM_PREFILL_PRESSURE:-0}" "${KVMEM_SKIP_KV_CHECK:-0}" > "$PARAMS_FILE"
+  "${KVMEM_PREFILL_PRESSURE:-1}" "${KVMEM_SKIP_KV_CHECK:-0}" > "$PARAMS_FILE"
 
 # bounded residency (v0.5.0): pass the window through ONLY when the operator pinned
 # one; empty means the worker derives it from CTX (clamped at the model-native

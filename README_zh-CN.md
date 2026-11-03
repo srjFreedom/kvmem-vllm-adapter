@@ -150,7 +150,7 @@ CUDA-graph 缓冲比 eager 多吃约 2.5K token，0.97 会把池压到 `MAX_MODE
 
 `THINKING_BUDGET` 默认为空 = **思考 token 无上限**；填数字才会限制推理长度。
 
-有界常驻压缩（实验开关，默认关）：`KVMEM_PREFILL_PRESSURE=1` 让 prefill 期间按水位
+有界常驻压缩（**v0.5.1 起默认开启**）：`KVMEM_PREFILL_PRESSURE` 让 prefill 期间按水位
 （B+R/2）滚动压缩——sink+尾块+评分选块、未选页回写主机，prompt 完成时用主机存储重建
 选中视图并重排队。实测 250K token（超池 226,240 且超原窗 200,000）端到端 2/2 答对
 `ZX-4417-QJ7`（详见 docs/design-prefill-pressure.md §6.25-6.29）。该臂启动即
@@ -167,7 +167,9 @@ fail-closed：池顶不足水位+余量时自动禁用并回落生产语义（`p
 （实测 226,240→214,928）；超出训练范围的 position 属 RoPE 外推，质量交给模型
 （原版同样如此）。关掉开关即回默认档（300K 变回 0.9s 干净 400）。
 
-试用有界常驻压缩：`KVMEM_PREFILL_PRESSURE=1 ./start-kvmem-vllm.sh`（超池 needle 端到端，见上）。
+v0.5.1 定位（用户裁定）：适配器的存在意义是超池上下文与多用户分块——所以默认就是
+pressure 臂；不超池且单并发的场景直接用原生 vLLM 更高，无需本适配器。回退旧生产
+语义：`KVMEM_PREFILL_PRESSURE=0 ./start-kvmem-vllm.sh`（对照/兼容用，非推荐）。
 改完 `sudo systemctl restart kvmem-vllm` 生效（无热改），`kvmem-params.env` 记录本次生效值。
 
 ## 运维

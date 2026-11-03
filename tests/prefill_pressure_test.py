@@ -56,8 +56,8 @@ pl = src(os.path.join(ROOT, "plugin", "vllm_kvmem_plugin.py"))
 check("plugin installs the runtime flag from cfg (default False)",
       'runtime.prefill_pressure = bool(cfg.get("prefill_pressure", False))' in pl)
 dp = src(os.path.join(ROOT, "deploy", "run-kvmem-vllm.sh"))
-check("deploy default is OFF (fail-closed)",
-      "KVMEM_PREFILL_PRESSURE=${KVMEM_PREFILL_PRESSURE:-0}" in dp)
+check("deploy default is the pressure arm (v0.5.1 user ruling)",
+      "KVMEM_PREFILL_PRESSURE=${KVMEM_PREFILL_PRESSURE:-1}" in dp)
 
 # v0.5.x architecture note: CTX is a VIRTUAL ceiling; with no disk tier it must
 # self-limit to the host share (spilled pages the rebuild needs cannot be dropped).
