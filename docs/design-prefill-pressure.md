@@ -675,3 +675,19 @@ child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建
   position rebasing（视图相对坐标）——独立工程题，未立项。
 - 验证：离线 10/10（含新 source-guard）、部署冒烟 88K OFF needle ✓ 108.1s、
   host_share 事件正常且 cap 未误触发。main 前行（v0.5.0 tag 不动）。
+
+## 6.34 Round 31 后段（用户问题）：CTX 512K 下 300K 单条上下文——拆掉一颗活雷
+
+- 用户问："CTX=512K、上下文到 300K 会怎么处理"。实测拆出**旧补丁的失效前提**：
+  fork `input_processor._validate_prompt_len` 被 KVMem 改为按 `KVMEM_ENTRY_CTX`（=CTX）
+  放行 decoder prompt——那是**窗口钉 200000 时代**的正确补丁（表 262144 > 一切进入的
+  position，250K 才因此安然无恙）。窗口跟 CTX 后（262,144=表大小），>262,144 的 prompt
+  照样进门，prefill position 冲到表外 = **nan/CUDA illegal access**（fork 警告原文），
+  4 分钟计算后崩服务。探针实测：修复前 282K/300K 请求**进入引擎**（Timeout=在算）。
+- 修复（worker 窗口设定处一行）：`KVMEM_ENTRY_CTX` clamp 到 `_mm`（min(CTX, native)）——
+  入口天花板=物理位置表。**实弹：300K → 0.9s 干净 400**（vLLM 标准文案），
+  ≤262,143 的进入路径不变（250K 验收为证）。CTX 512K 的语义修正表述：
+  **虚拟上下文的可用长度 = min(CTX, 262,144)**——超过位置表的部分当前实现无法单条承载
+  （需 prerope tier/视图重编号，见 §6.33），多轮累计+历史分层另算。
+- 探针教训：`KVMEM_ENTRY_INREQUEST_COMPACTION` 由 CLI 开关单源仲裁（entry_compaction_env
+  文档语义），探针必须带 `--kvmem-inrequest-compaction` 才走真链。

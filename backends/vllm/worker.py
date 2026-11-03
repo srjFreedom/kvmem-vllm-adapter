@@ -299,6 +299,23 @@ def main(argv=None) -> int:
         if _mm > 0:
             args += ["--set", f"MAX_MODEL_LEN={_mm}"]
             env["MAX_MODEL_LEN"] = str(_mm)
+            # PHYSICAL-POSITION CLAMP ON THE ENTRY CEILING (2026-11-03, found by the
+            # user's 300K question): the fork's input validation admits any prompt up
+            # to KVMEM_ENTRY_CTX (CTX), a patch made when the window was pinned BELOW
+            # the model's position table so CTX-exceeding-window prompts were still
+            # safe. With the window following CTX that premise breaks: a prompt above
+            # the model-native position limit would enter prefill and index the RoPE
+            # table out of bounds at ~262,144 (nan / CUDA illegal access after minutes
+            # of compute). Clamp the ENTRY ceiling to the same min(CTX, native) the
+            # window took - oversized prompts now get a clean HTTP 400 at the door.
+            try:
+                _ec = int(env.get("KVMEM_ENTRY_CTX") or 0)
+                if _ec > _mm:
+                    env["KVMEM_ENTRY_CTX"] = str(_mm)
+                    print(f"[kvmem backends/vllm] KVMEM_ENTRY_CTX clamped "
+                          f"{_ec} -> {_mm} (position-table bound)")
+            except Exception:
+                pass
             print(f"[kvmem backends/vllm] MAX_MODEL_LEN pinned to {_mm} (engine window)")
         else:
             args += ["--set", "MAX_MODEL_LEN=-1"]
