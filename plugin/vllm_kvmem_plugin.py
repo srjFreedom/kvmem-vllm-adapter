@@ -2004,16 +2004,13 @@ def register():
                     # state that was never computed, so such hits are recorded and
                     # DEFERRED: the entry survives untouched (no proof RPC, no discard)
                     # until the replay mode consumes it properly.
-                    if (not getattr(meta, "has_state", True)
-                            or _sched_cfg(scheduler).get("prefill_pressure")):
-                        # Pressure boots DEFER every hit (2026-11-03, C2-fix battery):
-                        # the resume-applied turn's books seed wrong vs the Core's
-                        # rewound counter (measured: 54 quiescent_compact_stale - every
-                        # watermark knife discarded as stale -> view ran to 122880 ->
-                        # answer poisoned). Fixing the seed is the NEXT increment;
-                        # until then the pressure arm keeps sealing (correct full turns,
-                        # entries never consumed) and the OFF arm keeps applying
-                        # resumes exactly as v0.4.0 qualified.
+                    if not getattr(meta, "has_state", True):
+                        # Plan-C (C1) restore-type entries: pages-only, never
+                        # skip-applied. DENSE-state entries (C2) apply normally -
+                        # the worker adoption now derives the SAME implicit
+                        # namespace the Core used (the 2026-11-03 fix; before it,
+                        # adoption refused while Core applied, and the turn read
+                        # un-written prefix pages - the 2e8bfe9 poison lineage).
                         _append(_sched_cfg(scheduler).get("probe_log")
                                 or "/tmp/kvmem_sparse.jsonl",
                                 {"kind": "kvmem_resume_deferred", "req": rid,

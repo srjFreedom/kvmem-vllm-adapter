@@ -812,3 +812,22 @@ child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建
 - 下一增量（已定形）：修 resume 应用的 worker 侧账本种子（note_resume 的
   (hit,visible) 如何进 st.tokens/页计数 vs Core num_computed=visible），
   使刀在 resume turn 正常落；恢复 pressure 的 apply 与 22 秒收益。
+
+
+## 6.42 C2 达成：adoption owner 门 = 最后一块毒（stale=0，resume 与冷字节一致）
+
+- 病理终章：Core 应用了 skip 而 worker 侧 `_adopt_session` 还卡在"native
+  session_id missing"门（隐式命名空间裁决没传到 adoption）→ 页/状态从未还原，
+  attention 读未写前缀页 = 2e8bfe9 毒代；54×stale 是同一根因的账本表象。
+- 修复三处：①adoption 用同一隐式命名空间（正确性仍由 digest+hashes 把关）；
+  ②phase-1 guard 改 `st.resume`（`_resume` dict 在 adoption 时已 pop，旧守卫恒假）；
+  ③pressure apply 恢复（defer 只留 restore 型条目）。
+- 决定性 battery（boot 干净）：152K 四连发 216.7/169.2/214.7/169.2s、
+  88K 128.8/103.7s——**resume turn 省 47s/25s（22%/19%）且与冷跑字节一致**
+  （B=D=A=C=2899f9138f524f1a，F=E=c1e81469911b7066）；stale=0、resumed=6、
+  刀 16 次全落、视图全 ≤48880、双锚 OK。
+- 语义账本：全量 turn 密封（dense snap+publish）、resume turn 消费且不重复密封
+  （防链式叠加）→ 隔行快（一次性消费的既有设计形态）；alternation 若要消，
+  下一步做 resume-turn 的 inherit-store 再密封，收益=每 turn 都快。
+- C3（本轮）：以上即默认行为（pressure 默认 ON、session_reuse 默认 ON，无新开关），
+  文档同步 README×2 后会签。

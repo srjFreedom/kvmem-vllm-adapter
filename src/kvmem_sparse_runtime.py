@@ -1021,9 +1021,12 @@ class VllmSparseRuntime:
             return False
         if getattr(st, "compacted_in_prefill", False) or not self.has_recurrent:
             return False
-        if req in getattr(self, "_resume", {}):
-            return False   # a resume turn carries the previous seal's bounded
-                           # double-apply; re-snapshotting would compound chains
+        if getattr(st, "resume", None) is not None:
+            return False   # an adopted (resumed) turn carries the previous
+                           # seal's bounded double-apply; re-snapshotting would
+                           # compound it. Note: the `_resume` dict is ALREADY
+                           # popped by `_adopt_session` at this point - the
+                           # request-level marker on st is the only valid tell.
         if getattr(self, "_dense_state_snap", {}).get(req):
             return False
         ids = self._prompt_ids.get(req)
@@ -1426,8 +1429,13 @@ class VllmSparseRuntime:
             return None
         owner_session_id = self._session_ids.get(req)
         if not owner_session_id:
-            self.log({"kind": "resume_skip", "req": req, "reason": "native session_id missing"})
-            return None
+            # Prefix-matching ruling (2026-11-03): the adoption must see the SAME
+            # implicit namespace the Core lookup and the seal used, or the Core
+            # would skip-apply against pages this rank never adopts (measured:
+            # pressure resume turns read un-written prefix pages - the 2e8bfe9
+            # poisoned lineage). Correctness still rides the digest + hashes check
+            # below, not any claimed identity.
+            owner_session_id = ("", "__prefix_cache__")
         ids = tuple(self._prompt_ids.get(req, ()) or ())
 
         def _digest(frontier):

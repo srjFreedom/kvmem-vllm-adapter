@@ -119,3 +119,17 @@ scripts/wait_ready.sh 18200 900 --smoke
 启动日志核对行：`Spec decode: mtp/4`、`MTP graph policy: nosync`、
 `GPU KV cache size: 201,438 tokens`、`session_reuse_on`、
 `retrieval=on -> original compiled path + query bridge`。
+
+
+## 8. 会话 = 内容前缀（2026-11-03，方案 C 定案）
+
+- 判定去身份化：park/resume/adoption 全链路以 prompt 内容前缀（block hashes +
+  prefix digest）为键，客户端零要求（对齐原版 `prompt.common_prefix` 立场，
+  driver.cpp:144）；`X-Session-ID` 降级为可选加速器（独立命名空间，不交叉）。
+- 密封形态（pressure 臂，默认行为）：dense 窗口拍 StateImage CPU 快照
+  （executed≥frontier、首刀之前）、finish 发布（store 全集）；restore 型条目
+  只命中不应用（defer 事件），等重放模式升级后消费。
+- 实测收益：命中轮省 prefill 88K ~25s / 152K ~47s，**与冷跑逐字节一致**
+  （152K 代 2899f9138f524f1a、88K 代 c1e81469911b7066）；刀全落 stale=0。
+- 已知形态：一次性消费 ⇒ 隔行快（全量 turn 密封、resume turn 不重复密封——
+  防链式叠加）；消隔行 = inherit-store 再密封，另轮立项。

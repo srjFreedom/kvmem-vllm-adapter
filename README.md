@@ -17,9 +17,12 @@ What that buys you on 2× RTX 2080 Ti (all numbers measured on the v0.4.0 produc
 - **Beyond-pool context, by default.** Resident prefill + in-request compaction are ON out of the
   box: an 88K prompt on a 36,864-token resident window answers a mid-archive needle correctly;
   the pool itself holds 201,438 tokens at `GPU_UTIL=0.972`.
-- **Session reuse.** With `X-Session-ID`, a finished conversation parks its prefix KV + recurrent
-  state into host RAM; the next turn resumes from the frontier and skips ~34 s of prefill on the
-  85K archive (needle answered identically through either path).
+- **Session reuse by content prefix - no header or field required.** A finished request parks
+  its prefix KV plus the recurrent StateImage at that frontier into host RAM; the next request
+  sharing that prefix hits automatically and skips the recomputed prefill (measured: ~25 s saved
+  at 88K, ~47 s at 152K, and the resumed turn is BYTE-IDENTICAL to the cold run). `X-Session-ID`
+  remains an optional accelerator - it matches within its own declared namespace and never
+  crosses with prefix-declared traffic.
 - **One service, one port (18200).** OpenAI-compatible API, `/metrics`, `/docs` and the web UI on
   the same origin — no sidecar gateway, no second process to keep alive.
 - **kvmem stays the policy layer.** It decides how much history is sent (B), which pages stay
@@ -225,9 +228,10 @@ original. Remove the switch to return to the clean 0.9s HTTP 400 for oversized p
 
 v0.5.1: the pressure arm IS the default (beyond-pool context and multi-user chunking are what this adapter exists for). To fall back to the legacy prompt-end path (comparison/compat): `KVMEM_PREFILL_PRESSURE=0 ./start-kvmem-vllm.sh`.
 
-Session reuse rides the same switch (`KVMEM_SESSION_REUSE=1` default): pass
-`X-Session-ID: <id>` on chat requests and a finished conversation parks its prefix at the
-checkpoint frontier; the next turn with the same id resumes from it.
+Session reuse rides the same switch (`KVMEM_SESSION_REUSE=1` default) and needs nothing
+from the client: a finished request parks its prefix at the checkpoint frontier and the next
+request sharing that prefix resumes from it (identity headers, when present, only act as a
+faster index within their own namespace).
 
 Bounded in-prefill residency (**default ON since v0.5.1**): `KVMEM_PREFILL_PRESSURE`
 makes prefill itself roll a watermark compaction (sink+tail+scored blocks, unselected pages

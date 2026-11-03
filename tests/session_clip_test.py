@@ -109,9 +109,11 @@ check("_seal_restore_checkpoint" in _rr and "session_checkpoint_sealed_restore" 
       "runtime seals a restore checkpoint at the pressure rebuild queue")
 check("restore_only=False" in _rr and "not restore_only and capacity * self.page_tokens" in _rr,
       "restore publish waives the full-resident contract only for restore mode")
-check('"kvmem_resume_deferred"' in _rs and 'if (not getattr(meta, "has_state", True)' in _rs
-      and "prefill_pressure" in _rs.split("kvmem_resume_deferred")[0].rsplit("if (not getattr(meta", 1)[-1],
-      "Core defers restore hits and ALL hits on pressure boots (seed fix pending)")
+check('"kvmem_resume_deferred"' in _rs and 'if not getattr(meta, "has_state", True):' in _rs,
+      "Core defers restore-type hits only; dense entries apply")
+_rr2 = _rr
+check('owner_session_id = ("", "__prefix_cache__")' in _rr2.split("def _adopt_session")[1].split("def ")[0],
+      "worker adoption uses the implicit namespace (Core/worker agreement)")
 
 print("FAIL session_clip_test" if failed else "PASS session_clip_test")
 sys.exit(1 if failed else 0)
