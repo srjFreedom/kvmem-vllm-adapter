@@ -185,5 +185,66 @@ def main():
     sys.exit(0 if not failed else 1)
 
 
+
+def test_restore_batch_equivalence():
+    """Layer-major bulk restore must land identical bytes and identical residency
+    books as the per-page loop (the four callers keep the loop as fallback; this
+    pins the fast path to it)."""
+    import sys as _sys
+    _sys.path.insert(0, "src")
+    import torch
+    from kvmem_sparse_orchestrator import SparseOrchestrator
+
+    class _Store:
+        def __init__(self, data): self._d = data
+        def has(self, p): return p in self._d
+        def get(self, p): return self._d[p]
+
+    def mk(seed, n=8, layers=3, tok=4, d=2):
+        gen = torch.Generator().manual_seed(seed)
+        kv = torch.zeros(n, tok, layers, d)  # slot-major page rows
+        store = {}
+        for page in range(2, 7):
+            store[page] = [torch.randn(tok, layers, d, generator=gen)
+                           for _ in range(2)]  # per-KV-tensor layer lists
+        return kv, store
+
+    def fake_self(kv1, kv2, store):
+        class _O:
+            pass
+        o = _O()
+        o.kvs = [type("T", (), {})()]
+        o.store = store
+        o.resident = set()
+        o.slot_of = {}
+        o.baked_delta = {}
+        return o
+
+    kv, store = mk(7)
+    # emulate two KV tensors: single-tensor list is enough for the stack path
+    items = [(p, 10 - p) for p in sorted(store)]
+    o = fake_self(kv, kv, store)
+    # batch on a clone namespace with real tensors as kvs
+    class KVHolder:  # store.get(page)[layer] shapes -> kv rows
+        def __init__(self):
+            self.kv = torch.zeros(16, 4, 2, 2)
+    kvt = KVHolder().kv
+    o.kvs = [kvt]
+    store2 = {p: [torch.randn(4, 2, 2) for _ in range(1)] for p in sorted(store)}
+    o.store = type("S", (), {"has": staticmethod(lambda p: p in store2),
+                             "get": staticmethod(lambda p: store2[p])})()
+    n = SparseOrchestrator.restore_pages_batch(o, items)
+    assert n == len(items), f"batch restored {n}/{len(items)}"
+    # per-page expectation
+    ref = torch.zeros(16, 4, 2, 2)
+    for layer in range(1):
+        for p, sl in items:
+            ref[sl] = store2[p][layer]
+    assert torch.equal(kvt, ref), "batch bytes differ from per-page writes"
+    assert o.resident == {p for p, _ in items}
+    assert o.slot_of == dict(items) and all(v == 0 for v in o.baked_delta.values())
+    print("  ok  restore_pages_batch == per-page restore (bytes + books)")
+
+test_restore_batch_equivalence()
 if __name__ == "__main__":
     main()

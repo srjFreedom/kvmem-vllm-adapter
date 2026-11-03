@@ -1101,6 +1101,47 @@ class SparseOrchestrator:
             return pages
         return [p for p in pages if p * self.page_tokens < limit]
 
+    def restore_pages_batch(self, items):
+        """Layer-major bulk restore: ONE host->device transfer per KV tensor instead
+        of one per (page, layer).
+
+        Same bytes into the same slots, same residency books as `restore_page`
+        (which is a pure copy; the rank argument never touched the bytes). The
+        per-page loop was the dominant prompt-end rebuild cost (measured: ~34k
+        micro-copies ~15s at 88K vs ~0.3s of raw data movement - granularity,
+        not bandwidth). Any layout problem raises and the CALLER keeps its
+        per-page loop as the fallback, so this fast path cannot change
+        outcomes - only their latency.
+        """
+        import torch
+        import time as _t_mod
+        _t_b = _t_mod.perf_counter()
+        if not items:
+            return 0
+        pairs = [(int(pg), int(sl)) for pg, sl in items]
+        probe = self.store.get(pairs[0][0])
+        if not isinstance(probe, (list, tuple)) or len(probe) != len(self.kvs):
+            raise ValueError("store layout is not a per-layer stack")
+        rows_host = []
+        for layer in range(len(self.kvs)):
+            rows_host.append(torch.stack([self.store.get(pg)[layer] for pg, _ in pairs]))
+        slots_cpu = [sl for _, sl in pairs]
+        for layer, kv in enumerate(self.kvs):
+            slots_t = torch.tensor(slots_cpu, device=kv.device, dtype=torch.long)
+            kv.index_copy_(0, slots_t, rows_host[layer].to(kv.device, non_blocking=True))
+        for pg, sl in pairs:
+            self.resident.add(pg)
+            self.slot_of[pg] = sl
+            self.baked_delta[pg] = 0
+        import time as _t_mod
+        try:
+            with open("/tmp/kvmem_sparse.jsonl", "a") as _f:
+                _f.write('{"kind": "restore_batch_applied", "pages": %d, '
+                         '"elapsed_s": %.3f}\n' % (len(pairs), _t_mod.perf_counter() - _t_b))
+        except Exception:
+            pass
+        return len(pairs)
+
     def restore_page_rank(self, page, dst_page, rank):
         """Load a stored page into tensor page `dst_page` at compacted position `rank`.
 

@@ -1156,12 +1156,17 @@ class VllmSparseRuntime:
             self.log({"kind": "resume_no_room", "req": req, "pages": len(pages),
                       "row": len(row_values), "visible": int(visible_tokens)})
             return False
-        for rank, page in enumerate(pages):
-            try:
-                orch.restore_page_rank(page, row_values[rank], rank)
-            except Exception:
-                self.log({"kind": "resume_restore_failed", "req": req, "page": int(page)})
-                return False
+        try:
+            orch.restore_pages_batch([(int(pg), int(row_values[i]))
+                                      for i, pg in enumerate(pages)])
+        except Exception:
+            for rank, page in enumerate(pages):
+                try:
+                    orch.restore_page_rank(page, row_values[rank], rank)
+                except Exception:
+                    self.log({"kind": "resume_restore_failed", "req": req,
+                              "page": int(page)})
+                    return False
         restored = tuple(row_values[:len(pages)])
         # Preserve the engine's already-synced tail (this step's chunk pages). A resumed
         # request schedules the rest of its prompt in the same admission, so the row must cover
@@ -3121,14 +3126,19 @@ class VllmSparseRuntime:
             #    `needed - store_delta`, never a rotation of a rotation).
             dest = {lp: pool_pages[i] for i, lp in enumerate(logical_pages)}
             done = 0
-            for rank_, lp in enumerate(logical_pages):
-                if orch.store.has(lp):
-                    try:
-                        orch.restore_page_rank(int(lp), int(dest[lp]), int(rank_))
-                        done += 1
-                        continue
-                    except Exception:
-                        return False, f"pack failed at page {lp} rank {rank_}"
+            _items = [(int(lp), int(dest[lp])) for lp in logical_pages
+                      if orch.store.has(lp)]
+            try:
+                done += orch.restore_pages_batch(_items)
+            except Exception:
+                for rank_, lp in enumerate(logical_pages):
+                    if orch.store.has(lp):
+                        try:
+                            orch.restore_page_rank(int(lp), int(dest[lp]), int(rank_))
+                            done += 1
+                            continue
+                        except Exception:
+                            return False, f"pack failed at page {lp} rank {rank_}"
                 # resident question page: still at its engine slot; copy the raw bytes (no
                 # rotation hop needed - it keeps its baked phase and rebakes to `rank_`)
                 src = orch.slot_of.get(int(lp))
@@ -3369,14 +3379,22 @@ class VllmSparseRuntime:
                           "pages": len(phys_pages)})
             return st
         missing = 0
-        for rank, (lp, phys) in enumerate(zip(logical_pages, phys_pages)):
-            try:
-                if orch.store.has(int(lp)):
-                    orch.restore_page_rank(int(lp), int(phys), int(rank))
-                else:
+        _has = [int(lp) for lp in logical_pages if orch.store.has(int(lp))]
+        missing += len(logical_pages) - len(_has)
+        _items = [(int(lp), int(phys_pages[i]))
+                  for i, lp in enumerate(logical_pages) if int(lp) in set(_has)]
+        try:
+            orch.restore_pages_batch(_items)
+        except Exception:
+            missing = 0
+            for rank, (lp, phys) in enumerate(zip(logical_pages, phys_pages)):
+                try:
+                    if orch.store.has(int(lp)):
+                        orch.restore_page_rank(int(lp), int(phys), int(rank))
+                    else:
+                        missing += 1
+                except Exception:
                     missing += 1
-            except Exception:
-                missing += 1
         st.row = tuple(phys_pages)
         st.logical = tuple(logical_pages)
         st.seq_len = int(len(phys_pages) * pt)
@@ -3598,12 +3616,16 @@ class VllmSparseRuntime:
                           "resident": int(resident_before), "pages": len(logical_pages)})
             return st
         moved = failed = 0
-        for rank, (lp, phys) in enumerate(zip(logical_pages, phys_pages)):
-            try:
-                orch.restore_page_rank(int(lp), int(phys), int(rank))
-                moved += 1
-            except Exception:
-                failed += 1
+        try:
+            moved += orch.restore_pages_batch(
+                [(int(lp), int(phys)) for lp, phys in zip(logical_pages, phys_pages)])
+        except Exception:
+            for rank, (lp, phys) in enumerate(zip(logical_pages, phys_pages)):
+                try:
+                    orch.restore_page_rank(int(lp), int(phys), int(rank))
+                    moved += 1
+                except Exception:
+                    failed += 1
         st.row = tuple(phys_pages)
         st.logical = tuple(logical_pages)
         st.seq_len = int(visible)
