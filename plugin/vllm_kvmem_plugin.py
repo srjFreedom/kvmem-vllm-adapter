@@ -2891,6 +2891,25 @@ def _install(cls, module_name, probe, smoke, state):
                     {"kind": "advance_error", "error": traceback.format_exc()})
         except Exception:
             self._kvmem_req_ids = []
+        # Plan D (KVMEM_PLAN_D=1): the per-request write-delta channel. R1 wires it
+        # IDENTITY (all zeros): slot_positions = positions, byte-identical to stock
+        # behavior - this proves the tensor path is live and harmless before R2
+        # starts moving views through it. The tensor is persistent device memory so
+        # CUDA graphs replay the live values (same contract as the scalar offset).
+        if os.environ.get("KVMEM_PLAN_D", "") in ("1", "true", "yes", "on"):
+            try:
+                _dl = getattr(self, "kvmem_slot_deltas", None)
+                if _dl is None:
+                    import torch as _td
+                    _n = int(getattr(self, "max_num_reqs", 0) or 0)
+                    if _n > 0:
+                        _dl = _td.zeros(_n, dtype=_td.int32, device="cuda")
+                        self.kvmem_slot_deltas = _dl
+                        _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "plan_d_wired", "pid": os.getpid(),
+                                 "reqs": _n})
+            except Exception:
+                self.kvmem_slot_deltas = None
         result = original(self, scheduler_output, *args, **kwargs)
         if os.environ.get("KVMEM_EXEC_POST", "1") == "0":
             return result

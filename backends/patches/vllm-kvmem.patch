@@ -3053,3 +3053,34 @@ index 7e7ce67..6adb5f0 100644
  def copy_kv_cache_blocks_inplace(
      kv_caches: Iterable[torch.Tensor],
      num_blocks: int | Sequence[int],
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 80e1156..9e722fa 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1574,11 +1574,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # difference (true - compacted) for the whole step; it is a tensor so a CUDA graph replays
+         # the live value instead of one baked in at capture time. None = stock behaviour.
+         slot_positions = None
+-        offset = getattr(self, "kvmem_slot_offset", None)
+-        if offset is not None:
+-            session_hint = getattr(self, "kvmem_slot_offset_uses", None)
+-            if session_hint is None or int(session_hint) > 0:
+-                slot_positions = input_batch.positions - offset
++        # KVMem Plan-D: per-request write-address deltas. `kvmem_slot_deltas` is an
++        # int32 tensor over request slots holding (true_base - view_base) for the
++        # CURRENT chunk of each request. It replaces the whole-step scalar when the
++        # adapter runs the uncompressed token stream (D1: num_computed never rewinds,
++        # the attention row is the compacted view, and each request's chunk maps to
++        # contiguous view slots with its own offset). None = legacy scalar behavior.
++        deltas = getattr(self, "kvmem_slot_deltas", None)
++        if deltas is not None:
++            slot_positions = input_batch.positions - deltas[input_batch.idx_mapping]
++        if slot_positions is None:
++            offset = getattr(self, "kvmem_slot_offset", None)
++            if offset is not None:
++                session_hint = getattr(self, "kvmem_slot_offset_uses", None)
++                if session_hint is None or int(session_hint) > 0:
++                    slot_positions = input_batch.positions - offset
+         # KVMem diagnostic: a write address past the row's coverage is an illegal access the length
+         # checks cannot see (the row is grown for `seq_len + n`, but the scheduler may schedule more
+         # than that, or the offset may be stale by one step). Record the worst case, once per step.

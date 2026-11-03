@@ -1,22 +1,22 @@
 {
-  "layout": "pinned-engines-with-patches",
-  "engines": {
-    "path": "engines/vllm",
-    "upstream": "https://github.com/weicj/vLLM-2080Ti-Definitive.git",
-    "base_commit": "93c9013e375b1ecbf2da88179d2a31175a0d5c99",
-    "license_file": "engines/vllm/LICENSE",
-    "local_changes": "KVMem integration (query bridge with CUDA-graph-capturable capture_k/capture_q, capture_q call sites, scheduler resident books + session checkpoint clip under speculation, re-admission/rebuild, SM75/FP8 profiles, beyond-pool reconstruction). v0.4.0: graph-safe static scratch + bit-exact rotation scoring. Excludes run-logs and triton-cache (JIT artifacts, rebuilt on first run).",
-    "patch": "backends/patches/vllm-kvmem.patch",
-    "patch_sha256": "39a91b1b72bd90c88ad428acf08226245f520a9a8d76bc7d7a6be1590b81cfde",
-    "patched_tree": "6a37768db596de305af008c59bd4da77831cc85a"
-  },
-  "model": {
-    "note": "weights are not in git (tens of GB); point MODEL at an FP8+MTP export"
-  },
-  "engines_kvmem": {
-    "path": "engines/kvmem",
-    "upstream": "https://github.com/kvmem/kvmem.git",
-    "base_commit": "v0.19.0-rc1",
-    "note": "headers + libkvmem.a for the native extension; fetched at the pinned tag, never vendored"
-  }
+ "layout": "pinned-engines-with-patches",
+ "engines": {
+  "path": "engines/vllm",
+  "upstream": "https://github.com/weicj/vLLM-2080Ti-Definitive.git",
+  "base_commit": "93c9013e375b1ecbf2da88179d2a31175a0d5c99",
+  "license_file": "engines/vllm/LICENSE",
+  "local_changes": "KVMem integration (query bridge with CUDA-graph-capturable capture_k/capture_q, capture_q call sites, scheduler resident books + session checkpoint clip under speculation, re-admission/rebuild, SM75/FP8 profiles, beyond-pool reconstruction). v0.4.0: graph-safe static scratch + bit-exact rotation scoring. Excludes run-logs and triton-cache (JIT artifacts, rebuilt on first run).",
+  "patch": "backends/patches/vllm-kvmem.patch",
+  "patch_sha256": "505c3e7dbf4d0825458a27ac6a5a7cab629b44f629a037ac6c16790898ac9c01",
+  "patched_tree": "8d9256677a52d4431cbf370eb27264ba0286c69a"
+ },
+ "model": {
+  "note": "weights are not in git (tens of GB); point MODEL at an FP8+MTP export"
+ },
+ "engines_kvmem": {
+  "path": "engines/kvmem",
+  "upstream": "https://github.com/kvmem/kvmem.git",
+  "base_commit": "v0.19.0-rc1",
+  "note": "headers + libkvmem.a for the native extension; fetched at the pinned tag, never vendored"
+ }
 }
