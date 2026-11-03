@@ -1954,15 +1954,19 @@ def register():
                         continue
                     _session_id = getattr(request, "session_id", None)
                     _cache_salt = getattr(request, "cache_salt", None)
+                    # PREFIX-MATCHING SESSIONS (2026-11-03, user design ruling): a
+                    # conversation IS its shared token prefix - no client must declare
+                    # identity. The original kvmem engine decides exactly this way
+                    # (driver: prompt.common_prefix(*cached) -> lcp -> restore limits);
+                    # session_id stays as an OPTIONAL accelerator namespace. A request
+                    # without the (broken-by-default) header parks/resumes inside the
+                    # implicit namespace, and correctness still comes from the block
+                    # hashes + prefix digest, not from any claimed identity.
                     if (not isinstance(_session_id, str) or not _session_id
                             or len(_session_id) > 1024
                             or (_cache_salt is not None and not isinstance(_cache_salt, str))
                             or len(_cache_salt or "") > 1024):
-                        _append(_sched_cfg(scheduler).get("probe_log")
-                                or "/tmp/kvmem_sparse.jsonl",
-                                {"kind": "resume_skip", "req": rid,
-                                 "why": "native session_id missing", "pid": os.getpid()})
-                        continue
+                        _session_id = "__prefix_cache__"
                     owner_session_id = (_cache_salt or "", _session_id)
                     ids = list(getattr(request, "prompt_token_ids", None) or ())
                     if len(ids) < block_size:
@@ -1993,6 +1997,21 @@ def register():
                                  "pid": os.getpid()})
                         continue
                     meta, blocks = found
+                    # Plan C (C1): a RESTORE-type checkpoint attests that the logical
+                    # prefix's canonical pages exist in the store - it has NO dense
+                    # StateImage (a pressure parent only ever ran GDN over compacted
+                    # views). The skip-style resume below would seed the engine from a
+                    # state that was never computed, so such hits are recorded and
+                    # DEFERRED: the entry survives untouched (no proof RPC, no discard)
+                    # until the replay mode consumes it properly.
+                    if not getattr(meta, "has_state", True):
+                        _append(_sched_cfg(scheduler).get("probe_log")
+                                or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "kvmem_resume_deferred", "req": rid,
+                                 "hit_blocks": int(blocks), "mode": "restore-pending",
+                                 "source": str(getattr(meta, "source_request", ""))[:40],
+                                 "prompt": int(getattr(request, "num_prompt_tokens", 0) or 0)})
+                        continue
                     hit = int(blocks) * block_size
                     pt = int(meta.page_tokens or 0)
                     ppb = max(1, int(meta.pages_per_block or 1))

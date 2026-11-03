@@ -95,5 +95,22 @@ check("num_spec_tokens == 0" not in code,
 check("kvmem_session_reuse" in code and "request.session_id" in code,
       "the clip still requires session reuse + a native session id")
 
+
+# prefix-matching sessions (user design ruling 2026-11-03): no client identity required
+_rs = open("plugin/vllm_kvmem_plugin.py", encoding="utf-8").read()
+_rr = open("src/kvmem_sparse_runtime.py", encoding="utf-8").read()
+check('"__prefix_cache__"' in _rs
+      and '"why": "native session_id missing"' not in _rs,
+      "Core resume derives the implicit prefix-cache namespace instead of skipping")
+check("__prefix_cache__" in _rr,
+      "runtime parks into the implicit namespace (no sid needed)")
+# plan C C1: restore-type checkpoint chain
+check("_seal_restore_checkpoint" in _rr and "session_checkpoint_sealed_restore" in _rr,
+      "runtime seals a restore checkpoint at the pressure rebuild queue")
+check("restore_only=False" in _rr and "not restore_only and capacity * self.page_tokens" in _rr,
+      "restore publish waives the full-resident contract only for restore mode")
+check('"kvmem_resume_deferred"' in _rs and 'if not getattr(meta, "has_state", True)' in _rs,
+      "Core defers has_state=False hits without discarding the entry")
+
 print("FAIL session_clip_test" if failed else "PASS session_clip_test")
 sys.exit(1 if failed else 0)

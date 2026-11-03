@@ -750,3 +750,25 @@ child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建
   （928→750 递减）互相矛盾——用户"越到后面掉越多"的观察正确，我的恒定 1365 表述作废。
 - 待办（若继续）：把 reconstruction_started→child 首样本→请求完成整段计时装齐，
   一次 88K run 分解最后 12s；batch 代码保留（微赚且结构更安全）。
+
+
+## 6.39 方案 C 立项（用户批准）：pressure 臂的前缀检索复用；C1 已完成
+
+- 设计纠偏链：session 判定先错在要求客户端身份（X-Session-ID 硬门）——原版用
+  `prompt.common_prefix`（driver:144）判会话，身份只是索引加速器。已改隐式命名空间
+  ("","__prefix_cache__")：门拆掉，正确性由 block_hashes+prefix_digest 保证。
+- 深坑（5 连发实测）：pressure 下密封从未成功——`session_park_skipped no sealed
+  executed-frontier`——父被刀裁过、child 账本不推进，**两阶段都没有"密集执行过前缀"
+  的可信 StateImage**。skip 式 resume 在本 fork 语义下对超水位请求结构性不可用。
+- 方案 C 的诚实形态：可复用资产是 **store 的真位置规范页**（每步 baked=0 提交，
+  重建机制的存在本身依赖其完备），不是状态。C1=密封"还原型" checkpoint
+  （has_state=False + 容量契约豁免 + stats 门豁免），Core 命中后 **defer**
+  （不 skip、不 proof、不 discard，行为=全量但链路证明）；C2=消费还原型命中：
+  前缀段跳过计算、页批量还原、只算增量与 final；C3=默认语义合入。
+- 密封时点 = `_rebuild_select` 入口（finalize 步的 per-step 提交已完成——
+  覆盖率门通过即实证，这是 C2 数据面的地基）。frontier 由
+  `session_checkpoint_frontier(prompt,…)` 决定（88K→25856/16 blocks）。
+- C1 验收（默认 pressure boot）：sealed_restore×2 → retired(ranks[0,1]) →
+  resume_deferred hit=16 blocks source 链式指向上一 rid → t2/t3 与 t1 字节一致
+  （c1e81469911b7066，跨 boot 与历史同值）→ entry 未被 discard（t3 仍 deferred）
+  → 耗时/锚点零回归 → 离线 10/10 + 守卫×5（隐式门×2、密封×1、豁免×1、defer×1）。

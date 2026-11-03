@@ -898,8 +898,59 @@ class VllmSparseRuntime:
         from kvmem_session_store import block_hash_sequence
         return block_hash_sequence(ids, self.kv_block_size)
 
+    def _seal_restore_checkpoint(self, req):
+        """Plan-C C1: seal the RESTORE-type prefix checkpoint at prompt completion.
+
+        A pressure parent NEVER has a trustworthy dense-execution StateImage: the
+        cuts spill pages to store and the GDN state only saw the compacted view,
+        so there is nothing this arm could hand to the old skip-style resume - and
+        applying one would be WRONG (the engine would be seeded from a state that
+        was never computed over the prefix). What IS trustworthy is the STORE: at
+        the moment the prompt-end rebuild queues, the very pages the child is about
+        to select from cover the logical prefix in true-position canonical bytes
+        (the same completeness the rebuild already depends for its existence).
+        This seal publishes that page identity with has_state=False; Core defers
+        such hits (no skip, no discard) until C2's replay mode consumes them.
+
+        Fail-closed by construction: incomplete store coverage -> publish refuses
+        -> nothing is sealed -> today's behaviour is untouched.
+        """
+        if not (self.session_reuse and self.session_store is not None):
+            return False
+        if self._session_checkpoints.get(req) is not None:
+            return False
+        ids = self._prompt_ids.get(req)
+        prompt = int(self._prompt_len.get(req, 0) or 0)
+        if not ids or len(ids) < prompt or prompt <= 0:
+            return False
+        from kvmem_session_store import session_checkpoint_frontier
+        covered = session_checkpoint_frontier(prompt, self.kv_block_size,
+                                              self.budget_tokens,
+                                              self.select_block_tokens)
+        if covered <= 0:
+            return False
+        owner = self._session_ids.get(req) or getattr(self, "_park_owner", {}).get(req)
+        if not owner:
+            owner = ("", "__prefix_cache__")
+        payload = self._publish_session_park(req, owner, int(covered),
+                                             list(ids[:covered]), None, None, None,
+                                             restore_only=True)
+        if payload is None:
+            return False
+        self._session_checkpoints[req] = {
+            "frontier": int(covered), "ids": tuple(int(t) for t in ids[:covered]),
+            "state": None, "index": None, "mean_tail": None,
+            "payload": payload, "restore_only": True}
+        self._park_owner = getattr(self, "_park_owner", {})
+        self._park_owner[req] = owner
+        if self.log is not None:
+            self.log({"kind": "session_checkpoint_sealed_restore", "req": req,
+                      "frontier": int(covered), "suffix": int(prompt) - int(covered),
+                      "blocks": len(payload.get("hashes", ()))})
+        return True
+
     def _publish_session_park(self, req, owner_session_id, covered, ids, state,
-                              index_checkpoint, mean_tail):
+                              index_checkpoint, mean_tail, restore_only=False):
         """Open the worker-store park and build the cross-process record.
 
         Runs AT SEAL TIME: the terminal prepare RPC can arrive after the books were released
@@ -913,7 +964,7 @@ class VllmSparseRuntime:
         hashes = self._session_hashes(req, ids)
         pages = orch.usable_pages(covered)
         stats = self._statistics.get(req) if self.stats_core else None
-        if self.stats_core and (stats is None or stats.frontier < covered):
+        if self.stats_core and not restore_only and (stats is None or stats.frontier < covered):
             self.log({"kind": "session_park_skipped", "req": req,
                       "reason": "core statistics checkpoint unavailable"})
             return None
@@ -927,7 +978,12 @@ class VllmSparseRuntime:
         ppb = max(1, int(self.pages_per_block))
         budget = int(self.selector.budget_pages())
         capacity = (min(len(pages), budget) // ppb) * ppb
-        if capacity <= 0 or capacity * self.page_tokens != covered:
+        # The full-resident-prefix contract exists for the SKIP-style resume (V2
+        # Mamba seeds its running slot from the resident counter). A RESTORE-type
+        # checkpoint (plan C) is never applied by skipping - the Core defers it and
+        # only C2's replay consumes the page identity - so the contract is waived
+        # here; store coverage (expected_pages) remains mandatory above.
+        if capacity <= 0 or (not restore_only and capacity * self.page_tokens != covered):
             # A compressed checkpoint would seed V2 Mamba's running slot from resident length
             # while its StateImage belongs to the larger logical frontier. Only restore the full
             # early prefix until that model-state slot contract has been separately qualified.
@@ -951,7 +1007,7 @@ class VllmSparseRuntime:
             # Do NOT truncate or clone: the sealing request keeps running and keeps harvesting
             # into the SAME object, so at resume time it covers the checkpoint frontier already.
             # The only requirement is complete coverage of the checkpoint range right now.
-            if any(not stats.has_block(b)
+            if not restore_only and any(not stats.has_block(b)
                    for b in range(covered // max(1, stats.block_tokens))):
                 self.log({"kind": "session_park_prepare_failed", "req": req,
                           "reason": "statistics coverage incomplete at seal"})
@@ -989,9 +1045,12 @@ class VllmSparseRuntime:
         if not owner_session_id:
             owner_session_id = getattr(self, "_park_owner", {}).get(req)
         if not owner_session_id:
-            self.log({"kind": "session_park_skipped", "req": req,
-                      "reason": "native session_id missing"})
-            return False
+            # Implicit conversation: the content prefix is the identity (see the
+            # Core-side note above; matches the original engine's common_prefix
+            # semantics). Park into the shared prefix-cache namespace.
+            owner_session_id = ("", "__prefix_cache__")
+            self.log({"kind": "session_park_implicit", "req": req,
+                      "namespace": "__prefix_cache__"})
         ck = self._session_checkpoints.get(req)
         if ck is None:
             st = self._state.get(req)
@@ -3017,6 +3076,19 @@ class VllmSparseRuntime:
         ids = self._prompt_ids.get(req)
         if not ids:
             return False, "no prompt ids recorded"
+        # Plan-C C1 (seal): every step has committed its pages canonical (true-position,
+        # baked=0 during pressure epochs) into the store, and the finalize step completed
+        # before this boundary - so the WHOLE logical prefix is here now. Seal the
+        # RESTORE-type checkpoint (has_state=False: a compacted view never executed the
+        # prefix, so no StateImage may be claimed; pages are the honest asset). Auxiliary
+        # by design: rebuild does not depend on the outcome, and coverage refusal keeps
+        # the fail-closed contract.
+        try:
+            self._seal_restore_checkpoint(req)
+        except Exception as exc:
+            if self.log is not None:
+                self.log({"kind": "session_restore_seal_error", "req": req,
+                          "error": f"{type(exc).__name__}: {exc}"})
         prompt_tokens = len(ids)
         n_pages = -(-prompt_tokens // pt)
         tail_tokens = max(pt, int(getattr(self, "rebuild_tail_tokens", 0) or 4096))
