@@ -1,4 +1,5 @@
 # The out-of-tree vLLM plugin: loaded by vLLM's `load_general_plugins()` in every process
+import time as _time
 # (engine core + each TP worker), so it can wrap GPUModelRunner.execute_model without patching
 # the vLLM source. This fork runs the V2 model runner (vllm.v1.worker.gpu.model_runner), so both
 # runner classes are patched.
@@ -1615,10 +1616,14 @@ def register():
                     # bytes (measured: refused+reverted x5 storm on the child rid).
                     return None
                 try:
+                    _t_wc = _time.perf_counter()
                     proposal = runtime.quiescent_compact(
                         str(request_id), int(frontier),
                         None if computed is None else int(computed),
                         None if final is None else bool(final))
+                    _append("/tmp/kvmem_sparse.jsonl",
+                            {"kind": "compact_worker_elapsed",
+                             "elapsed_s": round(_time.perf_counter() - _t_wc, 3)})
                 except Exception:
                     # A worker RPC must never take the engine down; Core treats None as refusal.
                     proposal = None
@@ -2484,11 +2489,13 @@ def register():
                         tp_size = 1
                     log_path = _sched_cfg(scheduler).get("probe_log") or "/tmp/kvmem_sparse.jsonl"
                     try:
+                        _t_rpc = _time.perf_counter()
                         records = executor.collective_rpc(
                             "kvmem_quiescent_compact", timeout=120,
                             args=(request.request_id, int(request.num_logical_tokens),
                                   epoch, int(request.num_computed_tokens),
                                   request in final))
+                        _elapsed_rpc = round(_time.perf_counter() - _t_rpc, 3)
                         if not any(rec for rec in (records or ())):
                             # Retirement-report mode: the worker audited its books and store and
                             # proposed NOTHING on purpose (the engine's dense window is correct by
@@ -2523,12 +2530,16 @@ def register():
                             _append(log_path, {"kind": "sched_compact_idle", "pid": os.getpid(),
                                                "req": request.request_id, "epoch": epoch})
                             return
+                        _t_val = _time.perf_counter()
                         result = validate_quiescent_compaction(
                             request, records, tp_size, epoch, manager)
                         outcome = apply_compaction(
                             request, result,
                             lambda visible, pages, block_pages: adopt_attention_blocks(
                                 manager, request.request_id, pages, block_pages))
+                        _append(log_path, {"kind": "sched_compact_timing", "req": request.request_id,
+                                               "epoch": epoch, "rpc_s": _elapsed_rpc,
+                                               "validate_apply_s": round(_time.perf_counter() - _t_val, 3)})
                     except Exception as exc:
                         # The worker already moved its view for this proposal; roll it back
                         # (symmetric collective) so the books cannot diverge after a refusal.

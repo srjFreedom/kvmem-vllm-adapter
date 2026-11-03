@@ -11,6 +11,7 @@
 # because every one of those is installed into engine tensors and a mismatch silently corrupts
 # attention.
 import os
+import time
 from kvmem_sparse_orchestrator import HostPageStore, SparseOrchestrator
 
 
@@ -334,7 +335,7 @@ class VllmSparseRuntime:
             self._absorb_upto[req] = len(row0)
         except Exception:
             pass
-        self.log({"kind": "reconstruction_started", "req": req,
+        self.log({"kind": "reconstruction_started", "t": round(time.time(), 3), "req": req,
                   "rank": int(getattr(self, "tp_rank", 0))})
 
     def needs_reconstruction(self, req):
@@ -2592,7 +2593,7 @@ class VllmSparseRuntime:
                 # pressure path lands acceptance.
                 if (getattr(self, "prefill_pressure", False)
                         and int(st.tokens) % 16384 < 4096 and self.log is not None):
-                    self.log({"kind": "pressure_gate", "req": req,
+                    self.log({"kind": "pressure_gate", "t": round(time.time(), 3), "req": req,
                               "tokens": int(st.tokens), "seq_len": int(st.seq_len),
                               "row": len(st.row), "resident": len(orch.resident),
                               "high": int(high), "sched": bool(getattr(self, "sched_compact", False)),
