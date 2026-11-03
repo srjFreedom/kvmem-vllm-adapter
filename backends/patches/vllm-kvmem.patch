@@ -3084,3 +3084,92 @@ index 80e1156..9e722fa 100644
          # KVMem diagnostic: a write address past the row's coverage is an illegal access the length
          # checks cannot see (the row is grown for `seq_len + n`, but the scheduler may schedule more
          # than that, or the offset may be stale by one step). Record the worst case, once per step.
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 8a57b5d..7ca6d5d 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -145,6 +145,11 @@ class Scheduler(SchedulerInterface):
+         self.kvmem_session_checkpoint_budget = int(_kvmem.get("budget_tokens") or 0)
+         self.kvmem_select_block_tokens = int(_kvmem.get("select_block_tokens") or 0)
+         self.kvmem_ctx = int(_kvmem.get("ctx") or 0) or None
++        self.kvmem_plan_d = bool(_kvmem.get("plan_d"))
++        self.kvmem_window_tokens = 0
++        if self.kvmem_plan_d:
++            self.kvmem_window_tokens = (int(_kvmem.get("budget_tokens") or 0)
++                                        + int(_kvmem.get("gen_reserve_tokens") or 0))
+         if self.kvmem_resident:
+             # KVMem exists precisely so the FULL sequence does not have to fit the pool: the
+             # working set is bounded by B+R and the rest lives on the host tier. vLLM's
+@@ -992,11 +997,25 @@ class Scheduler(SchedulerInterface):
+             # Schedule newly needed KV blocks for the request.
+             with record_function_or_nullcontext("schedule: allocate_slots"):
+                 while True:
++                    # Plan D: the token books grow past the pool on purpose; the
++                    # PHYSICAL block demand is capped to the attention view window
++                    # (the adapter rolls the row's contents). Without the cap the
++                    # scheduler would demand logical-length blocks and preempt.
++                    _cap = None
++                    if self.kvmem_plan_d and self.kvmem_window_tokens > 0:
++                        _need = (request.num_computed_tokens + num_new_tokens
++                                 + self.num_lookahead_tokens)
++                        if _need > self.kvmem_window_tokens:
++                            _cap = request.num_computed_tokens
++                            request.num_computed_tokens = self.kvmem_window_tokens \
++                                - num_new_tokens - self.num_lookahead_tokens
+                     new_blocks = self.kv_cache_manager.allocate_slots(
+                         request,
+                         num_new_tokens,
+                         num_lookahead_tokens=self.num_lookahead_tokens,
+                     )
++                    if _cap is not None:
++                        request.num_computed_tokens = _cap
+ 
+                     if new_blocks is not None:
+                         # The request can be scheduled.
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 9e722fa..45f4327 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1460,6 +1460,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             self.input_buffers.positions,
+             self.input_buffers.seq_lens,
+         )
++        # KVMem Plan D: the attention seq lens is the VIEW length, not the true
++        # num_computed (which keeps growing because the token stream never rewinds).
++        # The adapter maintains the per-request-slot device table (view_base + this
++        # step's new tokens), updated before every forward, so CUDA graphs replay it
++        # live. Absent = stock behavior (identity: view lens == num_computed lens).
++        _view_lens = getattr(self, "kvmem_view_lens", None)
++        if _view_lens is not None:
++            try:
++                _sel = idx_mapping[:num_reqs]
++                self.input_buffers.seq_lens[:num_reqs].copy_(
++                    _view_lens[_sel].to(self.input_buffers.seq_lens.dtype))
++            except Exception:
++                pass
+         _rope_offset = getattr(self, "kvmem_rope_offset", None)
+         if _rope_offset is not None:
+             try:
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 45f4327..2cfaa7b 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1468,9 +1468,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         _view_lens = getattr(self, "kvmem_view_lens", None)
+         if _view_lens is not None:
+             try:
++                # the table carries VIEW_BASE (length before this step's write);
++                # the attention axis needs view_base + query length. Identity wiring
++                # feeds num_computed-before-prepare here, which equals the stock
++                # seq_lens arithmetic only when nothing was compacted.
+                 _sel = idx_mapping[:num_reqs]
+-                self.input_buffers.seq_lens[:num_reqs].copy_(
+-                    _view_lens[_sel].to(self.input_buffers.seq_lens.dtype))
++                _ql = (query_start_loc[1:num_reqs + 1]
++                       - query_start_loc[:num_reqs])
++                self.input_buffers.seq_lens[:num_reqs] = (
++                    _view_lens[_sel] + _ql
++                ).to(self.input_buffers.seq_lens.dtype)
+             except Exception:
+                 pass
+         _rope_offset = getattr(self, "kvmem_rope_offset", None)

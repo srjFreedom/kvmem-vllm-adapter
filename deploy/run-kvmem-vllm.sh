@@ -138,8 +138,10 @@ printf 'CTX=%s\nB=%s\nR=%s\nSINK=%s\nRECENT=%s\nSESSIONS=%s\nHOST_MIB=%s\nN=%s\n
 # position limit) - passing 0 or a stale default here previously fought the derivation.
 WINARG=()
 [ -n "${MAX_MODEL_LEN:-}" ] && WINARG=(--max-model-len "$MAX_MODEL_LEN")
+_VPY=${VLLM_PY:-${VLLM_ROOT:-$ADAPTER/engines/vllm}/.venv/bin/python}
 RUN=(env MAX_NUM_SEQS="$N" \
-  ${VLLM_PY:-${VLLM_ROOT:-$ADAPTER/engines/vllm}/.venv/bin/python} \
+  RUNTIME_ROOT="$(cd "$(dirname "$(dirname "$(dirname "$_VPY")")")" && pwd)" \
+  "$_VPY" \
   "$ADAPTER/backends/vllm/worker.py" \
     --model "$MODEL" --port "$PORT" --served-name "$SERVED_NAME" "${WINARG[@]}" \
     --tensor-parallel-size 2 --max-num-seqs "$N" \
@@ -157,6 +159,7 @@ fi
 
 if [ "${FOREGROUND:-0}" = "1" ]; then
   echo "foreground mode (systemd); log: $LOG"
+  [ "${KVMEM_ECHO_CMD:-0}" = "1" ] && { printf '%q ' "${RUN[@]}"; echo; exit 0; }
   exec "${RUN[@]}" >> "$LOG" 2>&1
 fi
 

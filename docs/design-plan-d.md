@@ -56,3 +56,8 @@ reuse 深度 = `observed prefix/cursor`（全量）。
 R1 fork 通道（S1/S2 + adapter S3 游标）→ identity-D 短请求与现行字节一致；
 R2 刀 D 化（S4）+ 旧机器删除（S5）→ 超池 needle 全对；
 R3 resume 深度（S6）+ 全 battery；R4 文档/发布。
+
+## 5. R1/R2a 验证状态修正（见 design-prefill-pressure §6.43）
+
+R1 "identity 通过"与首轮 R2a 验证全部发生在 site 树（无 D hunks）上，判定作废。
+site 树 a156cf2bfd 已含 R1+R2a 全部 fork hunks（patch sha 7f11009c）；R2a 真验证 = PLAN_D=1 boot + deltas/view_lens 钩真加载 + 同查询双发确定性 + 40K/88K needle。锚点新基线 de3921f3/2d117bd（spec4）。

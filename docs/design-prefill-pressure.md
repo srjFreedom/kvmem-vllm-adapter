@@ -831,3 +831,24 @@ child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建
   下一步做 resume-turn 的 inherit-store 再密封，收益=每 turn 都快。
 - C3（本轮）：以上即默认行为（pressure 默认 ON、session_reuse 默认 ON，无新开关），
   文档同步 README×2 后会签。
+
+
+## 6.43 环境重建（方案 D R2 前置排查，重大事实链）
+
+- **生产引擎的真实基座一直是站点 fork** `/home/srj/vLLM-2080Ti-Definitive`：
+  `engines/vllm/.venv` 是指向 site venv 的符号链接，site venv 的 editable finder
+  指向 site 树。仓库 `engines/vllm` 代码树从未被生产加载过（R1 "identity 验证通过"
+  实为 site 树无 D hunks 的 stock 行为——已修正，R1/R2a 需在 site 树上重验）。
+- **anchor 换代根因**：用户 kv-offload 线（411e7d59 "keep recurrent groups
+  block-aligned without sub-block state export"）重编译了 kernels（.so），行为基线随
+  kernels 迁移；repo 树（拷贝用户新 .so）给出同一新值 ⇒ 归因唯一。
+  **新 spec4 基线：A=de3921f3611061b5 / B=2d117bd56906d250**（同查询双发一致，
+  确定性完好；40K needle ✓；88K legacy 130.2s needle ✓）。
+- 链级修复（全部落在 deploy/site 脚本）：ADAPTER 检测补 ../ 分支（此前 systemd
+  下偶发跌进 $HOME/vllm-kvmem-adapter 旧布局导致 6 秒静默死）、RUNTIME_ROOT 显式
+  导出、INREQUEST 默认 1、KVMEM_ECHO_CMD 诊断出口、site 脚本 VLLM_PY 导出、
+  PLAN_D 由 site 兜底 export。launcher "already running" 陈旧 state 需删除
+  （run-logs/start-manager.state）——worker rc=0 空转之谜。
+- 治理规则（新）：生产基座=site 树（用户 line+patch）；patch 演进必须
+  `git apply` 到 site 并 commit（a156cf2bfd 为第一个同步点）；锚点基线与用户
+  kernels 演进绑定，换代需双发确定性证据后落档。

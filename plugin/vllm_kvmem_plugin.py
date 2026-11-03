@@ -2910,6 +2910,29 @@ def _install(cls, module_name, probe, smoke, state):
                                  "reqs": _n})
             except Exception:
                 self.kvmem_slot_deltas = None
+            # Plan D R2a: the attention view-lens table. R2a wires it IDENTITY
+            # (a live copy of the engine's num_computed per request slot) so the
+            # seq-lens override path is proven harmless before the D knife starts
+            # feeding it real view lengths. The copy runs every step, on device,
+            # graph-safe.
+            try:
+                _vl = getattr(self, "kvmem_view_lens", None)
+                if _vl is None and self.kvmem_slot_deltas is not None:
+                    import torch as _tv
+                    _nv = int(getattr(self, "max_num_reqs", 0) or 0)
+                    if _nv > 0:
+                        _vl = _tv.zeros(_nv, dtype=_tv.int32, device="cuda")
+                        self.kvmem_view_lens = _vl
+            except Exception:
+                self.kvmem_view_lens = None
+            if getattr(self, "kvmem_view_lens", None) is not None:
+                try:
+                    _nc = self.req_states.num_computed_tokens
+                    _src = (_nc.gpu if hasattr(_nc, "gpu") else _nc)
+                    _m = min(self.kvmem_view_lens.shape[0], _src.shape[0])
+                    self.kvmem_view_lens[:_m].copy_(_src[:_m].to(_src.dtype))
+                except Exception:
+                    pass
         result = original(self, scheduler_output, *args, **kwargs)
         if os.environ.get("KVMEM_EXEC_POST", "1") == "0":
             return result

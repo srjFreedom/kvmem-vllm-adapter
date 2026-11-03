@@ -137,7 +137,21 @@ def main(argv=None) -> int:
     # OFF by default: production keeps the whole-prompt dense prefill + prompt-end rebuild.
     if _env_flag("KVMEM_REBUILD_FULL_HOOKS"):
         cfg["rebuild_full_hooks"] = True
-    if _env_flag("KVMEM_PREFILL_PRESSURE"):
+    if _env_flag("KVMEM_PLAN_D"):
+        cfg["plan_d"] = True
+        # PLAN D supersedes the whole rewind family: the pressure knife, the
+        # sched_compact protocol, and the end-of-prompt rebuild all truncate
+        # `_all_token_ids`/rewind books - the exact thing D forbids (D1). D's
+        # own view-knife arrives with its own triggers; until then D boots run
+        # the pure token stream (window-sized prompts; larger ones simply do
+        # not compact until the D knife lands).
+        cfg["prefill_pressure"] = False
+        cfg["sched_compact"] = False
+        cfg["compact_rebuild"] = False
+        print("[kvmem backends/vllm] PLAN D on: token stream never rewinds; "
+              "attention row/seq lens/slot mapping run on the adapter view "
+              "books (pressure/rebuild superseded)")
+    if _env_flag("KVMEM_PREFILL_PRESSURE") and not _env_flag("KVMEM_PLAN_D"):
         cfg["prefill_pressure"] = True
         # B2 (goal round 5): pressure releases through the Core quiescent protocol - the
         # (c) watermark trigger self-gates on cfg["prefill_pressure"], so it does NOT
