@@ -898,6 +898,91 @@ class VllmSparseRuntime:
         from kvmem_session_store import block_hash_sequence
         return block_hash_sequence(ids, self.kv_block_size)
 
+    def _seal_dense_checkpoint(self, req, st):
+        """Plan-C C2 (DENSE seal) - CURRENTLY UNWIRED (measured 2026-11-03: sealing at
+        the prompt-complete FINISH point is POISONED: the cuts already rewrote the
+        block_table columns, so _state_slot(frontier) resolves the ring slot in the
+        COMPACTED frame - the captured StateImage belongs to unrelated view pages.
+        The mechanism itself proved out (88K turn2: resume_decided hit=25856,
+        108.0s vs 130.5s cold, needle right), but 152K answered WRONG through this
+        seal (needle absent) - correctness red line, fail-closed back to C1.
+        The fix round seals BEFORE the first cut: inside the dense window where
+        executed in [target, target+2 chunks) and st.compacted_in_prefill is still
+        False (columns authentic, store covers 0..target per-step commits).
+
+        Original docstring follows.
+
+        A trustworthy prefix checkpoint at prompt completion.
+
+        The pressure arm's ONLY honest sealing moment is this commit point (finish
+        of the final prompt chunk): the GPU has evaluated every token 0..T strictly
+        sequentially (KV written, ring columns for 0..target still intact, nothing
+        compacted yet from the ENGINE's view - the cut lives in the runtime books),
+        every page below target was committed per step (baked=0 canonical), and the
+        StateImage is read from the ring AT the frontier itself. The claim is exactly
+        the one the v0.4.0 OFF terminal seal made (prompt-complete books, ring state
+        at a block-quantum target) and verdict A qualified: skip-resume below target
+        replays the target..executed tail, whose ring columns the engine still owns.
+
+        Deliberately NOT reused from the capture path: seal-kv's identity books check
+        (the runtime tail is in compacted frame at this moment, while the seal needs
+        only the store-covered prefix - the coverage gate below is the real invariant).
+
+        Fail-closed everywhere else: no ck guard duplicates, coverage refusal leaves
+        the C1 restore seal to run later as the pages-only fallback.
+        """
+        if not (self.session_reuse and self.session_store is not None):
+            return False
+        if self._session_checkpoints.get(req) is not None:
+            return False
+        ids = self._prompt_ids.get(req)
+        prompt = int(self._prompt_len.get(req, 0) or 0)
+        if not ids or len(ids) < prompt or prompt <= 0:
+            return False
+        from kvmem_session_store import session_checkpoint_frontier
+        covered = session_checkpoint_frontier(prompt, self.kv_block_size,
+                                              self.budget_tokens,
+                                              self.select_block_tokens)
+        if covered <= 0:
+            return False
+        orch = self._orch.get(req)
+        if orch is None:
+            return False
+        expected = int(covered) // max(1, int(self.page_tokens))
+        pages = orch.usable_pages(covered)
+        if len(pages) < expected:
+            # tail pages not committed yet at this boundary - the C1 restore seal at
+            # _rebuild_select (later, fully committed) remains the fallback.
+            self.log({"kind": "session_dense_seal_skipped", "req": req,
+                      "reason": "store coverage incomplete",
+                      "pages": len(pages), "expected": int(expected)})
+            return False
+        owner = self._session_ids.get(req) or getattr(self, "_park_owner", {}).get(req)
+        if not owner:
+            owner = ("", "__prefix_cache__")
+        try:
+            state = self.capture_state(req, int(covered)) if self.has_recurrent else None
+        except Exception:
+            state = None
+        if self.has_recurrent and state is None:
+            self.log({"kind": "session_dense_seal_skipped", "req": req,
+                      "reason": "ring state unavailable at frontier"})
+            return False
+        payload = self._publish_session_park(req, owner, int(covered),
+                                             list(ids[:covered]), state, None, None)
+        if payload is None:
+            return False
+        self._session_checkpoints[req] = {
+            "frontier": int(covered), "ids": tuple(int(t) for t in ids[:covered]),
+            "state": state, "index": None, "mean_tail": None,
+            "payload": payload}
+        self._park_owner = getattr(self, "_park_owner", {})
+        self._park_owner[req] = owner
+        self.log({"kind": "session_dense_sealed", "req": req,
+                  "frontier": int(covered), "state": True,
+                  "suffix": int(prompt) - int(covered)})
+        return True
+
     def _seal_restore_checkpoint(self, req):
         """Plan-C C1: seal the RESTORE-type prefix checkpoint at prompt completion.
 

@@ -772,3 +772,26 @@ child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建
   resume_deferred hit=16 blocks source 链式指向上一 rid → t2/t3 与 t1 字节一致
   （c1e81469911b7066，跨 boot 与历史同值）→ entry 未被 discard（t3 仍 deferred）
   → 耗时/锚点零回归 → 离线 10/10 + 守卫×5（隐式门×2、密封×1、豁免×1、defer×1）。
+
+
+## 6.40 C2 首攻实测：机制成立、密封点有毒、已 fail-closed 回 C1
+
+- **正向证据**：dense seal（挂 finish pressure 分支）→ t1 密封 retired →
+  t2 `resume_decided hit=25856` → **108.0s vs 130.5s（省 22.4s）needle ✓**——
+  检索命中跳过前缀重算的通路端到端走通。
+- **毒性实锤**：t5（152K resume 臂）**needle=False**。根因静态可判：finish 时点
+  在首刀之后，`_state_slot` 用 **已重排的 view block_table** 解析 ring 列——
+  capture 到的 StateImage 属于无关视图页。88K 的两对 turn 恰好无碍属容差内运气，
+  不能当正确性证据。同时暴露两个链路断点：
+  ①resume turn 的 store 是新的（restore 页没进新 orch 的 store）→ 它完成时
+  dense seal coverage=0 拒绝 → 不再 retired → **隔行 zigzag**（t2b miss 全量、
+  t3 又命中），PATH-STABLE=False 由此而来；
+  ②C2a 早攻（步界 capture 放宽）的 probe 数据证明 prefill 步的 capture 调用
+  被乐观镜像账本挡住（rt_tokens 恒 > executed，gate 原文即为防"release 态配
+  短 prompt"），三处门缝手术已整体回滚，OFF 链零改动。
+- **止血**：dense seal 摘线（方法保留+文档中毒标记），回 C1 deferred 安全态。
+  复验：152K 双发 216.2/214.4s 全对、resume_decided=0、resume_deferred=2 ✓。
+- **下一刀（C2-fix）已定形**：密封必须在**首刀之前**——dense 窗口内
+  `executed ∈ [target, target+2·chunk)` 且 `st.compacted_in_prefill==False`
+  （列位真实、页已 per-step 提交、ring 列未被改写）；捕获坐标用 GPU 计数器；
+  resume turn 完成后的 re-seal 需把 restore 继承的页认入新 orch（修断点①）。
