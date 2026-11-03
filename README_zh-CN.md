@@ -167,9 +167,8 @@ fail-closed：池顶不足水位+余量时自动禁用并回落生产语义（`p
 （实测 226,240→214,928）；超出训练范围的 position 属 RoPE 外推，质量交给模型
 （原版同样如此）。关掉开关即回默认档（300K 变回 0.9s 干净 400）。
 
-v0.5.1 定位（用户裁定）：适配器的存在意义是超池上下文与多用户分块——所以默认就是
-pressure 臂；不超池且单并发的场景直接用原生 vLLM 更高，无需本适配器。回退旧生产
-语义：`KVMEM_PREFILL_PRESSURE=0 ./start-kvmem-vllm.sh`（对照/兼容用，非推荐）。
+v0.5.1：pressure 臂即默认（超池上下文与多用户分块就是本适配器的存在意义）。回退旧
+生产语义：`KVMEM_PREFILL_PRESSURE=0 ./start-kvmem-vllm.sh`（对照/兼容用）。
 改完 `sudo systemctl restart kvmem-vllm` 生效（无热改），`kvmem-params.env` 记录本次生效值。
 
 ## 运维

@@ -223,7 +223,7 @@ table takes ~134 MB per rank (KV pool 226,240 -> 214,928 measured) and positions
 the trained range are RoPE extrapolation - quality is the model's, exactly as in the
 original. Remove the switch to return to the clean 0.9s HTTP 400 for oversized prompts.
 
-v0.5.1 positioning (user ruling): this adapter exists for beyond-pool context and multi-user chunking - so the pressure arm IS the default. For within-pool single-tenant use plain native vLLM is simply faster; do not use this adapter for it. To fall back to the legacy prompt-end path (comparison/compat, not recommended): `KVMEM_PREFILL_PRESSURE=0 ./start-kvmem-vllm.sh`.
+v0.5.1: the pressure arm IS the default (beyond-pool context and multi-user chunking are what this adapter exists for). To fall back to the legacy prompt-end path (comparison/compat): `KVMEM_PREFILL_PRESSURE=0 ./start-kvmem-vllm.sh`.
 
 Session reuse rides the same switch (`KVMEM_SESSION_REUSE=1` default): pass
 `X-Session-ID: <id>` on chat requests and a finished conversation parks its prefix at the
