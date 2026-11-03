@@ -76,3 +76,26 @@ site 树 a156cf2bfd 已含 R1+R2a 全部 fork hunks（patch sha 7f11009c）；R2
 - 环境基线：site=a156cf2..0b83d19（patch 39dbcb23）；spec4 各臂锚点代不同属
   合法臂差异（de39=pressure 臂 / e783=D-dense 臂 / b804=classic 臂），换代判据
   以 needle 电池 + 同查询双发一致为准，锚点不再跨臂比较。
+
+
+## 7. R2b 协议（刀=页重排，本设计的施工合同）
+
+**复用面（不动）**：(c) 水位触发器、selector/core_selection_scores 选择、quiescent_compact 的
+worker 侧页搬移与快照回退、adopt/revert 通道、geometry fail-closed。
+**切换面（D 分支）**：
+
+| 阶段 | v0.5.2 现状 | R2b D 语义 | 失败语义 |
+|---|---|---|---|
+| 水位判据 | num_computed(压缩账本) ≥ hi | **view 占用 ≥ hi**（num_computed 恒真，永不 rewind） | 同现状（idle throttle 不变） |
+| 提案 | select_pages 升序 | 不变 | 空提案=不动 |
+| worker install | row 重写+页交换（已有） | 不变 + **写表**：deltas[ri]=st.tokens−base_view、view_lens[ri]=base_view | 异常→revert 快照（row/表一起回） |
+| Core apply | truncate _all_token_ids + rewind num_computed | **D 分支：两者都不做**；epoch/事件照发 | 拒案=无账本回滚需要（更稳） |
+| prompt 末 | compact_rebuild→child | **compact_rebuild=False**：无 child，decode 直接续 | escape 谓词天然恒假 |
+| 每步维护 | — | view_lens[ri] += n_new（worker step wrapper） | 步失败=现状一致 |
+| hook | seq_lens=表值（纯读） | **恢复 +query_start**（内核约定 pos=seq_len−ql+idx，表只存 base） | mismatch 诊断常开（刀下 old=真 new=视图 属预期） |
+| seal/resume | 浅快照两段式 | **R3**：StateImage 在 cursor 处诚实可得（D1 不变量）→ 深度=前缀全长，skip 合法 | R3 定 |
+
+不变式自检：D1 num_computed 单调；D2 row 物理集=窗口容量恒定（cap 冻结后零 alloc/free）；
+D3 刀零 truncate；D5 因果=视图升序+前缀性质；GDN 只吃真 token 流。
+施工顺序：①apply 开关（plugin/Core）②worker install 写表+step 维护 ③hook +ql
+④水位判据改 view 8⑤88K live 电池 → 152K/250K → 删旧机器（R3 一并）。
