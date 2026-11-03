@@ -691,3 +691,23 @@ child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建
   （需 prerope tier/视图重编号，见 §6.33），多轮累计+历史分层另算。
 - 探针教训：`KVMEM_ENTRY_INREQUEST_COMPACTION` 由 CLI 开关单源仲裁（entry_compaction_env
   文档语义），探针必须带 `--kvmem-inrequest-compaction` 才走真链。
+
+## 6.35 Round 32 方案 C 落地：KVMEM_ROPE_TABLE_CTX opt-in（原版立场的准入开关）
+
+- 用户裁定 C：默认拒绝保持，超长单条走显式开关。文档口径（README×2 已写）：
+  **推荐默认 = 单条 ≤ ~262K**（位置表内、全验收）；需要更长开
+  `KVMEM_ROPE_TABLE_CTX=<CTX>`（表+窗口+入口三同步；worker 推导处 + plugin
+  `get_rope` 包装器，register() 期在模型模块绑定前挂钩）。
+- **机制依据（原版调查）**：ggml CUDA rope kernel `cosf/sinf` 数值直算
+  （`rope.cu:36,107`），**无表**——原版收 300K 不拒是引擎形态使然；vLLM 表在
+  `qwen3_next.py:354` 绑 `config.max_position_embeddings`，opt-in 在此抬表。
+- **实测（opt-in boot, window 524288）**：
+  - 表扩 `rope_table_ctx_lift 262144→524288` 事件 ×2 rank ✓；池代价实测
+    **226,240 → 214,928**（−11K token ≈ 表 134MB/卡+profile）；
+  - **PRESSURE=ON：300K（282,142 tok）端到端 needle ✓ 395.2s**——5 压缩刀、
+    escape_suppressed、4 重建事件；resident 峰 **4640 页/74240 tok = 水位级常数**
+    （vs 250K@窗口262144 的 4323/69168——随预算，不随 prompt，也不随窗口量级）；
+  - **PRESSURE=OFF：同一 300K 在 prompt 末重建处崩**（"reconstruction page lies
+    outside the original prompt" 家族，EngineDead 500）——OFF 路径 >池重建上限是
+    既有生产边界，opt-in 只开准入不开这条 ⇒ **开关必须配合 pressure 臂**（文档已写明）。
+- 站点已回生产（开关删除 + PRESSURE=0）；回归：300K → 干净 400、boot OK、离线 10/10。

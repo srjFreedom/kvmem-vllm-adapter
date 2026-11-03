@@ -211,6 +211,18 @@ prefix caching is force-disabled, scheduling stays synchronous because compactio
 block table mid-request). `max_tokens` is clamped to `CTX`, not R. Set
 `INREQUEST_COMPACTION=0` only to debug the classic entry-trim path (ceiling then reverts to R).
 
+Single-prompt length tiers (v0.5.x): the RECOMMENDED default caps one prompt at about
+262K tokens (inside the model position table, fully qualified). For genuinely longer
+prompts - the original kvmem engine has NO position table (ggml computes RoPE
+numerically) and admits 300K+ on this same model - opt in with
+`KVMEM_ROPE_TABLE_CTX=<CTX>`: it lifts the RoPE table, engine window and entry
+admission together. USE IT WITH `KVMEM_PREFILL_PRESSURE=1`: a 282,142-token prompt
+answered correctly end-to-end (395s) on the pressure arm, while the OFF arm dies at the
+prompt-end rebuild past the pool (a known OFF-path boundary). Honest costs: the bigger
+table takes ~134 MB per rank (KV pool 226,240 -> 214,928 measured) and positions beyond
+the trained range are RoPE extrapolation - quality is the model's, exactly as in the
+original. Remove the switch to return to the clean 0.9s HTTP 400 for oversized prompts.
+
 Try the residency mode without touching any defaults: `KVMEM_PREFILL_PRESSURE=1 ./start-kvmem-vllm.sh`.
 
 Session reuse rides the same switch (`KVMEM_SESSION_REUSE=1` default): pass

@@ -293,9 +293,32 @@ def main(argv=None) -> int:
             except Exception:
                 _native = 0
             if _ctxw > 0 and _native > 0:
-                _mm = min(_ctxw, _native)
-                print(f"[kvmem backends/vllm] MAX_MODEL_LEN follows CTX: "
-                      f"min({_ctxw}, model-native {_native}) = {_mm}")
+                # OPT-IN long single prompt (KVMEM_ROPE_TABLE_CTX=<tokens>): lift
+                # table + window + entry together to the original kvmem stance -
+                # the ggml engine computes RoPE numerically with NO position table,
+                # so it admits 300K+ on this same model. vLLM precomputes the table
+                # (qwen3_next.py:354 -> config.max_position_embeddings); the plugin's
+                # get_rope wrapper rebuilds it at KVMEM_ROPE_TABLE_CTX. Costs are
+                # real and stated: ~134 MB/rank table at 524,288 (pool shrinks -
+                # check the boot device_pool line), and positions beyond the trained
+                # range are RoPE extrapolation (admission, not accuracy).
+                _rtc = 0
+                try:
+                    _rtc = int(env.get("KVMEM_ROPE_TABLE_CTX") or 0)
+                except Exception:
+                    _rtc = 0
+                if _rtc > _native:
+                    _mm = min(_ctxw, _rtc)
+                    env["KVMEM_ROPE_TABLE_CTX"] = str(_mm)
+                    if _mm > _native:
+                        # the fork errors on window > model-derived limit without this
+                        env["VLLM_ALLOW_LONG_MAX_MODEL_LEN"] = "1"
+                    print(f"[kvmem backends/vllm] ROPE_TABLE_CTX opt-in ACTIVE: "
+                          f"table+window+entry -> {_mm} (native {_native})")
+                else:
+                    _mm = min(_ctxw, _native)
+                    print(f"[kvmem backends/vllm] MAX_MODEL_LEN follows CTX: "
+                          f"min({_ctxw}, model-native {_native}) = {_mm}")
         if _mm > 0:
             args += ["--set", f"MAX_MODEL_LEN={_mm}"]
             env["MAX_MODEL_LEN"] = str(_mm)

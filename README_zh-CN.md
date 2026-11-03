@@ -158,6 +158,15 @@ fail-closed：池顶不足水位+余量时自动禁用并回落生产语义（`p
 事件）。超长 prompt 另需 `MAX_MODEL_LEN` 高于 prompt 且 `KVMEM_SKIP_KV_CHECK=1`
 （RoPE 位置表本身按模型原生 262,144 分配，不是瓶颈）。
 
+单条上下文长度档位（v0.5.x）：**建议默认配置——单条最大 ≈262K token**（模型位置表内，
+全路径验收过；并发=1 时这就是安全上限）。确需更长（原版 kvmem 引擎无位置表、可收 300K+，
+对齐其立场）时开 opt-in：`KVMEM_ROPE_TABLE_CTX=<CTX>`（把 RoPE 表+引擎窗口+入口准入
+三者一起抬到该值，例如 524288）。**必须配合 `KVMEM_PREFILL_PRESSURE=1` 使用**——实测
+300K/282,142 tok pressure 臂端到端答对（395s），OFF 臂会在 prompt 末重建越界处崩
+（>池的重建上限是 OFF 生产路径的已知边界）。代价如实：表 ~134MB/卡 → KV 池约 −11K token
+（实测 226,240→214,928）；超出训练范围的 position 属 RoPE 外推，质量交给模型
+（原版同样如此）。关掉开关即回默认档（300K 变回 0.9s 干净 400）。
+
 试用有界常驻压缩：`KVMEM_PREFILL_PRESSURE=1 ./start-kvmem-vllm.sh`（超池 needle 端到端，见上）。
 改完 `sudo systemctl restart kvmem-vllm` 生效（无热改），`kvmem-params.env` 记录本次生效值。
 

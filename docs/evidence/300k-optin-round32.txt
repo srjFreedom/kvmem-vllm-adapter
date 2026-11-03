@@ -1,0 +1,124 @@
+{"kind": "rope_table_ctx_lift", "from": 8192, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 8192, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208110}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 208109}
+{"kind": "device_pool", "pid": 208110, "tokens": 214928, "pages": 13433, "page_tokens": 16, "budget": 36864}
+{"kind": "device_pool", "pid": 208109, "tokens": 214928, "pages": 13433, "page_tokens": 16, "budget": 36864}
+{"kind": "rope_table_ctx_lift", "from": 8192, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 8192, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209709}
+{"kind": "rope_table_ctx_lift", "from": 262144, "to": 524288, "pid": 209711}
+{"kind": "device_pool", "pid": 209709, "tokens": 214928, "pages": 13433, "page_tokens": 16, "budget": 28672}
+{"kind": "device_pool", "pid": 209711, "tokens": 214928, "pages": 13433, "page_tokens": 16, "budget": 28672}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 16384, "seq_len": 16384, "row": 1111, "resident": 1024, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 16384, "seq_len": 16384, "row": 1111, "resident": 1024, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 32768, "seq_len": 32768, "row": 2121, "resident": 2048, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 32768, "seq_len": 32768, "row": 2121, "resident": 2048, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "sched_compact_applied", "pid": 209561, "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "epoch": 1, "visible": 24048, "offset": 21008, "final": false, "free_blocks": 102, "blocks": 15, "freed": 13}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 49152, "seq_len": 28144, "row": 3131, "resident": 1759, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 49152, "seq_len": 28144, "row": 3131, "resident": 1759, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 65536, "seq_len": 44528, "row": 4141, "resident": 2783, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 65536, "seq_len": 44528, "row": 4141, "resident": 2783, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "sched_compact_applied", "pid": 209561, "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "epoch": 2, "visible": 17168, "offset": 56560, "final": false, "free_blocks": 106, "blocks": 11, "freed": 22}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 81920, "seq_len": 25360, "row": 5151, "resident": 1585, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 81920, "seq_len": 25360, "row": 5151, "resident": 1585, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 98304, "seq_len": 41744, "row": 6161, "resident": 2609, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 98304, "seq_len": 41744, "row": 6161, "resident": 2609, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 114688, "seq_len": 58128, "row": 7171, "resident": 3633, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 114688, "seq_len": 58128, "row": 7171, "resident": 3633, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "sched_compact_applied", "pid": 209561, "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "epoch": 3, "visible": 12880, "offset": 101808, "final": false, "free_blocks": 109, "blocks": 8, "freed": 28}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 131072, "seq_len": 29264, "row": 8282, "resident": 1829, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 131072, "seq_len": 29264, "row": 8282, "resident": 1829, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 147456, "seq_len": 45648, "row": 9292, "resident": 2853, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 147456, "seq_len": 45648, "row": 9292, "resident": 2853, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 163840, "seq_len": 62032, "row": 10302, "resident": 3877, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 163840, "seq_len": 62032, "row": 10302, "resident": 3877, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "sched_compact_applied", "pid": 209561, "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "epoch": 4, "visible": 12800, "offset": 155136, "final": false, "free_blocks": 109, "blocks": 8, "freed": 33}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 180224, "seq_len": 25088, "row": 11312, "resident": 1568, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 180224, "seq_len": 25088, "row": 11312, "resident": 1568, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 196608, "seq_len": 41472, "row": 12322, "resident": 2592, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 196608, "seq_len": 41472, "row": 12322, "resident": 2592, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 212992, "seq_len": 57856, "row": 13332, "resident": 3616, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 212992, "seq_len": 57856, "row": 13332, "resident": 3616, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 229376, "seq_len": 74240, "row": 14342, "resident": 4640, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 229376, "seq_len": 74240, "row": 14342, "resident": 4640, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "sched_compact_applied", "pid": 209561, "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "epoch": 5, "visible": 12832, "offset": 216544, "final": false, "free_blocks": 109, "blocks": 8, "freed": 38}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 245760, "seq_len": 29216, "row": 15453, "resident": 1826, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 245760, "seq_len": 29216, "row": 15453, "resident": 1826, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 262144, "seq_len": 45600, "row": 16463, "resident": 2850, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 262144, "seq_len": 45600, "row": 16463, "resident": 2850, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 278528, "seq_len": 61984, "row": 17473, "resident": 3874, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 278528, "seq_len": 61984, "row": 17473, "resident": 3874, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "escape_suppressed", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "pid": 209561}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 282142, "seq_len": 65598, "row": 17675, "resident": 4100, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "pressure_gate", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "tokens": 282142, "seq_len": 65598, "row": 17675, "resident": 4100, "high": 2368, "sched": true, "flag": true, "npc": false, "hw": 2368, "bp": 2304, "bt": 28672, "pc": 182608}
+{"kind": "reconstruction_started", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "rank": 0}
+{"kind": "rebuild_select", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "ok": true, "pages": 1676, "tail_forced": 256, "row": 1676, "prompt_tokens": 282142, "detail": "{'ok': True, 'queued': True, 'pending': True, 'tokens': 30910, 'pages': 1676, 'already_pending': False}"}
+{"kind": "reconstruction_started", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "rank": 1}
+{"kind": "rebuild_select", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "ok": true, "pages": 1676, "tail_forced": 256, "row": 1676, "prompt_tokens": 282142, "detail": "{'ok': True, 'queued': True, 'pending': True, 'tokens': 30910, 'pages': 1676, 'already_pending': True}"}
+{"kind": "reconstruction_started", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "rank": 0}
+{"kind": "reconstruction_started", "req": "chatcmpl-94a140f37ebb6f67-91c90cef", "rank": 1}

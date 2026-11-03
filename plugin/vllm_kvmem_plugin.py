@@ -1478,7 +1478,51 @@ def _install_capture_early(log_path, gen_reserve):
     return _CAPTURE
 
 
+def _install_rope_table_optin():
+    """KVMEM_ROPE_TABLE_CTX=<tokens> (opt-in; default unset = OFF): rebuild the RoPE
+    cos/sin table at the given length so ONE prompt may exceed the model-native
+    position limit (262,144 here) up to the virtual CTX ceiling - matching the
+    original kvmem engine stance, whose ggml rope kernel computes cosf/sinf from
+    the position NUMERICALLY with no table at all (rope.cu:36,107). vLLM binds the
+    table to config.max_position_embeddings (qwen3_next.py:354), so the lift goes
+    through the factory, wrapped at register() BEFORE the model module imports it.
+    Cost: the table (~134 MB per rank at 524,288) is allocated during model load,
+    BEFORE the KV pool sizing - the boot device_pool line shows the shrink.
+    Beyond-trained-range quality is RoPE extrapolation - this switch unlocks
+    ADMISSION, not accuracy. The worker lifts window/entry to the same value."""
+    import os as _os_rt
+    _n = 0
+    try:
+        _n = int(_os_rt.environ.get("KVMEM_ROPE_TABLE_CTX", "") or 0)
+    except Exception:
+        _n = 0
+    if _n <= 0:
+        return
+    try:
+        import vllm.model_executor.layers.rotary_embedding as _re_mod
+        _orig_get_rope = _re_mod.get_rope
+        if getattr(_orig_get_rope, "_kvmem_table_ctx", False):
+            return
+        def get_rope(head_size, max_position, *args, **kwargs):
+            if _n > int(max_position or 0):
+                _append("/tmp/kvmem_sparse.jsonl",
+                        {"kind": "rope_table_ctx_lift", "from": int(max_position or 0),
+                         "to": _n, "pid": _os_rt.getpid()})
+                max_position = _n
+            return _orig_get_rope(head_size, max_position, *args, **kwargs)
+        get_rope._kvmem_table_ctx = True
+        _re_mod.get_rope = get_rope
+    except Exception:
+        try:
+            _append("/tmp/kvmem_sparse.jsonl",
+                    {"kind": "rope_table_ctx_error",
+                     "error": traceback.format_exc()[-300:]})
+        except Exception:
+            pass
+
+
 def register():
+    _install_rope_table_optin()
     global _PATCHED
     cfg = _config()
     probe, smoke = cfg.get("probe_log"), cfg.get("smoke_log")
