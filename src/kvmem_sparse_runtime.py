@@ -381,6 +381,17 @@ class VllmSparseRuntime:
             # quiescent boundary before the next schedule - TP2-consistent by construction).
             if getattr(self, "_rebuild_queue", None) is None:
                 self._rebuild_queue = {}
+            try:
+                # C2-fix PHASE 2: publish from the dense-window snapshot. The
+                # store is complete here (proven by the rebuild's own restores)
+                # and finish-time parking is the position the v0.4.0 chain
+                # validated. Self-refuses without a phase-1 snapshot, so the
+                # C1 restore seal (at _rebuild_select) remains the fallback.
+                self._seal_dense_checkpoint(req, st)
+            except Exception as exc:
+                if self.log is not None:
+                    self.log({"kind": "session_dense_seal_error", "req": req,
+                              "error": f"{type(exc).__name__}: {exc}"})
             self._rebuild_queue[req] = int(st.tokens) + int(n_new or 0)
             if self.log is not None:
                 self.log({"kind": "pressure_rebuild_queued", "req": req,
@@ -910,6 +921,12 @@ class VllmSparseRuntime:
         executed in [target, target+2 chunks) and st.compacted_in_prefill is still
         False (columns authentic, store covers 0..target per-step commits).
 
+        PHASE 2 (finish/publish): consumes the CPU StateImage captured during
+        the dense window (phase 1). The request is still live but the store is
+        complete, and park-at-finish is exactly the v0.4.0 OFF chain position
+        that was proven harmless. No executed hook needed here (the snapshot's
+        own frontier is the claim).
+
         Original docstring follows.
 
         A trustworthy prefix checkpoint at prompt completion.
@@ -935,6 +952,14 @@ class VllmSparseRuntime:
             return False
         if self._session_checkpoints.get(req) is not None:
             return False
+        if getattr(st, "compacted_in_prefill", False):
+            return False   # the dense window closed: the first cut already
+                           # rewrote columns - sealing now would be the POISON
+                           # point measured 2026-11-03 (152K wrong answer).
+        if req in getattr(self, "_resume", {}):
+            return False   # a resume-applied turn must not re-seal: its state
+                           # already carries the previous seal's bounded
+                           # double-apply, and chaining seals compounds it.
         ids = self._prompt_ids.get(req)
         prompt = int(self._prompt_len.get(req, 0) or 0)
         if not ids or len(ids) < prompt or prompt <= 0:
@@ -944,6 +969,14 @@ class VllmSparseRuntime:
                                               self.budget_tokens,
                                               self.select_block_tokens)
         if covered <= 0:
+            return False
+        snap = getattr(self, "_dense_state_snap", {}).get(req)
+        if not snap or int(snap[0]) != int(covered):
+            return False   # no phase-1 snapshot for THIS frontier - the dense
+                           # window was never observed (short prompt, resume
+                           # turn, or a config that moved the quantum)
+        state = snap[1]
+        if self.has_recurrent and state is None:
             return False
         orch = self._orch.get(req)
         if orch is None:
@@ -960,14 +993,6 @@ class VllmSparseRuntime:
         owner = self._session_ids.get(req) or getattr(self, "_park_owner", {}).get(req)
         if not owner:
             owner = ("", "__prefix_cache__")
-        try:
-            state = self.capture_state(req, int(covered)) if self.has_recurrent else None
-        except Exception:
-            state = None
-        if self.has_recurrent and state is None:
-            self.log({"kind": "session_dense_seal_skipped", "req": req,
-                      "reason": "ring state unavailable at frontier"})
-            return False
         payload = self._publish_session_park(req, owner, int(covered),
                                              list(ids[:covered]), state, None, None)
         if payload is None:
@@ -978,9 +1003,59 @@ class VllmSparseRuntime:
             "payload": payload}
         self._park_owner = getattr(self, "_park_owner", {})
         self._park_owner[req] = owner
+        getattr(self, "_dense_state_snap", {}).pop(req, None)
         self.log({"kind": "session_dense_sealed", "req": req,
                   "frontier": int(covered), "state": True,
                   "suffix": int(prompt) - int(covered)})
+        return True
+
+    def _capture_dense_state(self, req, st):
+        """Plan-C C2-fix PHASE 1: CPU-snapshot the StateImage in the dense window.
+
+        Read-only with respect to the request machinery: NO store claim, NO park,
+        NO orch ownership change - only `capture_state` (t[slot] -> clone to CPU).
+        The window: not compacted yet (columns authentic), no resume marker,
+        GPU-executed covers the frontier. One shot per request per frontier.
+        """
+        if not (self.session_reuse and self.session_store is not None):
+            return False
+        if getattr(st, "compacted_in_prefill", False) or not self.has_recurrent:
+            return False
+        if req in getattr(self, "_resume", {}):
+            return False   # a resume turn carries the previous seal's bounded
+                           # double-apply; re-snapshotting would compound chains
+        if getattr(self, "_dense_state_snap", {}).get(req):
+            return False
+        ids = self._prompt_ids.get(req)
+        prompt = int(self._prompt_len.get(req, 0) or 0)
+        if not ids or len(ids) < prompt or prompt <= 0:
+            return False
+        from kvmem_session_store import session_checkpoint_frontier
+        covered = session_checkpoint_frontier(prompt, self.kv_block_size,
+                                              self.budget_tokens,
+                                              self.select_block_tokens)
+        if covered <= 0:
+            return False
+        if self.session_checkpoint_executed_frontier is None:
+            return False
+        try:
+            executed = int(self.session_checkpoint_executed_frontier(req))
+        except Exception:
+            return False
+        if executed < covered:
+            return False
+        try:
+            state = self.capture_state(req, int(covered))
+        except Exception:
+            state = None
+        if state is None:
+            self.log({"kind": "session_dense_snap_failed", "req": req,
+                      "frontier": int(covered), "executed": int(executed)})
+            return False
+        self._dense_state_snap = getattr(self, "_dense_state_snap", {})
+        self._dense_state_snap[req] = (int(covered), state)
+        self.log({"kind": "session_dense_snap", "req": req,
+                  "frontier": int(covered), "executed": int(executed)})
         return True
 
     def _seal_restore_checkpoint(self, req):
@@ -1688,6 +1763,7 @@ class VllmSparseRuntime:
         self._over_budget_logged.discard(req)
         self._pending_frontier.pop(req, None)
         self._pending_new.pop(req, None)
+        getattr(self, "_dense_state_snap", {}).pop(req, None)
         self._inflight.pop(req, None)
         self._prev_n.pop(req, None)
         self._prompt_ids.pop(req, None)
@@ -2168,6 +2244,22 @@ class VllmSparseRuntime:
                     import traceback as _tb
                     self.log({"kind": "session_checkpoint_capture_error", "req": req,
                               "error": _tb.format_exc()[-400:]})
+        if getattr(self, "prefill_pressure", False) and prev:
+            # Plan-C C2-fix, PHASE 1 (boundary): INSIDE the dense window (before
+            # the first cut flips compacted_in_prefill), when the GPU counter has
+            # covered the checkpoint frontier, capture ONLY the StateImage as a
+            # CPU snapshot. Parking/claiming the LIVE orchestrator mid-run is POISON
+            # (measured: the 152K sealed turns broke compaction - the view book ran
+            # to 90112, needle wrong; the same-turn resume path stayed right): the
+            # session entry's ownership fights the still-running request's page
+            # releases. The publish moves to the finish point (phase 2), where the
+            # v0.4.0 OFF chain proves it is harmless.
+            try:
+                self._capture_dense_state(req, st)
+            except Exception as exc:
+                if self.log is not None:
+                    self.log({"kind": "session_dense_seal_error", "req": req,
+                              "error": f"{type(exc).__name__}: {exc}"})
         self._prev_n[req] = n_new
         st.tokens = max(st.tokens, getattr(st, "tokens", 0))
         orch.note_tokens(st.tokens)

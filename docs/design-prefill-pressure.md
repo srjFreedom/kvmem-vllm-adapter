@@ -795,3 +795,20 @@ child 从 "No" 续写=自我实现。**修复**：rebuild 时 `outs=[]`（重建
   `executed ∈ [target, target+2·chunk)` 且 `st.compacted_in_prefill==False`
   （列位真实、页已 per-step 提交、ring 列未被改写）；捕获坐标用 GPU 计数器；
   resume turn 完成后的 re-seal 需把 restore 继承的页认入新 orch（修断点①）。
+
+
+## 6.41 C2-fix 两段式落地 + resume apply 病理确诊（本轮收束于安全基线）
+
+- 两段式密封（boundary 只拍 state CPU 快照 / finish 才 publish）修好了**密封 turn
+  本身**：152K sealed 全量 turn max_view 48880 受控、答案正确（一代 sha=2e8bfe9
+  的"密封 turn 中毒"消灭）。
+- 但 battery 揭示**下一层病理**：resume-applied turn 的账本种子与 Core 的 rewind
+  计数器不一致 → 水位刀全部 `quiescent_compact_stale`（实测 54 次）→ 视图失控到
+  122880 → 答案中毒（2e8bfe9 代=刀失控指纹，跨 boot 复现）。**不是双应用误差，
+  是种子失配**。
+- 本轮止血：pressure boot **一律 defer**（一行 cfg 条件）——OFF 臂 resume apply
+  保持 v0.4.0 原样零影响。止血复验：152K×3 全对同 sha、88K 对、
+  decided=0/deferred=4/stale=0。
+- 下一增量（已定形）：修 resume 应用的 worker 侧账本种子（note_resume 的
+  (hit,visible) 如何进 st.tokens/页计数 vs Core num_computed=visible），
+  使刀在 resume turn 正常落；恢复 pressure 的 apply 与 22 秒收益。
