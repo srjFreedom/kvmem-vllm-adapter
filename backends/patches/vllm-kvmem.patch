@@ -3173,3 +3173,73 @@ index 45f4327..2cfaa7b 100644
              except Exception:
                  pass
          _rope_offset = getattr(self, "kvmem_rope_offset", None)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 2cfaa7b..68da255 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1475,9 +1475,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 _sel = idx_mapping[:num_reqs]
+                 _ql = (query_start_loc[1:num_reqs + 1]
+                        - query_start_loc[:num_reqs])
+-                self.input_buffers.seq_lens[:num_reqs] = (
+-                    _view_lens[_sel] + _ql
+-                ).to(self.input_buffers.seq_lens.dtype)
++                _new = (_view_lens[_sel] + _ql).to(
++                    self.input_buffers.seq_lens.dtype)
++                _old = self.input_buffers.seq_lens[:num_reqs]
++                _diff = (_old != _new)
++                if bool(_diff.any().item()):
++                    try:
++                        import json as _j
++                        _d0 = int((_old - _new)[_diff][0].item())
++                        _n0 = int(_new[_diff][0].item())
++                        _o0 = int(_old[_diff][0].item())
++                        with open("/tmp/kvmem_sparse.jsonl", "a") as _f:
++                            _f.write(_j.dumps({
++                                "kind": "kvmem_vl_mismatch", "reqs": int(num_reqs),
++                                "old": _o0, "new": _n0, "delta": _d0,
++                                "base_src": int(_view_lens[_sel][0].item())}) + "\n")
++                    except Exception:
++                        pass
++                self.input_buffers.seq_lens[:num_reqs] = _new
+             except Exception:
+                 pass
+         _rope_offset = getattr(self, "kvmem_rope_offset", None)
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 68da255..25fc3fd 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1466,6 +1466,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # step's new tokens), updated before every forward, so CUDA graphs replay it
+         # live. Absent = stock behavior (identity: view lens == num_computed lens).
+         _view_lens = getattr(self, "kvmem_view_lens", None)
++        # The override is ACTIVE only once the D knife owns the view books
++        # (kvmem_view_active). While identity-wired the tables exist, the
++        # diagnostic can still compare, but the stock seq lens stand.
++        _vactive = getattr(self, "kvmem_view_active", False)
+         if _view_lens is not None:
+             try:
+                 # the table carries VIEW_BASE (length before this step's write);
+@@ -1475,8 +1479,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 _sel = idx_mapping[:num_reqs]
+                 _ql = (query_start_loc[1:num_reqs + 1]
+                        - query_start_loc[:num_reqs])
+-                _new = (_view_lens[_sel] + _ql).to(
+-                    self.input_buffers.seq_lens.dtype)
++                # table carries view_len - query_start (worker kernel
++                # subtracts query_start again; keep the stock arithmetic)
++                _new = _view_lens[_sel].to(self.input_buffers.seq_lens.dtype)
++                _ = _ql
+                 _old = self.input_buffers.seq_lens[:num_reqs]
+                 _diff = (_old != _new)
+                 if bool(_diff.any().item()):
+@@ -1492,7 +1498,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                                 "base_src": int(_view_lens[_sel][0].item())}) + "\n")
+                     except Exception:
+                         pass
+-                self.input_buffers.seq_lens[:num_reqs] = _new
++                if _vactive:
++                    self.input_buffers.seq_lens[:num_reqs] = _new
+             except Exception:
+                 pass
+         _rope_offset = getattr(self, "kvmem_rope_offset", None)

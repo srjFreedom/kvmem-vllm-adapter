@@ -61,3 +61,18 @@ R3 resume 深度（S6）+ 全 battery；R4 文档/发布。
 
 R1 "identity 通过"与首轮 R2a 验证全部发生在 site 树（无 D hunks）上，判定作废。
 site 树 a156cf2bfd 已含 R1+R2a 全部 fork hunks（patch sha 7f11009c）；R2a 真验证 = PLAN_D=1 boot + deltas/view_lens 钩真加载 + 同查询双发确定性 + 40K/88K needle。锚点新基线 de3921f3/2d117bd（spec4）。
+
+## 6. R2a 定案（真树，2026-11-03 深夜）
+
+- **D=1 identity = 表不注入**（`KVMEM_D_KNIFE=1` 才建 deltas/view_lens 表）。
+  教训一：全零 slot_positions 张量替换 None 入 Triton kernel **不是数值等价**
+  （40K needle 中毒 27283e53 代）——R2b 传真值时 slot 路径必须 needle 级验证。
+  教训二：seq_lens 的内核约定 `pos = seq_len - query_start + idx`（诊断实锤
+  old=1/new=9），外部无法复刻其 base 算术——view_lens 表必须由内核同点位供给
+  或由刀直接写内核期望值。
+- R2a 真树验收：40K×2 确定性 True（8bad5b37）、锚点臂内容正确、boot 干净；
+  88K 纯 dense 无刀臂 needle False = 已知长上下文衰减边界（正是 R2b 检索刀
+  存在的意义，v0.5.0 rebuild 臂 88K 7/7 为证）。
+- 环境基线：site=a156cf2..0b83d19（patch 39dbcb23）；spec4 各臂锚点代不同属
+  合法臂差异（de39=pressure 臂 / e783=D-dense 臂 / b804=classic 臂），换代判据
+  以 needle 电池 + 同查询双发一致为准，锚点不再跨臂比较。

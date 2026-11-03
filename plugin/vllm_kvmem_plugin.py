@@ -2891,12 +2891,17 @@ def _install(cls, module_name, probe, smoke, state):
                     {"kind": "advance_error", "error": traceback.format_exc()})
         except Exception:
             self._kvmem_req_ids = []
-        # Plan D (KVMEM_PLAN_D=1): the per-request write-delta channel. R1 wires it
-        # IDENTITY (all zeros): slot_positions = positions, byte-identical to stock
-        # behavior - this proves the tensor path is live and harmless before R2
-        # starts moving views through it. The tensor is persistent device memory so
-        # CUDA graphs replay the live values (same contract as the scalar offset).
-        if os.environ.get("KVMEM_PLAN_D", "") in ("1", "true", "yes", "on"):
+        # PLAN D tables are injected ONLY when the D knife owns the view books
+        # (KVMEM_D_KNIFE=1, R2b+). Identity wiring taught two lessons the hard
+        # way: (1) passing an all-zero slot_positions tensor where the stock
+        # path passes None changes the Triton kernel's numeric behavior (40K
+        # needle wrong), and (2) the seq-lens override cannot reproduce the
+        # kernel's internal base arithmetic from outside (kvmem_vl_mismatch:
+        # old=1 new=9 - the in-kernel convention subtracts query_start). The
+        # knife will supply both tables with REAL view values and be judged by
+        # the needle battery, not by identity.
+        if (os.environ.get("KVMEM_PLAN_D", "") in ("1", "true", "yes", "on")
+                and os.environ.get("KVMEM_D_KNIFE", "") in ("1", "true", "yes", "on")):
             try:
                 _dl = getattr(self, "kvmem_slot_deltas", None)
                 if _dl is None:
@@ -2905,34 +2910,15 @@ def _install(cls, module_name, probe, smoke, state):
                     if _n > 0:
                         _dl = _td.zeros(_n, dtype=_td.int32, device="cuda")
                         self.kvmem_slot_deltas = _dl
+                        self.kvmem_view_lens = _td.zeros(_n, dtype=_td.int32,
+                                                         device="cuda")
+                        self.kvmem_view_active = False
                         _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                                 {"kind": "plan_d_wired", "pid": os.getpid(),
                                  "reqs": _n})
             except Exception:
                 self.kvmem_slot_deltas = None
-            # Plan D R2a: the attention view-lens table. R2a wires it IDENTITY
-            # (a live copy of the engine's num_computed per request slot) so the
-            # seq-lens override path is proven harmless before the D knife starts
-            # feeding it real view lengths. The copy runs every step, on device,
-            # graph-safe.
-            try:
-                _vl = getattr(self, "kvmem_view_lens", None)
-                if _vl is None and self.kvmem_slot_deltas is not None:
-                    import torch as _tv
-                    _nv = int(getattr(self, "max_num_reqs", 0) or 0)
-                    if _nv > 0:
-                        _vl = _tv.zeros(_nv, dtype=_tv.int32, device="cuda")
-                        self.kvmem_view_lens = _vl
-            except Exception:
                 self.kvmem_view_lens = None
-            if getattr(self, "kvmem_view_lens", None) is not None:
-                try:
-                    _nc = self.req_states.num_computed_tokens
-                    _src = (_nc.gpu if hasattr(_nc, "gpu") else _nc)
-                    _m = min(self.kvmem_view_lens.shape[0], _src.shape[0])
-                    self.kvmem_view_lens[:_m].copy_(_src[:_m].to(_src.dtype))
-                except Exception:
-                    pass
         result = original(self, scheduler_output, *args, **kwargs)
         if os.environ.get("KVMEM_EXEC_POST", "1") == "0":
             return result
