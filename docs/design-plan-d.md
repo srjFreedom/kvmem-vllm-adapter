@@ -185,3 +185,24 @@ reason 探针（wrapper exception/is_rebuilt/entry）把"第二刀 idle"完全�
 - **下轮施工定案**：D 的 final 刀弃用 blockwise 自建 resample，改调 rebuild_select 的
   选择段抽成 `_d_final_pages()`（返回升序 logical_pages），再接 D install（无 rewind、
   无 channel、row 直写、表照旧）。mid 刀维持统计 grid（它的职责只是滚动窗口）。
+
+
+## 14. 打分链路：独立深水区立项（round 8 叫停游击战）
+
+三轮连续"根因"被下轮数据推翻的记录（全部留档，防止再犯）：
+1. round 6 判"final 刀被覆盖律误拒"→ 放宽后 final 落地（epoch 25）但 needle 依旧 False；
+2. round 7 判"resample grid 只覆盖 29/92"→ 抽段/坐标系假设；
+3. round 8 修 align_scores 截断（raw 全长度 2236）→ **d_final_scores 本轮零事件** =
+   blockwise 的 pressure=False 聚合段根本没被执行——前三轮观测的"final 刀"其实是 mid 刀，
+   **观测对象本身搞错了**。applied 序列 vis 27808/25024/23808 + stride 全为 mid 特征。
+
+**当前铁的事实**（多轮重复、互相一致）：
+- D 协议层稳定：cadence 11 连发 refused=0、两口径分离、152K spec0 140.7s 完成（dense 219s，
+  刀提速 35%）、40K/短请求全对、boot 健康；
+- **D 刀的选择质量未达验收**：mid 刀（统计分）合法地可能漏 needle 页，而"问题驱动的 final
+  刀"在 D 臂的实际执行路径从未被证实跑过（本轮零事件）——它是**下一个独立工程单元**：
+  先把 final→blockwise(pressure=False) 的调用链打通并有事件证据，再谈打分网格。
+
+**生产线决议**：验收线未达，**生产保持 spec4 + PLAN_D=0（v0.5.2 验证臂）**；D 臂继续在
+实验环境迭代。raw/consensus/sanitize 改动对 classic 臂零影响（classic 不走这些分支），
+已五套件验证。

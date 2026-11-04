@@ -3096,6 +3096,61 @@ class VllmSparseRuntime:
                           "error": _tb.format_exc()[-400:]})
             return None
 
+    @staticmethod
+    def _sanitize_core(core):
+        """Plan D: statistics harvested while pages are being evicted and
+        reinstalled can hold NaN/inf entries; the TP consensus gate rejects
+        the ENTIRE vector on one bad cell (`present=all(isfinite)`), which on
+        the D lane degraded core to None and finally to the bare
+        sink/recent view (measured: mid knives scored 29 keys of 704).
+        Sanitize first - a non-finite cell means 'no coverage here' and is
+        honestly 0.0 - then consensus compares clean finite vectors."""
+        if core is None:
+            return None
+        out = []
+        bad = 0
+        for v in core:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                bad += 1
+                out.append(0.0)
+                continue
+            if f != f or f in (float("inf"), float("-inf")):
+                bad += 1
+                f = 0.0
+            out.append(f)
+        return out, bad
+
+    def _core_consensus(self, orch, core, req, tokens, budget_blocks, log_kind):
+        """One consensus protocol for all knife kinds. Non-D keeps the strict
+        path verbatim. D: skip the collective but SANITIZE the vector - the
+        ranking must survive cells the statistics never covered."""
+        if not (core is not None and len(core)):
+            return core
+        if bool(getattr(self, "d_mode", False)):
+            clean, bad = self._sanitize_core(core)
+            if self.log is not None and bad:
+                self.log({"kind": "d_core_sanitized", "req": req,
+                          "bad": int(bad), "len": len(core)})
+            return clean
+        if not (bool(getattr(self, "_in_quiescent", False))
+                and int(getattr(self, "tp_size", 1) or 1) > 1):
+            return core
+        try:
+            from kvmem_tp_scores import average_reconstruction_scores
+            _sel = getattr(orch, "selector", None)
+            _sb = getattr(_sel, "selection_blocks", None)
+            expected = int(_sb() if callable(_sb) else len(core))
+            device = self.view.paged_kv()[0].device
+            return average_reconstruction_scores(list(core), expected, req,
+                                                 int(tokens), device)
+        except Exception as exc:
+            if self.log is not None:
+                self.log({"kind": log_kind, "req": req,
+                          "error": f"{type(exc).__name__}: {exc}"})
+            return None
+
     def quiescent_compact(self, req, frontier=None, computed=None, final=None,
                           epoch=None):
         """EngineCore-callable compaction on the scheduler thread, between steps.
@@ -3423,7 +3478,8 @@ class VllmSparseRuntime:
             core = getattr(orch, "_last_core", None)
             if core is None:
                 try:
-                    core = orch.core_selection_scores()
+                    core = orch.core_selection_scores(
+                raw=bool(getattr(self, "d_mode", False)))
                 except Exception:
                     core = None
             if core is None:
@@ -3675,27 +3731,16 @@ class VllmSparseRuntime:
             | set(range(max(0, n_blocks - recent_blocks), n_blocks))
         core = None
         try:
-            core = orch.core_selection_scores()
+            core = orch.core_selection_scores(
+                raw=bool(getattr(self, "d_mode", False)))
         except Exception:
             core = None
         if core is None:
             core = getattr(orch, "_last_core", None)
-        if (core is not None and len(core) and bool(getattr(self, "_in_quiescent", False))
-                and int(getattr(self, "tp_size", 1) or 1) > 1
-                and not getattr(self, "d_mode", False)):
-            try:
-                from kvmem_tp_scores import average_reconstruction_scores
-                _sel = getattr(orch, "selector", None)
-                _sb = getattr(_sel, "selection_blocks", None)
-                expected = int(_sb() if callable(_sb) else len(core))
-                device = self.view.paged_kv()[0].device
-                core = average_reconstruction_scores(list(core), expected, req,
-                                                     int(st.tokens), device)
-            except Exception as exc:
-                if self.log is not None:
-                    self.log({"kind": "tp_consensus_degraded", "req": req,
-                              "error": f"{type(exc).__name__}: {exc}"})
-                core = None
+        # Unified consensus protocol (helper handles D sanitize vs strict collective)
+        if core is not None and len(core):
+            core = self._core_consensus(orch, core, req, int(st.tokens),
+                                    budget_blocks, "tp_consensus_degraded")
         if core is not None and len(core):
             grid_pages = max(1, int(getattr(orch, "select_block_tokens", 2 * pt)
                                     or 2 * pt) // pt)
@@ -3902,31 +3947,16 @@ class VllmSparseRuntime:
         kept.add((n_pages - 1) // q)                     # Core validates the tail page
         core = None
         try:
-            core = orch.core_selection_scores()
+            core = orch.core_selection_scores(
+                raw=bool(getattr(self, "d_mode", False)))
         except Exception:
             core = None
         if core is None:
             core = getattr(orch, "_last_core", None)
-        if (core is not None and len(core) and bool(self._in_quiescent)
-                and int(getattr(self, "tp_size", 1) or 1) > 1
-                and not getattr(self, "d_mode", False)):
-            # TP2 consensus: without it each rank ranks the middle by its own shard's scores,
-            # the proposals differ and Core refuses ("TP ranks proposed different working
-            # sets"). The collective raises SYMMETRICALLY, so degrading to `no ranking` keeps
-            # every rank on the same deterministic sink/recent/tail selection.
-            try:
-                from kvmem_tp_scores import average_reconstruction_scores
-                _sel = getattr(orch, "selector", None)
-                _sb = getattr(_sel, "selection_blocks", None)
-                expected = int(_sb() if callable(_sb) else len(core))
-                device = self.view.paged_kv()[0].device
-                core = average_reconstruction_scores(list(core), expected, req,
-                                                     int(st.tokens), device)
-            except Exception as exc:
-                if self.log is not None:
-                    self.log({"kind": "tp_consensus_degraded", "req": req,
-                              "error": f"{type(exc).__name__}: {exc}"})
-                core = None
+        # Unified consensus protocol (helper handles D sanitize vs strict collective)
+        if core is not None and len(core):
+            core = self._core_consensus(orch, core, req, int(st.tokens),
+                                    budget_blocks, "tp_consensus_degraded")
         if core is not None and len(core):
             try:
                 grid_pages = max(1, int(getattr(orch, "select_block_tokens", 2 * pt)

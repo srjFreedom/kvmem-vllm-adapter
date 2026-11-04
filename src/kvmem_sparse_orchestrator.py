@@ -477,7 +477,7 @@ class SparseOrchestrator:
         return 0
 
     # --- v0.19 scoring path ------------------------------------------------------------
-    def core_selection_scores(self):
+    def core_selection_scores(self, raw=False):
         """Page-softmax scores from kvmem's own scorer, resampled to the selection-block grid.
 
         This IS the ranking input now. Upstream's default configuration is page-softmax with LRFU
@@ -579,6 +579,16 @@ class SparseOrchestrator:
         selection_blocks = int(getattr(self.selector, "selection_blocks", lambda: 0)() or 0)
         if selection_blocks <= 0:
             return None
+        if raw:
+            # raw=True: full per-statistics-block vector with NO resample-
+            # truncate. The aligned path keeps only the selector's fixed
+            # selection_blocks entries, so on a 143K stream it covers
+            # 704*64 = 45,056 tokens and every score past the first-knife
+            # position silently does not exist (measured: block_scores 29
+            # keys of 92 blocks, the needle block absent on BOTH mid and
+            # final knives). The D-lane aggregation maps the raw 64-token
+            # grid onto engine blocks itself, across the whole stream.
+            return list(core) or None
         aligned = align_scores(core, int(recall.block_tokens), selection_blocks,
                               int(self.selector.tokens_per_selection_block()))
         return aligned or None
