@@ -304,3 +304,21 @@ return None 只有两个门：take<=0（span=66 排除）或 **buffer/rows 对�
 - 探针要么不截断，要么在事件里带 cap 标注（防"观察工具骗人"第三次发生）。
 - 同一问题连续两轮"根因"被证伪 → 立即停手改复现路线（CPU mock 优先），
   不在真机上继续假设循环。
+
+
+## 20. Round 13 实录：op_calls 曲线 + 两个被更正的观测 + retire 断裂立案
+
+- 直读曲线（steps%3 无 cap 后）：op_calls 严格 +16/步（每层一次）到 frontier 36864、
+  armed=true 恒真 —— **capture op 被调用且在写**（graph/eager 假设出局）。
+- 观测自我更正（第二次犯同一条律并当场记下）：
+  1) harvest_attempt 的 probe<6 截断 → "调用停在 step7" 是假；
+  2) d_hv_funnel 的 cap<8 → "harvest 只跑了 8 次" 也是假。
+  **凡带 cap 的探针，其最后一条事件的距离不等于真相 - 判读前必须先看 cap。**
+- 立案的真断裂：`session_checkpoint_retire_aborted: "TP workers did not all
+  prepare a checkpoint"` @请求收尾 - D 臂上 checkpoint prepare 两侧不对称 →
+  retire abort。这既是 R3（resume/seal 在 D 下的诚实性）的核心缺口，也可能与
+  统计断供同源（seal/prepare 走的是 harvest 数据的 completeness 检查！
+  "statistics coverage incomplete at seal" 分支在同一条链上）。
+- 下一轮唯一入口（非猜测，是对案）：retire abort 现场取证 - prepare 失败侧的值
+  （哪层检查、当时 coverage 数字）；它与"第 12 步后 sums 空"很可能是同一个
+  completeness 检查的两个断面。若同源，修 capture 覆盖 = 修 seal + 修 final 分数。

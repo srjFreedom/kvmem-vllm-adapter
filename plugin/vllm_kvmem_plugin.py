@@ -3255,7 +3255,7 @@ def _install(cls, module_name, probe, smoke, state):
                     if not getattr(runtime, "_advance_owns_accounting", False):
                         st_before = runtime.state(req)
                         runtime.after_step(req, int(n_new), prefill=st_before.row == ())
-                    if state["steps"] <= 5 or state["steps"] % 200 == 0:
+                    if state["steps"] <= 5 or state["steps"] % 3 == 0:
                         st_now = runtime.state(req)
                         _append(probe or smoke or "/tmp/kvmem_sparse.jsonl",
                                 {"kind": "step_after", "pid": os.getpid(),
@@ -3263,10 +3263,18 @@ def _install(cls, module_name, probe, smoke, state):
                                  "tokens": st_now.tokens, "seq_len": st_now.seq_len,
                                  "row": len(st_now.row)})
                         if getattr(runtime, "stats_core", False):
+                            _bst = {}
+                            try:
+                                from vllm import kvmem_bridge as _bkb
+                                _bs = _bkb.stats()
+                                _bst = {"op_calls": int(_bs.get("op_calls", -1)),
+                                        "armed": bool(_bs.get("armed", False))}
+                            except Exception:
+                                _bst = {"op_calls": -2}
                             _append(probe or smoke or "/tmp/kvmem_sparse.jsonl",
                                     {"kind": "statistics", "pid": os.getpid(),
                                      "req": str(req)[:8], "n_new": int(n_new),
-                                     **runtime.statistics_stats(req)})
+                                     **_bst, **runtime.statistics_stats(req)})
                     if trace:
                         # Logging must never break the step.
                         try:
