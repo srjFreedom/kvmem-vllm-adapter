@@ -342,3 +342,21 @@ return None 只有两个门：take<=0（span=66 排除）或 **buffer/rows 对�
   （旧形态 step 12 死）——defer 步改变了 harvest 时序；final 分数仍覆盖不足
   （block_scores 29/49）→ 断供点下轮以 d_hv_pre/post（已埋，无 cap）判 read-back
   空 vs 写路空。
+
+
+## 22. Round 15 立案：刀后时序在"同 boot 第二个请求"上全面劣化（跨请求态嫌疑）
+
+实测矛盾（同一代码状态、同一 boot、两次 152K）：
+- guard 首轮（boot 后第 1 个大请求）：step-end statistics 事件正常爬升（op_calls
+  +16/步、frontier 40960+ 继续涨）、刀 15 发 refused=0、guard=0；
+- 同 boot 第二轮 152K：step-end statistics 事件 **0 条**、final 刀进入 blockwise
+  （d_knife_enter pressure=false ×2）但**打分段未执行**（d_final_scores 0 条）、
+  statistics_final 显示 written=0（真实请求键！）；
+- bridge 读路静态无清除点（_KACC 无 clear/pop、take 恒 66、reset 无调用者）——
+  "读空"物理不可能 → 病灶必然是**写路或请求态字典**：`self._statistics[req]` 键
+  错位（attach 与 final 读的对象不同）或 step-end 循环对第二个请求根本没进。
+- **下轮第一刀**：blockwise 入口早退点 + `_statistics` 字典键 + step-end 循环命中
+  三处值探针（全部无 cap），单 boot 连跑 152K×2 直接对照两轮差异。
+
+安全面不变：guard 已让越界不可能（两轮 Xid=0），本机可继续实验。
+性能面不变：guard 下 152K 最快 119.6s（dense 219s 的 54%）。
