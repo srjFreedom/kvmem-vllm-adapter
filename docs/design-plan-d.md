@@ -279,3 +279,28 @@ reason 探针（wrapper exception/is_rebuilt/entry）把"第二刀 idle"完全�
   bucket_writes 增量，一发区分"op 没被调"vs"op 调了没写行"vs"写了读不到"。
 - 结构修复累积（全部保留）：publish_offset D=0、is_rebuilt 短路、wrote0 雪崩保护、
   真坐标锚、两口径分离、(b) 探针、漏斗探针、epoch 盖章、margins 法、final 刀接线。
+
+
+## 19. 断水点静态排雷（round 13）：假设出局清单 + CPU 复现路线
+
+静态解剖 capture 写路/读路后的出局名单：
+- `KEY_ROWS_LIMIT` 卡死 → **出局**（plugin 每步无条件重设 0/1）；
+- `_K_MISMATCH` 宽度失配 → **出局**（刀不动 key 宽度，且首轮 warmup 11280 行正常入）；
+- `first` 坐标错 → **出局**（stats_from_bridge 根本不用 first 定位行，span 由 n 导出，
+  读的是 bridge 的当前步缓冲头部——我此前所有"锚"工作对这个读路无效）。
+剩余唯一可能：`read_key_buckets(layer, span)` 每层返回 None（666-692 区），其
+return None 只有两个门：take<=0（span=66 排除）或 **buffer/rows 对象本身为 None
+（= capture 那层本步没写过 → n<=0/…）**。
+
+**下轮第一步 = 免 boot 的 CPU 复现**：tests/bridge_capture_test.py 已有 mock bridge，
+扩一个场景 = d_mode + 首刀后步骤序列 → 断言 sums 空复现 → 在 mock 里直接调试读路。
+复现不了才上 GPU 探针（read_key_buckets 的每层返回值事件）。
+
+**本轮顺带纠正的认知**：`harvest_attempt` probe<6 截断曾让我们以为调用停在 step7，
+真实情况是调用从未停（漏斗证）——探针截断本身就是本次连环误判的一半来源，
+已把"探针不截断/截断必标注"写入运维条律。
+
+### 运维条律追加
+- 探针要么不截断，要么在事件里带 cap 标注（防"观察工具骗人"第三次发生）。
+- 同一问题连续两轮"根因"被证伪 → 立即停手改复现路线（CPU mock 优先），
+  不在真机上继续假设循环。
