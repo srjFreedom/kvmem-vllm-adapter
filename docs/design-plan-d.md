@@ -425,3 +425,22 @@ sweep 统一政策）的产物**——倒退发生在 round-16/18 的 sweep/grac
 plugin/vllm_kvmem_plugin.py + src/kvmem_sparse_runtime.py；每态单跑 152K 计时 +
 数 knives/no_row；两三次 boot 之间必收敛。
 guard 已撤（其保护在 cadence 正确时代本就未用到；cadence 修复后按 round-14 判据重加）。
+
+
+## 27. Round 20：收割死亡定形=请求被"合法 retirement"释放（Core 视其 finished）
+
+- import 回归治愈（无 `_np` 丢失后：no_row=0、knives=11、gate=16、refused=0、140.4s）。
+- d_hv_result：44 条=11 步×2pid×2，**第 11 步后函数零进入**；funnel 尾部 `tok=None`
+  而 `has_stats=True`（_state 没了、_statistics 还在）；`released` 事件为**旧格式**
+  =出自 2860 的 `retire_finished_worker_requests`（唯一合法 retirement：
+  `req in scheduler_output.finished_req_ids`）。
+- **判决**：收割不是被谁杀了 - 是 Core **在第 11-12 步（首刀窗口）把未完成的请求
+  标成 finished**，retirement 依规释放了 state。此后引擎还在跑该请求（prefill 继续、
+  刀继续落、140s 完成响应）但 runtime 账本已注销 → 统计冻结、final 无分、needle False。
+- 下轮唯一问题（新问题域）：**为什么 finished_req_ids 含一个 prefill 没走完的请求**——
+  嫌疑：preempt（D 的 cap 让 allocate 的 demand 失真→资源判定误 preempt？）、
+  max-model-len/len 检查、或 `_finishing_reconstruction` 残留标志。取证：
+  scheduler_output.finished_req_ids 到达 retirement 时的值事件（带请求当前
+  computed/prompt 进度对照）+ 引擎日志 preempt/abort grep。
+- 若=preempt：D 的 cap（R2a 临时 book 改写）需与 scheduler 的资源判定和解——
+  这条线索把"刀 cadence"与"假 finished"统一（也解释 round-14 15 knives 后统计仍冻结）。

@@ -1701,6 +1701,17 @@ class VllmSparseRuntime:
                 if _tp is not None and int(_tp.numel()) >= n:
                     first = int(_tp[-n].item())
             sums = stats_from_bridge(bridge, range(stats.layers), first, n)
+            # DECISIVE per-call harvest result (uncapped for real requests;
+            # ~35 events/request): distinguishes read-empty (sums 0 layers)
+            # from write-refused (16 layers, wrote 0) from healthy - the
+            # last unlabeled segment between the surviving funnel calls and
+            # the frozen statistics frontier at the first knife.
+            if self.log is not None and not str(req).startswith("_warmup"):
+                self._d_hv_seen = getattr(self, "_d_hv_seen", 0) + 1
+                if self._d_hv_seen <= 90:
+                    self.log({"kind": "d_hv_result", "req": str(req)[-6:],
+                              "call": self._d_hv_seen, "first": first, "n": n,
+                              "sums_layers": (len(sums) if sums else 0)})
             if not sums:
                 self._skip(req, "no capture")
                 return 0

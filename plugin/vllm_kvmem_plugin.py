@@ -3427,6 +3427,7 @@ def _install(cls, module_name, probe, smoke, state):
                                              "site": "B"})
                                 for _alive in reqs:
                                     rt.seen_alive(_alive)
+                            import numpy as _np
 
                             counts_np = _np.asarray(counts, dtype=_np.int64)
                             csl = _np.concatenate(([0], _np.cumsum(counts_np)))
