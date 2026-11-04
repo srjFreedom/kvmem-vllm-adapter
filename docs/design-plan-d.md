@@ -641,3 +641,28 @@ final 刀未落的剩余疑点（两点，下轮一发分辨）：
   末段 forward 重放 + GDN 状态在 cursor 处快照/回置（token 流与账本不动，
   重放是幂等再计算）——这正是 R3 resume 深度的同一个机制，一并施工。
 - seam 刀保留（token2+ 的正确视图 + 锁的终末语义，都是 R3 重评的地基）。
+
+
+## 41. Round 31 R3.1：D6 重评原语机制侦察完成（施工蓝图定形）
+
+fork 无 StateImage 名字，但**同等机制已在 spec-rollback 生命周期里现成运转**：
+- `mamba_hybrid.preprocess_state`（forward 前跨块迁移，spec scratch 列快照 =
+  `run_fused_precopy`，postprocess 按 token_bias 折叠 accepted 列回主列）；
+- 底层 `_copy_mamba_state_block`（(layer, state-type)×tile 分块 GPU 拷贝）
+  + `batch_memcpy`；conv 与 temporal 两类状态全覆盖；
+- 状态张量引用经 `get_extra_attn_kwargs` 直达 attn 层，无需自挖 KV cache。
+
+**D6 重评六步（全部用现成原语）**：
+1. 完成步 preprocess_state 时 snapshot 主列状态 → scratch（spec 机制自动，
+   spec0 借用 scratch 块分配）；
+2. 首跑 forward 完成 → seam 问题刀安装（round-30 已通）；
+3. restore：scratch→主列（precopy 反向，src/dst 指针交换）→ 状态回到末 chunk 前；
+4. **重放 forward 末 chunk**（同形状：batch=1 行 × 4096 token，positions/slots
+   用现有通道）→ attention 读问题视图（needle 在场），GDN 从正确起点再推到正确终态
+   （幂等再计算 - D1 不违：账本/token 流全程未动）；
+5. 用重放的行末 logits 替换首跑 logits 进 sampler → 第一 token 出生在问题视图；
+6. 后续 decode 正常（scratch 释放，锁保住问题视图到下一问题）。
+
+分工：R3.2 = 步骤1/3/6 wiring + 离线；R3.3 = 4/5 重放与 logits 接管 + 88K 全链；
+R3.4 = 152K/250K 电池 + resume 复用同一原语（observed-prefix：restore 到 cursor +
+skip=不重放只装视图 - 顺路）。
