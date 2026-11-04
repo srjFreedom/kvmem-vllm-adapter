@@ -484,6 +484,23 @@ class VllmSparseRuntime:
         # capacity, so the engine's next appends are still picked up.
         self._absorb_upto[req] = max(start, upto)
 
+    def _d_reset_row(self, row_index):
+        """Plan D: tables for a freshly (re)used engine row start at zero - the
+        step accounting then reproduces num_computed exactly until a knife
+        publishes a real view base."""
+        try:
+            runner = getattr(self.view, "runner", None)
+            if runner is None or not getattr(runner, "kvmem_view_active", False):
+                return
+            ri = int(row_index)
+            _dv = getattr(runner, "kvmem_slot_deltas", None)
+            _vl = getattr(runner, "kvmem_view_lens", None)
+            if _dv is not None and _vl is not None and 0 <= ri < int(_dv.shape[0]):
+                _dv[ri] = 0
+                _vl[ri] = 0
+        except Exception:
+            pass
+
     def _ensure(self, req):
         if req not in self._orch:
             try:
@@ -1818,6 +1835,7 @@ class VllmSparseRuntime:
             # Bind the ROW even before a view exists: the first reselect must know which block
             # table row is the request's own (it compacts inside the request's own pages).
             st.row_index = int(row_index)
+            self._d_reset_row(row_index)
         # Slot-mapping history: remember THIS step's query-token range so the LAGGED commit
         # (which runs at the start of the NEXT step, while the device slot mapping still holds
         # this step's values) can ask the kernel where it wrote each page.
@@ -3079,7 +3097,11 @@ class VllmSparseRuntime:
             self.log({"kind": "quiescent_compact_stale", "req": req,
                       "want": int(frontier), "have": int(st.tokens)})
             return None
-        if computed is not None and int(computed) != int(st.seq_len):
+        # Plan D: Core's computed book is TRUE length, the worker's resident book
+        # is the VIEW length - they legitimately differ by the delta. The logical
+        # (frontier) check above still guards proposal freshness across ranks.
+        if (computed is not None and not getattr(self, "d_mode", False)
+                and int(computed) != int(st.seq_len)):
             # The two resident books must agree BEFORE the move; refusing here (instead of after
             # the move) is what keeps a disagreement recoverable (measured: one refused final
             # proposal left the worker at 20,161 while Core kept 54,326 and every later proposal
@@ -3194,6 +3216,36 @@ class VllmSparseRuntime:
         finally:
             self._in_quiescent = False
         proposal = getattr(self, "_last_proposal", None)
+        if proposal is not None and getattr(self, "d_mode", False):
+            # Plan D R2b: the worker installed the rearranged view (row CONTENT
+            # written inside the FROZEN physical set). Publish the translation
+            # tables the engine consumes from the next step on:
+            #   view_lens[ri] = view_base (the hook adds query_start; kernel
+            #       convention pos = seq_len - query_start + idx)
+            #   deltas[ri]    = computed_true_now - view_base (Core's true book
+            #       for THIS step - the worker's own book lags by design; using
+            #       it misaligned every write by one chunk - measured)
+            # Constant between knives; republished at every knife.
+            try:
+                runner = getattr(self.view, "runner", None)
+                dv = getattr(runner, "kvmem_slot_deltas", None) if runner else None
+                vlv = getattr(runner, "kvmem_view_lens", None) if runner else None
+                if dv is not None and vlv is not None:
+                    import torch as _tdl
+                    _ri = int(st.row_index)
+                    _base_view = int(st.seq_len)
+                    _true_now = int(computed if computed is not None else st.tokens)
+                    with _tdl.no_grad():
+                        dv[_ri] = _true_now - _base_view
+                        vlv[_ri] = _base_view
+                    runner.kvmem_view_active = True
+                    self.log({"kind": "d_tables_published", "req": req,
+                              "row": _ri, "view_base": _base_view,
+                              "true_base": _true_now,
+                              "delta": _true_now - _base_view})
+            except Exception:
+                self.log({"kind": "d_tables_publish_error", "req": req,
+                          "error": __import__("traceback").format_exc()[-160:]})
         if proposal is not None:
             # Byte probe (KVMEM_TRACE_PAGES): fingerprint the canonical store bytes and the device
             # bytes at the slot the proposal just installed. The store-vs-device `needle` check is
@@ -3756,6 +3808,14 @@ class VllmSparseRuntime:
         tokens = int(st.tokens)
         old_row = list(st.row or ())
         old_logical = list(st.logical or ())
+        # Plan D: after a knife, st.logical names the SELECTED pages while the row
+        # is the FULL frozen physical set - the headroom slots ahead of the
+        # selection hold no logical page until written. Pad with None: the
+        # position map below already skips None entries, and the D invariant
+        # (row CONTENT ownership by the adapter) makes the length gap normal,
+        # not the corrupt-frame signal this guard was written for.
+        if getattr(self, "d_mode", False) and len(old_logical) < len(old_row):
+            old_logical = old_logical + [None] * (len(old_row) - len(old_logical))
         if not old_row:
             self._last_proposal = None
             if self.log is not None:
@@ -3866,7 +3926,24 @@ class VllmSparseRuntime:
                           "row": len(old_row), "logical": len(old_logical)})
             return st
         visible = sum(min(pt, max(0, tokens - p * pt)) for p in logical_pages)
-        if visible <= 0 or visible >= resident_before:
+        # Plan D: the no-shrink guard is a rewind-world rule (there the resident
+        # book WAS the visible arithmetic). Under D the true book runs free while
+        # the view slides inside the frozen window - visible (measured at true
+        # positions) legitimately exceeds the previous resident count every time.
+        # The D-era rule: a knife must land BEFORE the window overruns, and the
+        # new view base is simply the installed selection inside the window:
+        #   view_base = pages_used * pt   (selection + headroom = row size)
+        # with a hard ceiling at the frozen physical set (overflow = refused).
+        if getattr(self, "d_mode", False):
+            if len(logical_pages) > len(old_row):
+                self._last_proposal = None
+                if self.log is not None:
+                    self.log({"kind": "blockwise_d_overrow", "req": req,
+                              "pages": len(logical_pages), "row": len(old_row)})
+                return st
+            resident_before = int(st.seq_len)
+            visible = len(logical_pages) * pt
+        elif visible <= 0 or visible >= resident_before:
             self._last_proposal = None
             if self.log is not None:
                 self.log({"kind": "blockwise_no_shrink", "req": req, "visible": int(visible),
@@ -3911,6 +3988,34 @@ class VllmSparseRuntime:
             "store_max": max(orch.store.pages, default=-1),
             "blockwise": True, "moved": moved, "failed": failed,
         }
+        # Plan D R2b (the LIVE publish path: blockwise is what the D boot
+        # executes): the row CONTENT was just installed inside the frozen
+        # physical set. Tables: view_lens = view_base (hook adds query_start;
+        # kernel convention pos = seq_len - query_start + idx), deltas =
+        # Core's true book for this step - the worker's own book LAGS one
+        # chunk at this boundary; using st.tokens here misaligned every write
+        # by exactly that lag (measured: cadence right, needle wrong).
+        if getattr(self, "d_mode", False):
+            try:
+                _runner = getattr(self.view, "runner", None)
+                _dv = getattr(_runner, "kvmem_slot_deltas", None) if _runner else None
+                _vlv = getattr(_runner, "kvmem_view_lens", None) if _runner else None
+                if _dv is not None and _vlv is not None:
+                    import torch as _tdl
+                    _ri = int(st.row_index)
+                    _true = int(self._engine_computed.get(req) or tokens)
+                    # .data escapes the inference-tensor guard (measured:
+                    # "InplaceMode is not allowed" inside the engine context)
+                    _dv.data[_ri] = _true - int(visible)
+                    _vlv.data[_ri] = int(visible)
+                    _runner.kvmem_view_active = True
+                    self.log({"kind": "d_tables_published", "req": req,
+                              "row": _ri, "view_base": int(visible),
+                              "true_base": _true,
+                              "delta": _true - int(visible)})
+            except Exception:
+                self.log({"kind": "d_tables_publish_error", "req": req,
+                          "error": __import__("traceback").format_exc()[-160:]})
         if self.log is not None:
             self.log({"kind": "blockwise_reselect", "req": req,
                       "blocks": len(kept), "kept": [int(b) for b in kept],

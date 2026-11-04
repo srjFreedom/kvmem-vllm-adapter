@@ -789,6 +789,12 @@ def _attach_sparse(runner, log_path):
             runtime.sched_compact = bool(cfg.get("sched_compact", False)
                                            or cfg.get("prefill_pressure", False))
             runtime.prefill_pressure = bool(cfg.get("prefill_pressure", False))
+            # Plan D mode must be set HERE (install), not lazily at table
+            # creation: the publish guard inside quiescent_compact reads d_mode
+            # from the first knife onward, and creation-time-only setting
+            # raced with it (measured: tables=0 across a full battery).
+            runtime.d_mode = bool(cfg.get("plan_d")) and \
+                (os.environ.get("KVMEM_D_KNIFE", "") in ("1", "true", "yes", "on"))
             if runtime.prefill_pressure:
                 # prefix mode PROPOSES NOTHING to Core (retirement reporting only); the
                 # pressure watermark trigger needs the real blockwise proposal channel.
@@ -2483,7 +2489,8 @@ def register():
                             _last = scheduler.kvmem_pressure_last = {}
                         _cands = [r for r in running
                                   if int(getattr(r, "num_computed_tokens", 0) or 0) >= _hi
-                                  and int(getattr(r, "num_in_flight_tokens", 0) or 0) == 0
+                                  and (int(getattr(r, "num_in_flight_tokens", 0) or 0) == 0
+                                       or _sched_cfg(scheduler).get("plan_d"))
                                   # prompt-complete requests belong to the FINAL path; a (c)
                                   # rewind there starves the last chunk (measured: logical
                                   # stuck at 86016 < 86670, need 4751 > window 4096 forever)
@@ -2491,7 +2498,11 @@ def register():
                                            and int(getattr(r, "num_logical_tokens", 0) or 0)
                                            >= int(getattr(r, "num_prompt_tokens", 0) or 0))
                                   and int(getattr(r, "num_computed_tokens", 0) or 0)
-                                  - int(_last.get(r.request_id, -10**9)) >= _step]
+                                  - int(_last.get(r.request_id, -10**9)) >= (
+                                      max(4096, int(getattr(r, "kvmem_d_stride",
+                                                            _hi)))
+                                      if _sched_cfg(scheduler).get("plan_d")
+                                      else _step)]
                         if _cands:
                             request = max(_cands, key=lambda r: int(r.num_computed_tokens))
                             _last[request.request_id] = int(request.num_computed_tokens)
@@ -2558,6 +2569,47 @@ def register():
                         _t_val = _time.perf_counter()
                         result = validate_quiescent_compaction(
                             request, records, tp_size, epoch, manager)
+                        if _sched_cfg(scheduler).get("plan_d"):
+                            # D apply: NOTHING to do on the Core books. The worker
+                            # installed the view (pages moved inside the frozen
+                            # physical set, row CONTENT written) and maintains its
+                            # own view books plus the delta/seq-lens tables. No
+                            # adopt (the block ID set is invariant), no truncate,
+                            # no rewind. Validate above already kept the proposal
+                            # honest (frontier/resident agreement across ranks).
+                            # The ONE piece Core records: the knife's view length
+                            # decides the next stride - the window fills at
+                            # win_tokens - visible_true, and knives must land
+                            # BEFORE the view overruns the frozen row.
+                            _vis = 0
+                            _shape = ""
+                            try:
+                                _r0 = records[0] if isinstance(records, (tuple, list)) and len(records) else None
+                                _shape = f"{type(_r0).__name__}:{sorted(_r0.keys())[:8] if isinstance(_r0, dict) else str(_r0)[:60]}"
+                                if isinstance(_r0, dict):
+                                    # the worker proposal spells it visible_tokens
+                                    # (apply_compaction consumes the same key)
+                                    _vis = int(_r0.get("visible_tokens", 0) or 0)
+                                    if _vis <= 0:
+                                        _vis = int(_r0.get("visible", 0) or 0)
+                                    if _vis <= 0:
+                                        for _k in ("resident", "adopted", "result"):
+                                            _sub = _r0.get(_k)
+                                            if isinstance(_sub, dict) and int(_sub.get("visible", 0) or 0) > 0:
+                                                _vis = int(_sub["visible"])
+                                                break
+                            except Exception:
+                                pass
+                            if _vis > 0:
+                                _win = int(cfg.get("budget_tokens", 36864)) +                                     int(cfg.get("gen_reserve_tokens", 16384))
+                                request.kvmem_d_stride = max(4096, _win - _vis)
+                            _append(log_path, {"kind": "d_compact_applied",
+                                               "req": request.request_id,
+                                               "epoch": epoch,
+                                               "vis": _vis, "rec0": _shape[:90],
+                                               "stride": int(getattr(request,
+                                                      "kvmem_d_stride", 0))})
+                            return
                         outcome = apply_compaction(
                             request, result,
                             lambda visible, pages, block_pages: adopt_attention_blocks(
@@ -2908,11 +2960,20 @@ def _install(cls, module_name, probe, smoke, state):
                     import torch as _td
                     _n = int(getattr(self, "max_num_reqs", 0) or 0)
                     if _n > 0:
-                        _dl = _td.zeros(_n, dtype=_td.int32, device="cuda")
+                        # created OUTSIDE inference mode: the engine runs
+                        # forwards in inference_mode and the KNIFE writes these
+                        # tables from its own context - an inference tensor
+                        # rejects every later in-place update (measured:
+                        # "InplaceMode is not allowed" even via .data)
+                        with _td.inference_mode(False):
+                            _dl = _td.zeros(_n, dtype=_td.int32, device="cuda")
+                            _vl0 = _td.zeros(_n, dtype=_td.int32, device="cuda")
                         self.kvmem_slot_deltas = _dl
-                        self.kvmem_view_lens = _td.zeros(_n, dtype=_td.int32,
-                                                         device="cuda")
+                        self.kvmem_view_lens = _vl0
                         self.kvmem_view_active = False
+                        _rt0 = state.get("sparse")
+                        if _rt0 is not None:
+                            _rt0.d_mode = True
                         _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                                 {"kind": "plan_d_wired", "pid": os.getpid(),
                                  "reqs": _n})
@@ -2920,7 +2981,23 @@ def _install(cls, module_name, probe, smoke, state):
                 self.kvmem_slot_deltas = None
                 self.kvmem_view_lens = None
         result = original(self, scheduler_output, *args, **kwargs)
-        if os.environ.get("KVMEM_EXEC_POST", "1") == "0":
+        # Plan D step accounting (AFTER prepare consumed the base): the tables
+        # hold the NEXT step's base. view_lens advances by this step's write
+        # count; a row without any knife advances 0 -> n -> num_computed, i.e.
+        # identity for stock arithmetic. Delta is constant between knives.
+        if getattr(self, "kvmem_view_active", False):
+            try:
+                _ns = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+                if _ns:
+                    _vlv = self.kvmem_view_lens
+                    _ridx = self.input_batch.req_id_to_index
+                    for _rq, _cnt in _ns.items():
+                        _ri = _ridx.get(_rq)
+                        if _ri is not None:
+                            _vlv.data[_ri] += int(_cnt)
+            except Exception:
+                pass
+
             return result
         # Profiling/dummy runs are not real steps.
         if kwargs.get("dummy_run") or kwargs.get("is_profile"):

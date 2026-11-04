@@ -145,8 +145,14 @@ def main(argv=None) -> int:
         # own view-knife arrives with its own triggers; until then D boots run
         # the pure token stream (window-sized prompts; larger ones simply do
         # not compact until the D knife lands).
-        cfg["prefill_pressure"] = False
-        cfg["sched_compact"] = False
+        # R2b protocol (design-plan-d section 7): D REUSES the proven trigger
+        # and proposal machinery unchanged (watermark (c) + sched_compact + the
+        # worker-side quiescent proposal/install plane), and switches ONLY the
+        # apply: Core does nothing to the books (no adopt - the physical set
+        # never changes - no truncate, no rewind). compact_rebuild stays OFF:
+        # no prompt-end child, escape predicates are inert by construction.
+        cfg["prefill_pressure"] = True
+        cfg["sched_compact"] = True
         cfg["compact_rebuild"] = False
         print("[kvmem backends/vllm] PLAN D on: token stream never rewinds; "
               "attention row/seq lens/slot mapping run on the adapter view "

@@ -99,3 +99,13 @@ worker 侧页搬移与快照回退、adopt/revert 通道、geometry fail-closed�
 D3 刀零 truncate；D5 因果=视图升序+前缀性质；GDN 只吃真 token 流。
 施工顺序：①apply 开关（plugin/Core）②worker install 写表+step 维护 ③hook +ql
 ④水位判据改 view 8⑤88K live 电池 → 152K/250K → 删旧机器（R3 一并）。
+
+## 8. R2b 现场进展（2026-11-04 晨，主机重启后）
+
+- 断点续验发现夜间电池从未真正运行刀：`KVMEM_D_KNIFE` 行在环境文件操作中丢失（d_mode False、表从未创建）——补回后链路瞬间打通。
+- **第一刀端到端活了**：`d_tables_published` view_base=24048 / true_base=40960..45056 / **delta=16912..21008**（与 stride 理论吻合）；prefill 100% 正常推进；publish 的 inference-tensor 坑三连修（写侧 no_grad→.data→**建表侧 inference_mode(False)**才是正解）。
+- **剩两门**：
+  1. 第二刀 idle：quiescent_compact 在进入 blockwise 之前 return None 且无事件（所有 blockwise None 分支都有 log，一个没出现）——需给入口三检查补 reason 事件再打一发定位；
+  2. 窗口越界守卫：stride 节奏失配时 prefill 写出窗口（本轮 80970 vs 53248 窗，第二刀没落 → 越界 ~8K → 请求 900s 未完被客户端 timeout）。方向：第二刀修好后按 stride 自然落；另加硬保险 = worker 端写游标逼近窗满时同步拒写并报 `d_window_guard`（提案，下轮定）。
+- 夜间遗留：`/tmp` 数据文件全灭（重建了 88K 数据集 80970tok/needle@43K）；site/patch/engine 三树同步状态未受影响（重启无变化）。
+- 本轮证据链：88K runs（125.4s needle True 无表时代 → 修表后 timeout 时代）+ console 直读（d_mode False→True、has_deltas False→True 的对照）。
