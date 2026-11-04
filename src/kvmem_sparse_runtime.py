@@ -3283,7 +3283,11 @@ class VllmSparseRuntime:
                 if dv is not None and vlv is not None:
                     import torch as _tdl
                     _ri = int(st.row_index)
-                    _base_view = int(st.seq_len)
+                    # WINDOW frame for the tables (row positions are whole
+                    # pages); st.seq_len carries the clip-sum by protocol.
+                    _base_view = int(st.row and len(st.row) and
+                                     (len(st.logical) * int(self.page_tokens))
+                                     or int(st.seq_len))
                     _true_now = int(computed if computed is not None else st.tokens)
                     with _tdl.no_grad():
                         dv[_ri] = _true_now - _base_view
@@ -3987,6 +3991,15 @@ class VllmSparseRuntime:
         #   view_base = pages_used * pt   (selection + headroom = row size)
         # with a hard ceiling at the frozen physical set (overflow = refused).
         if getattr(self, "d_mode", False):
+            resident_before = int(st.seq_len)
+            # visible STAYS the clipped sum (validate's convention). The
+            # WINDOW frame (pages x pt) is what laws and the tables use;
+            # overriding `visible` with it poisoned every proposal after the
+            # prompt completed at a non-page-multiple length (measured: 22
+            # applies through chunk-aligned prefill, then 397 straight
+            # "invalid or non-shrinking" refusals on 143,082 % 16 = 10).
+            _d_window_visible = len(logical_pages) * pt
+            # (resident_before kept above the laws: same value, correct order)
             # D shrinking law: a knife must free REAL room to be worth the
             # move - the previous attempt collapsed the view to 722 pages and
             # only grew the base again (refuse loop, measured). Require the
@@ -4004,11 +4017,18 @@ class VllmSparseRuntime:
             # real 2-chunk margin; FINAL (question ranking) must instead keep
             # the observed prefix COVERED - the question knife exists to put
             # the needle-bearing middle back in view.
+            #  - MID (pressure/statistics) knives: must FREE a 2-chunk margin
+            #    or the view never rolls (wheel-spinning cuts);
+            #  - FINAL (question-ranked) knives: only the row bound applies -
+            #    their value is REPLACING middle pages with the question's
+            #    relevant pages, and a view already saturated by mid knives
+            #    cannot "grow" (the coverage form of this law permanently
+            #    refused the 152K final knife: view 24K steady-state could
+            #    never beat resident+8192, so the question knife that would
+            #    fetch the needle block #74 from the store never landed).
             if (len(logical_pages) > len(old_row)
-                    or (not bool(final)
-                        and visible >= resident_before - 2 * 4096)
-                    or (bool(final)
-                        and visible < min(tokens, resident_before + 2 * 4096))):
+                    or (bool(pressure)
+                        and _d_window_visible >= resident_before - 2 * 4096)):
                 self._last_proposal = None
                 if self.log is not None:
                     self.log({"kind": "blockwise_d_overrow", "req": req,
@@ -4016,8 +4036,6 @@ class VllmSparseRuntime:
                               "visible": int(visible),
                               "resident_before": int(resident_before)})
                 return st
-            resident_before = int(st.seq_len)
-            visible = len(logical_pages) * pt
         elif visible <= 0 or visible >= resident_before:
             self._last_proposal = None
             if self.log is not None:
@@ -4083,13 +4101,13 @@ class VllmSparseRuntime:
                     _true = int(self._engine_computed.get(req) or tokens)
                     # .data escapes the inference-tensor guard (measured:
                     # "InplaceMode is not allowed" inside the engine context)
-                    _dv.data[_ri] = _true - int(visible)
-                    _vlv.data[_ri] = int(visible)
+                    _dv.data[_ri] = _true - _d_window_visible
+                    _vlv.data[_ri] = _d_window_visible
                     _runner.kvmem_view_active = True
                     self.log({"kind": "d_tables_published", "req": req,
-                              "row": _ri, "view_base": int(visible),
+                              "row": _ri, "view_base": _d_window_visible,
                               "true_base": _true,
-                              "delta": _true - int(visible)})
+                              "delta": _true - _d_window_visible})
             except Exception:
                 self.log({"kind": "d_tables_publish_error", "req": req,
                           "error": __import__("traceback").format_exc()[-160:]})

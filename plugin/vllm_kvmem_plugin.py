@@ -2552,7 +2552,9 @@ def register():
                                          "best": int(_best), "hi": _hi})
                         if _cands:
                             request = max(_cands, key=lambda r: int(r.num_computed_tokens))
-                            _last[request.request_id] = int(request.num_computed_tokens)
+                            _last[request.request_id] = (
+                                0 if _sched_cfg(scheduler).get("plan_d")
+                                else int(request.num_computed_tokens))
                             scheduler.kvmem_pressure_last = _last
                     if (request is None and pressure
                             and cfg.get("sched_compact")):
@@ -2579,6 +2581,9 @@ def register():
                                   epoch, int(request.num_computed_tokens),
                                   request in final))
                         _elapsed_rpc = round(_time.perf_counter() - _t_rpc, 3)
+                        _append(log_path, {"kind": "d_rpc_return",
+                                           "req": request.request_id, "epoch": epoch,
+                                           "shapes": [type(r).__name__ for r in (records or ())]})
                         if not any(rec for rec in (records or ())):
                             # Retirement-report mode: the worker audited its books and store and
                             # proposed NOTHING on purpose (the engine's dense window is correct by

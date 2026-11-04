@@ -156,3 +156,17 @@ reason 探针（wrapper exception/is_rebuilt/entry）把"第二刀 idle"完全�
 - **移交门 1（decode/MTP）**：spec4+D 刀 → prefill 100% 后 190s 不收敛（无 crash，abort 后 released）；spec0 正常完成 → **MTP4 draft 通道在 D 视图坐标下的 position/slot 独毒**，下轮 console 断点定位（嫌疑：draft block_table 行/scratch 页/query_len=5 写位）。
 - **移交门 2（152K/250K 电池）**：spec0 口径先验通，再开 MTP 门。
 - 生产恢复：SPECULATIVE=4 + PLAN_D=0（v0.5.2 已验证臂）；刀场保留在 /etc/default 注释位。
+
+
+## 12. R2b 收官扫描（round 6）：cadence 全绿，剩"final 问题刀落点"一门
+
+**本轮打通（applied 计数与 refused=0 为证）**：
+- (c) 触发在 D 下全程开火（d_c_probe 事件链），stride 基线归零修正后不再 45056 复读；
+- **刀 10-11 连发全成功**（epoch 1..25，vis 24-27K 稳态）；152K spec0 完成 140.7s（dense 219s → **刀提速 35%**）；
+- **两口径分离定案**：提案=validate 的 clip 和；刀律+表=窗口整页（`_d_window_visible`）——覆写 visible 的教训（chunk 对齐期全对、prompt 完成瞬间永拒 397 连）已成文；
+- d_none_reason/d_rpc_return/d_c_probe/d_window_guard 四探针构成完整取证面（本轮三次靠它们命名根因：NameError(final 未定义参数名)、UnboundLocalError(定义顺序)、frame 分叉）。
+
+**剩余一门（下一步）**：152K needle False 的唯一解释链——统计刀正确滚动视图，但**"问题驱动 final 刀"没在 prompt 完成刻以问题分重选到 needle 块（block 74）**。已排除：law 误拒（已放宽为 row-bound-only，epoch 25 落地=final 在 decode 步有成功 applied），kept 列表显示 tail 块在推进（86/91）但 **中间问题分没把 74 选进来**。可能：final 刀在 decode 段触发时问题分对"页 4750 区"打分缺失（harvest 只到 45056 统计）→ 需要在 prompt 完成瞬间（(b) final 集首次成立时）落一刀，用**冻结问题重打 store 分**（v0.5.0 的 rebuild_select 有现成问题打分链——D 版走 blockwise(pressure=False) 的 core 分数是否真是问题驱动 = 下一步第一检查点）。
+
+**spec4+刀判据未验**（draft view-split 代码已落，真实刀况 timeout 待复测——若 final 门修复后仍 timeout 则 draft 修复复验提级）。
+服务态：spec0 + D=1 + knife=1（生产臂 SPEC=4/PLAN_D=0 恢复留给验收全绿后）。
