@@ -268,6 +268,15 @@ class VllmSparseRuntime:
         self.statistics_layers = 0
 
     def is_rebuilt(self, req):
+        # Plan D has NO children: this predicate is meaningless there and was
+        # poisonous - a stale mark (six rebuild_select events fired even with
+        # compact_rebuild=False) switched step_end's harvest `continue` gate
+        # on for the request's WHOLE lifetime: statistics froze at the first
+        # knife (frontier 45,056 of 143K) and no selector could rank a
+        # region it never scored (measured: d_harvest_call ZERO events for
+        # the whole run; attach and skip branches never touched either).
+        if getattr(self, "d_mode", False):
+            return False
         return req in getattr(self, "_rebuilt_req", ())
 
     def accept_reconstruction(self, req):
@@ -1602,6 +1611,16 @@ class VllmSparseRuntime:
         drafts is refused, because the model writes 1+draft rows while acceptance is decided
         later, and committing them would inject rejected KV into the statistics.
         """
+        _fev = getattr(self, "_d_funnel", None)
+        if _fev is None:
+            _fev = self._d_funnel = {}
+        _fk = _fev.get(req, 0)
+        if _fk < 8 and self.log is not None:
+            _fev[req] = _fk + 1
+            self.log({"kind": "d_hv_funnel", "req": str(req)[-6:],
+                      "call": _fk, "stats_core": bool(self.stats_core),
+                      "has_stats": req in (self._statistics or {}),
+                      "n_tokens": int(n_tokens or 0)})
         if not self.stats_core:
             return 0
         stats = self._statistics.get(req)

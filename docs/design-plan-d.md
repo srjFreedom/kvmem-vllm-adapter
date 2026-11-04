@@ -245,3 +245,20 @@ reason 探针（wrapper exception/is_rebuilt/entry）把"第二刀 idle"完全�
   一发区分"读不到行"vs"锚没生效"vs"skip 门"。三套 skip 计数现已并进 statistics_final 的
   skipped 字段——本轮它还是 null（说明连 _skip 都没走——更可能是 harvest_attempt 在
   step≥8 后就没再触发：plugin 调用点的 n_new 或 prefill 标志在刀后异常——查调用点条件）。
+
+
+## 17. Harvest 公案判决：供水断在 capture，收割无罪（round 11）
+
+- 函数首行漏斗探针（d_hv_funnel，无条件前 8 次/请求）实测：harvest_key_statistics
+  **每步都在被调用**，stats_core=True、has_stats=True、n_tokens 正常；
+- write_step 之后的 d_harvest_call 事件 = 0 → 每步都死在 `sums = stats_from_bridge(...)`
+  为空（"no capture" 分支）；
+- statistics_final：frontier=45057、steps=12、written=11280 —— **第 11 步整 chunk 入统计、
+  第 12 步只入 1 行、此后 sums 恒空** = **bridge capture 从首刀附近就停止写行**；
+- 判决：**问题在 capture 侧（谁停的水），不在收割坐标系**。此前 3 轮在 harvest/selector
+  上的修正（真坐标锚、wrote0 保护、is_rebuilt 短路）都是必要卫生但不是本病灶——
+  is_rebuilt 短路本身仍是真修复（stale mark 确实存在且毒过别的消费者）。
+- 下轮唯一目标：capture 停水根因。第一嫌疑：capture op 的门读 `st.rebuilt` 字段（不是
+  is_rebuilt() 谓词——短路盖不住它）；第二嫌疑：capture install 的 per-request 门
+  （ARMED/geometry）在刀事件后失活。取证法：capture_slot_mapping/cap.note_tokens 处
+  漏斗事件（同 d_hv_funnel 模式），一发看哪层没水。
