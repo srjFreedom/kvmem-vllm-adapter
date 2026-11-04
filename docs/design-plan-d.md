@@ -170,3 +170,18 @@ reason 探针（wrapper exception/is_rebuilt/entry）把"第二刀 idle"完全�
 
 **spec4+刀判据未验**（draft view-split 代码已落，真实刀况 timeout 待复测——若 final 门修复后仍 timeout 则 draft 修复复验提级）。
 服务态：spec0 + D=1 + knife=1（生产臂 SPEC=4/PLAN_D=0 恢复留给验收全绿后）。
+
+
+## 13. Final 刀打分链路定罪（round 7）
+
+诊断事件 d_final_scores（一次 final 一发）实测：
+- `core_len=704`、`n_blocks=92`、**`block_scores_len=29`**、`top8=[8,9,10,13,12,14,11,16]`、
+  `score_around_needle={}`（needle 块 74 **根本不在分数表里**）。
+- 判词：**分数网格 resample 只铺到 block 28**——`b=(gi*grid_pages)//q` 的 grid_pages/q 配比
+  在 152K 上覆盖不到 n_blocks（704 条分数 × 32 页 ÷ q 上限≈29 块）。这不是排序问题、
+  不是 room 问题（room=10 有名额），是**评分坐标系没走到 needle 所在区域**。
+- v0.5.0 时代 final 刀正确选页走的是 `_rebuild_select` 的官方选择段（engine grid、
+  block_ok、tail forced——88K/152K/250K 7/7 全对的 proven 打分链路）。
+- **下轮施工定案**：D 的 final 刀弃用 blockwise 自建 resample，改调 rebuild_select 的
+  选择段抽成 `_d_final_pages()`（返回升序 logical_pages），再接 D install（无 rewind、
+  无 channel、row 直写、表照旧）。mid 刀维持统计 grid（它的职责只是滚动窗口）。

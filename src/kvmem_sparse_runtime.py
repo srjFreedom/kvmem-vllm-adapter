@@ -3939,6 +3939,27 @@ class VllmSparseRuntime:
                     except (TypeError, ValueError):
                         continue
                 order = sorted(block_scores, key=lambda b: -block_scores[b])
+                # FINAL-knife score observability (one per final): is the
+                # needle-bearing block RANKED at all (score path broken) or
+                # merely not SELECTED (room/kept path broken)? The question
+                # is exactly this split; measure, do not argue.
+                if (not bool(pressure)) and self.log is not None:
+                    try:
+                        _nb = int(tokens // 1024)  # needle-adjacent block guess
+                        _core0 = [int(b) for b in order[:8]]
+                        self.log({"kind": "d_final_scores", "req": req,
+                                  "core_len": len(core),
+                                  "n_blocks": n_blocks,
+                                  "top8": _core0,
+                                  "kept_n": len(kept),
+                                  "room": max(0, budget_blocks - len(kept)),
+                                  "block_scores_len": len(block_scores),
+                                  "score_around_needle": {
+                                      str(b): round(block_scores[b], 4)
+                                      for b in (_nb - 1, _nb, _nb + 1)
+                                      if b in block_scores}})
+                    except Exception:
+                        pass
                 room = max(0, budget_blocks - len(kept))
                 for b in order:
                     if room <= 0:
