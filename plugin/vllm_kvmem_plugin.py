@@ -2687,6 +2687,18 @@ def register():
                                 # against a 4096 chunk = guaranteed overrun)
                                 _chunk = int(cfg.get("chunk_token_size", 4096))
                                 request.kvmem_d_stride = max(4096, _win - _vis - _chunk)
+                                # Xid31 hard ceiling (design 21): true-position
+                                # write bound until the NEXT knife. Row holds
+                                # _win tokens; the view occupies _vis now; both
+                                # books advance together, so the true frontier
+                                # may reach knife_true + (_win - _vis); minus a
+                                # chunk of knife-response margin. Past this the
+                                # scheduler zeroes the step (never a raw write
+                                # past the frozen row - the two machine hangs
+                                # were exactly that write reaching the MMU).
+                                request.kvmem_d_ceiling = (
+                                    int(request.num_computed_tokens)
+                                    + _win - _vis - _chunk)
                                 if (int(getattr(request, "num_prompt_tokens", 0) or 0) > 0
                                         and int(getattr(request, "num_logical_tokens", 0) or 0)
                                         >= int(getattr(request, "num_prompt_tokens", 0) or 0)):

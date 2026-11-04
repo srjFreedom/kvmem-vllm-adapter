@@ -322,3 +322,23 @@ return None 只有两个门：take<=0（span=66 排除）或 **buffer/rows 对�
 - 下一轮唯一入口（非猜测，是对案）：retire abort 现场取证 - prepare 失败侧的值
   （哪层检查、当时 coverage 数字）；它与"第 12 步后 sums 空"很可能是同一个
   completeness 检查的两个断面。若同源，修 capture 覆盖 = 修 seal + 修 final 分数。
+
+
+## 21. Xid31 硬防线落地并验证（round 14）
+
+- 尸检结论（用户机器两次卡死）：NVRM Xid 31 MMU Fault = kernel 写越出冻结行后
+  GPU 页表故障 → 驱动级硬锁死（journal 写不出，表现为整机卡死）。事后记账 guard
+  拦不住 kernel 的写，必须事前不可能。
+- 机制（fork scheduler 一处 + Core apply 一处，零 kernel 改动）：
+  * 刀落地时 Core 记 `request.kvmem_d_ceiling = knife_true + (window − vis) − chunk`
+    （两账本同步前进 → 真位写到 ceiling 时行恰好满，chunk 为刀响应头量）；
+  * 排程点守卫：`computed + num_new + lookahead > ceiling` → num_new_tokens=0
+    （引擎自己的"无事可排"路径，等待至多一步，刀因 stride 同额度已在路上）；
+  * 首刀前无 ceiling（dense 写天然界内）；ceiling 只在 D 分支生效。
+- 实测（D=1 knife=1 spec0 boot）：88K 75.1s 完成、152K **119.8s** 完成（此前同条件
+  140.4s 且每轮 guard 事件 2-6 次）；**d_window_guard=0、refused=0、本 boot Xid=0**；
+  三树同步：engine guard commit、site 32519891f0、patch 7650ab16/tree cb74be83。
+- harvest 断供新线索：本轮 statistics 走到 step 10+ frontier 40960 仍在写
+  （旧形态 step 12 死）——defer 步改变了 harvest 时序；final 分数仍覆盖不足
+  （block_scores 29/49）→ 断供点下轮以 d_hv_pre/post（已埋，无 cap）判 read-back
+  空 vs 写路空。
