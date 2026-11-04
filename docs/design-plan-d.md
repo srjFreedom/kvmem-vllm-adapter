@@ -501,3 +501,26 @@ guard 已撤（其保护在 cadence 正确时代本就未用到；cadence 修复
   由别的路径继续执行引擎步 - 需要查 async 采样线程与 execute_model 的关系）。
 - 案卷补充：D 臂 spec0 收割死亡史 = 与 spec4 同症状（MTP 通道假设作废）；
   生产臂 v0.5.2 harvest 无恙（无刀）。问题被精确隔离在"D 刀 + step_end"。
+
+
+## 32. Round 24-25 案卷：我亲手埋的"裸 return"才是头号元凶；新前沿=state 在 ~step 8 蒸发
+
+- **头号案件（已破已修）**：round-21 我用 s.find 移动错位的 d_pre_after 探针时，
+  把 `if os.environ.get("KVMEM_EXEC_POST", "1") == "0":` 条件行整个吃掉，留下
+  **裸的 `return result`** —— step_end 段自此 EVERY 步无条件返回。round 21-24 的
+  "step_end 死亡"不是引擎之谜，是我对文件的一次毁伤。修法=条件行复原（本轮），
+  验证=snapshots 从 11 → 116/pid 级（funnel 232 条，stats 写到 31200 后靠
+  decode-drain 续命）。**教训（第六条取证条律）：用 s.find 锚定"多行语句中间行"
+  的编辑必须先 grep 该文本出现次数；移动探针=删旧+插新两次独立编辑，不是一行替换。**
+- **修复 step_end 后的新前沿**：stats 冻结点从 45057（刀1）提前到 31200（~step 8），
+  funnel 分布显示 tok=None×82：state 在中段消失而调用继续。seal 豁免（本轮第二修，
+  证据支持弱）没有改变冻结点 → 我的"seal 清零 _stats_next"假设**未被证实**，记录
+  待查。真凶候选：grace=8 的 sweep_release——请求若在任意 8 连续步缺席
+  （async 双阶段里 `_kvmem_req_ids` 的某阶段可能不含 prefill 请求）就会被中程释放。
+  **下轮唯一取证**：release() 入口无条件栈事件（前 6 次/pid，含调用方栈），一发
+  点名 31200 时刻是谁按下的按钮；若是 sweep，则 grace 的缺席判定要改用
+  "scheduler 报告过该请求的步数"而非"连续缺席计数"。
+- 本轮其余落档：EXEC_POST 复原；seal D 豁免（保留：ledger 连续性论证独立成立，
+  即便非本案元凶）；decode 桶路径早退（消除 n=0 雪崩的正当性来自 decode 行走
+  harvest_decode_rows 专职通道）；RPC 补读删除（与 step_end 竞争同一缓冲）。
+- 预算：13 boots。纪律：停。交还。

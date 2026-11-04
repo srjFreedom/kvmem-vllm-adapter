@@ -3133,7 +3133,21 @@ def _install(cls, module_name, probe, smoke, state):
                 self.kvmem_slot_deltas = None
                 self.kvmem_view_lens = None
         result = original(self, scheduler_output, *args, **kwargs)
-        # Plan D step accounting (AFTER prepare consumed the base): the tables
+        try:
+            _exs = state.get("_exs", None)
+            if _exs is None:
+                _exs = state["_exs"] = [0]
+            if _exs[0] < 60:
+                _exs[0] += 1
+                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "d_exec_after", "pid": os.getpid(),
+                         "nres": 0 if result is None else 1,
+                         "dummy": bool(kwargs.get("dummy_run")),
+                         "prof": bool(kwargs.get("is_profile")),
+                         "post": os.environ.get("KVMEM_EXEC_POST", "1")})
+        except Exception:
+            pass
+
         # hold the NEXT step's base. view_lens advances by this step's write
         # count; a row without any knife advances 0 -> n -> num_computed, i.e.
         # identity for stock arithmetic. Delta is constant between knives.
@@ -3149,7 +3163,7 @@ def _install(cls, module_name, probe, smoke, state):
                             _vlv.data[_ri] += int(_cnt)
             except Exception:
                 pass
-
+        if os.environ.get("KVMEM_EXEC_POST", "1") == "0":
             return result
         # Profiling/dummy runs are not real steps.
         if kwargs.get("dummy_run") or kwargs.get("is_profile"):
@@ -3174,6 +3188,23 @@ def _install(cls, module_name, probe, smoke, state):
                 state["attach_failed"] = state["adapter_step"] is None
             if state["adapter_step"] is not None:
                 state["adapter_step"](scheduler_output)
+            # sandwich (design 31): did we get PAST the adapter call, and did
+            # the sparse section open? one run pins the single silent door.
+            _ps = state.get("_ps", None)
+            if _ps is None:
+                _ps = state["_ps"] = [0]
+            if _ps[0] < 60:
+                _ps[0] += 1
+                _ad = state.get("adapter_step")
+                _sp = state.get("sparse")
+                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "d_post_adapter", "pid": os.getpid(),
+                         "n": _ps[0],
+                         "adapter_none": _ad is None,
+                         "sparse_none": _sp is None,
+                         "sched_n": len(getattr(scheduler_output,
+                                                "num_scheduled_tokens",
+                                                None) or {})})
             if state.get("sparse") is not None:
                 # Hook 2: commit what this step wrote, and reselect when due.
                 runtime = state["sparse"]
@@ -3181,20 +3212,36 @@ def _install(cls, module_name, probe, smoke, state):
                 trace = state.get("trace", False)
                 cap = getattr(runtime, "capture", None)
                 state["steps"] = state.get("steps", 0) + 1
+                # 三点定位 third probe: reached the step-end section at all.
+                _pcl = state.get("_pcl", None)
+                if _pcl is None:
+                    _pcl = state["_pcl"] = [0]
+                if _pcl[0] < 84 and (
+                        not all(str(k).startswith("_warmup")
+                                for k in (getattr(scheduler_output,
+                                                  "num_scheduled_tokens",
+                                                  None) or {})) or len(
+                                                  (getattr(scheduler_output,
+                                                  "num_scheduled_tokens",
+                                                  None) or {})) == 0):
+                    _pcl[0] += 1
+                    _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                            {"kind": "d_preclear", "pid": os.getpid(),
+                             "steps": state.get("steps")})
                 # STEP-END SNAPSHOT, uncapped, once per step (design 29): the
                 # exact set of requests the worker was handed THIS step. If a
                 # request vanishes from this set after the first knife while
                 # the engine keeps executing it, the eviction is UPSTREAM in
                 # the scheduler->worker payload, not in any worker gate.
                 try:
-                    _sn = getattr(state, "get", None)
+                    _real = not all(str(k).startswith("_warmup")
+                                    for k in scheduled)
                     _snaps = state.get("_snaps", None)
                     if _snaps is None:
                         _snaps = state["_snaps"] = [0]
-                    if _snaps[0] < 120 and (
-                            len(scheduled) == 0
-                            or not all(str(k).startswith("_warmup")
-                                       for k in scheduled)):
+                    # LOCAL cap (design 31, fifth cap lesson): warmup steps
+                    # must not drain the real-step budget.
+                    if _real and _snaps[0] < 60:
                         _snaps[0] += 1
                         _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
                                 {"kind": "d_step_snapshot", "pid": os.getpid(),
@@ -3620,8 +3667,25 @@ def _install(cls, module_name, probe, smoke, state):
                                 rt.before_step(req, row_index=row,
                                                position_slots=rt.view.query_position_slots(req))
                 except Exception as exc:
-                    _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
-                            {"kind": "sparse_step_error", "error": traceback.format_exc()})
+                    # belt: the append itself must not die (traceback module
+                    # resolved locally; prior versions of this handler were
+                    # suspected of secondary failures that erased all evidence)
+                    try:
+                        import traceback as _tbx
+                        _es = state.get("_es", None)
+                        if _es is None:
+                            _es = state["_es"] = [0]
+                        _es[0] += 1
+                        _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "sparse_step_error", "pid": os.getpid(),
+                                 "count": _es[0],
+                                 "error": _tbx.format_exc()[-700:]})
+                    except BaseException:
+                        try:
+                            with open("/tmp/kvmem_sparse.jsonl", "a") as _fz:
+                                _fz.write('{"kind":"sparse_step_error_FINAL","\n')
+                        except BaseException:
+                            pass
                     from kvmem_session_budget import BudgetError
                     from kvmem_sparse_runtime import SparseViewCapacityError
                     if isinstance(exc, (BudgetError, SparseViewCapacityError)):

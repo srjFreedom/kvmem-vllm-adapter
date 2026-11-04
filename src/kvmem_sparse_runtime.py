@@ -936,6 +936,15 @@ class VllmSparseRuntime:
         return block_hash_sequence(ids, self.kv_block_size)
 
     def _seal_dense_checkpoint(self, req, st):
+        # Plan D does not run the two-phase seal machinery: its ledger is the
+        # CONTINUOUS true book (nothing rewinds), and this seal's terminal
+        # housekeeping zeroed the harvest book mid-prefill (measured:
+        # dense_sealed at frontier 25,088 with suffix 118,046 - every later
+        # chunk's statistics silently lost, which is why the frozen frontier
+        # sat at 31,200 even after all gates were healed). D resume is its
+        # own design (deep StateImage at the true cursor) - not this path.
+        if getattr(self, "d_mode", False):
+            return
         """Plan-C C2 (DENSE seal) - CURRENTLY UNWIRED (measured 2026-11-03: sealing at
         the prompt-complete FINISH point is POISONED: the cuts already rewrote the
         block_table columns, so _state_slot(frontier) resolves the ring slot in the
@@ -1683,6 +1692,14 @@ class VllmSparseRuntime:
             # One position offset is published per step; a batched step would attribute every
             # request's buckets to the same offset.
             self._skip(req, "batch")
+            return 0
+        # Decode steps without stats_decode fold ACCEPTED rows through
+        # harvest_decode_rows at their true positions; the bucket path would
+        # clamp n to the (lagged) accepted count and produce n=0 no-ops that
+        # my wrote0 hold then froze into a permanent jam (measured: frontier
+        # stuck at 31,200 with "wrote 0 ... n 0" as top skip reason). The
+        # bridge buffer is claimed by the pre-step drain - nothing lost.
+        if decode and not getattr(self, "stats_decode", False):
             return 0
         try:
             from vllm import kvmem_bridge as bridge
@@ -3299,16 +3316,12 @@ class VllmSparseRuntime:
             # buffer holds the LAST writing step's rows keyed at their true
             # positions, so draining here reads exactly the chunk that was
             # just committed: first = tokens - pending.
-            if getattr(self, "d_mode", False) and pending >= self.page_tokens:
-                try:
-                    self._stats_next[req] = int(self._state[req].tokens) - pending
-                    got = self.harvest_key_statistics(req, pending)
-                    if self.log is not None:
-                        self.log({"kind": "d_rpc_harvest", "req": str(req)[-6:],
-                                  "pending": int(pending), "written": int(got or 0)})
-                except Exception:
-                    self.log({"kind": "d_rpc_harvest_error", "req": str(req)[-6:],
-                              "error": __import__("traceback").format_exc()[-160:]})
+            # NOTE (design 31): the RPC-side rescue harvest added in round 23
+            # is REMOVED - with the step-end gate healed, two harvest passes
+            # race for the same last-step bridge buffer and the loser writes
+            # nothing while advancing the frontier past unread rows (measured:
+            # frontier 31,200 - BEHIND the single-pass era's 45,057). One
+            # source of harvest, one owner of the buffer: step_end.
         # The epoch Core validated at trigger time IS authoritative here: we
         # run at Core's quiescent boundary by construction (this very RPC).
         # The worker's local counter lags one step behind Core's increment
