@@ -374,3 +374,16 @@ return None 只有两个门：take<=0（span=66 排除）或 **buffer/rows 对�
   accept_reconstruction? _release_slots 附带? retire 链? 下轮在 `_state.pop/del` 
   与 session retire 出口装无 cap 值事件，一发点名）。
 - 此前"step-end 循环成员继续"的结论也被坏 bucket 污染，一并作废重查。
+
+
+## 24. Round 17 双证伪与路标
+
+- 证伪一（我的 sweep 误杀论）：加了 8 步 grace 后 `d_sweep_spared=0` 且 funnel 照旧
+  停在 call 10 —— sweep 根本没做过误杀（round-16 的"disposer 定名"过早，撤回）。
+- 新线索（比 disposer 更基础）：`released` 事件仍是**旧格式**（无 after_absent 字段）
+  ——**worker 进程执行的 plugin 代码 ≠ repo 磁盘文件**！loader 鉴定是下轮第一步：
+  `python -c "import vllm_kvmem_plugin as m; print(m.__file__)"` 在 worker 上下文
+  （console 探针打印 module __file__ + d_mode 实际值 + sweep 函数源码指纹）。
+  **若 worker 加载的是 site-packages 的旧拷贝，则过去几轮所有"plugin 修改"对
+  该进程可能从未生效**——多个"修了没用"的现象将获得统一解释。
+- funnel/harvest 的 call 停滞机制本身未定名；但先解决 loader 真相等最低层问题。

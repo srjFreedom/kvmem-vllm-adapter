@@ -1254,8 +1254,34 @@ def _attach_sparse(runner, log_path):
                 # A request that disappeared from the batch has finished: give its H share back,
                 # otherwise a long-lived engine leaks the shared host budget.
                 for gone in [r for r in runtime.live_requests() if r not in live]:
-                    runtime.release(gone)
-                    _append(log_path, {"kind": "released", "req": gone, "pid": os.getpid()})
+                    # THE DISPOSER, CAUGHT (design 23/24): disappearance from
+                    # ONE step's batch is not completion. Plan D defers steps
+                    # by construction (ceiling guard zeroes num_new_tokens
+                    # while a knife lands), so the sweep used to execute the
+                    # request mid-flight - state gone (funnel tok=None from
+                    # call 9), harvest dead, statistics frozen at the knife,
+                    # the final knife scoring nothing. Release only after
+                    # EIGHT consecutive absent steps (real finishes stay
+                    # absent; a deferred knife costs one or two).
+                    _gs = getattr(runtime, "_gone_streak", None)
+                    if _gs is None:
+                        _gs = runtime._gone_streak = {}
+                    _gs[gone] = _gs.get(gone, 0) + 1
+                    _grace = 8 if getattr(runtime, "d_mode", False) else 1
+                    if _gs[gone] >= _grace:
+                        runtime.release(gone)
+                        _gs.pop(gone, None)
+                        _append(log_path, {"kind": "released", "req": gone,
+                                           "pid": os.getpid(),
+                                           "after_absent": _grace})
+                    else:
+                        _append(log_path, {"kind": "d_sweep_spared",
+                                           "req": str(gone)[-6:],
+                                           "streak": _gs[gone]})
+                for req in live:
+                    _gs2 = getattr(runtime, "_gone_streak", None)
+                    if _gs2 and req in _gs2:
+                        _gs2.pop(req)  # seen again: the absence was a defer
                 for req in live:
                     if view.row_index(req) is None:
                         continue
