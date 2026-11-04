@@ -64,7 +64,8 @@ class _ReqState:
     __slots__ = ("row", "logical", "seq_len", "tokens", "next_page", "steps", "spare",
                  "row_index", "prefill_done", "query_reselected", "resume", "resumed",
                  "replay_snap", "replay_n", "replay_at", "replay_at_resident", "rebuilt",
-                 "compacted_in_prefill", "applied_view_coord", "off_pages", "window_src")
+                 "compacted_in_prefill", "applied_view_coord", "off_pages", "window_src",
+                 "d_question_cut")
 
     def __init__(self):
         self.row = ()
@@ -1855,6 +1856,40 @@ class VllmSparseRuntime:
     def live_requests(self):
         """Requests the runtime still holds state for (for the worker-side sweep)."""
         return list(self._orch.keys())
+
+    def d_question_knife_seam(self, scheduler_output):
+        """Design 39-A: install the question view on the completion step,
+        BEFORE the sampler runs. Trigger: a scheduled chunk whose step
+        completes the prompt, no question knife landed yet. The final chunk
+        pages need no store (they are resident in the statistics view's
+        rolling write area; remobilize keeps resident∩chosen in place and
+        only consults the store for selected-but-absent pages)."""
+        if not getattr(self, "d_mode", False):
+            return
+        try:
+            ns = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+        except Exception:
+            return
+        for rid, n_new in ns.items():
+            st = self._state.get(rid)
+            if st is None or getattr(st, "d_question_cut", False):
+                continue
+            pl = int(self._prompt_len.get(rid, 0) or 0)
+            if not pl or int(st.tokens) + int(n_new) < pl:
+                continue
+            if int(st.tokens) <= int(self.budget_tokens) + 4096:
+                continue  # dense view already covers the whole prompt
+            try:
+                self._reselect_blockwise(rid, pressure=False)
+                if self.log is not None:
+                    self.log({"kind": "d_seam_local_knife", "req": str(rid)[-8:],
+                              "tokens": int(st.tokens), "prompt": pl,
+                              "after": getattr(st, "d_question_cut", False)})
+            except Exception:
+                if self.log is not None:
+                    self.log({"kind": "d_seam_local_knife_error",
+                              "req": str(rid)[-8:],
+                              "error": __import__("traceback").format_exc()[-260:]})
 
     def sweep_release(self, req):
         """The ONE release policy for sweep callers (design 24): disappearance
@@ -4324,6 +4359,19 @@ class VllmSparseRuntime:
             orch.rebuild_index(tuple(logical_pages))
         except Exception:
             pass
+        if not bool(pressure):
+            # design 39-A completion (seam lock): the terminal question mark
+            # used to be set ONLY at the quiescent-tail RPC publish site, so
+            # a knife installed through THIS path (pre-sampler seam, or any
+            # worker-local landing) left the view UNLOCKED and the first
+            # post-completion MID knife rolled the question view back
+            # (measured: seam installed with needle_in_view=1, after:false).
+            try:
+                st.d_question_cut = True
+            except AttributeError:
+                getattr(self, "_qc_set", None) or setattr(
+                    self, "_qc_set", set())
+                self._qc_set.add(req)
         self._owned_slots[req] = set(int(p) for p in st.row)
         _dsend = getattr(self, "_d_sender", None)
         self._last_proposal = {
@@ -4363,7 +4411,13 @@ class VllmSparseRuntime:
                     _vlv.data[_ri] = _d_window_visible
                     _runner.kvmem_view_active = True
                     if not bool(pressure) and self._state.get(req) is not None:
-                        self._state[req].d_question_cut = True
+                        try:
+                            self._state[req].d_question_cut = True
+                        except AttributeError:
+                            _fbs = getattr(self, "_qc_set", None)
+                            if _fbs is None:
+                                _fbs = self._qc_set = set()
+                            _fbs.add(req)
                     self.log({"kind": "d_tables_published", "req": req,
                               "row": _ri, "view_base": _d_window_visible,
                               "true_base": _true,

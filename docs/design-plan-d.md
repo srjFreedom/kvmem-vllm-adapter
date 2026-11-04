@@ -626,3 +626,18 @@ final 刀未落的剩余疑点（两点，下轮一发分辨）：
   在 D 下已跳过）+ remobilize 安装 + 表发布，然后才 sampler - **第一 token 出生在问题视图**。
   风险登记：TP 两 rank 需同轮执行（确定性输入成立）；与 (c)/(b) 的幂等（final_cut 标记已有）。
 - 本轮预算：4 boots 止，seam 保险层代码保留（D 门内无害）。
+
+
+## 40. Round 30：seam 刀全链运转；候选 A 判死——首 token logits 物理先于刀
+
+- slots 血案（`__slots__` AttributeError 杀光两臂 2 轮）修复入 `__slots__` +
+  try/except fallback 双保险；离线 6/6。
+- 本 boot 刀链全绿：`d_seam_local_knife after:True`（错误 0）、blockwise_reselect×2、
+  锁生效、答案从复读机变 "user is is"（token2+ 确实活在了问题视图里）。
+- **候选 A 的物理判决（定案）**：完成步的 logits 由 forward 在装刀**之前**算出——
+  pre-sampler 刀救不了第一个 token；16-token 思维链被错首词带偏，needle 到不了输出。
+  v0.5.2 靠 child rebuild 重 prefill 整个 prompt 才有正确首 token。
+  **D 不变量（永不 rewind/无 child）下唯一出路 = D6 StateImage 重评原语**：
+  末段 forward 重放 + GDN 状态在 cursor 处快照/回置（token 流与账本不动，
+  重放是幂等再计算）——这正是 R3 resume 深度的同一个机制，一并施工。
+- seam 刀保留（token2+ 的正确视图 + 锁的终末语义，都是 R3 重评的地基）。

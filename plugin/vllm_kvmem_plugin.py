@@ -3228,6 +3228,14 @@ def _install(cls, module_name, probe, smoke, state):
             except Exception:
                 self.kvmem_slot_deltas = None
                 self.kvmem_view_lens = None
+        # design 39-A binding: expose the pre-sampler seam to the runner for
+        # THIS step. The hook fires inside execute_model between forward and
+        # sampler - the only place the question view can precede the first
+        # sampled token of a completing prompt under nosync scheduling.
+        _rtb = state.get("sparse")
+        if _rtb is not None:
+            self.kvmem_pre_sample_hook = (
+                lambda: _rtb.d_question_knife_seam(scheduler_output))
         result = original(self, scheduler_output, *args, **kwargs)
         try:
             _exs = state.get("_exs", None)

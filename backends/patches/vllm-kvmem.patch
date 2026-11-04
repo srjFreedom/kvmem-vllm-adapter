@@ -2758,7 +2758,7 @@ index 481da20..f12cc94 100644
          LOOKAHEAD_BLOCK=triton.next_power_of_2(num_lookahead),
      )
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 0422c9e..6485362 100644
+index 0422c9e..321583f 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -181,6 +181,7 @@ from vllm.v1.worker.utils import (
@@ -2991,7 +2991,26 @@ index 0422c9e..6485362 100644
          )
          return block_tables, slot_mappings
  
-@@ -1746,11 +1902,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1571,6 +1727,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 grammar_output.grammar_bitmask,
+             )
+ 
++        # KVMem Plan D pre-sampler question-knife seam (design 39-A): on the
++        # prompt-completion step the sampler would otherwise run on the
++        # statistics view, which legitimately lacks the needle pages; the
++        # question rows EXIST right now (this step's forward just harvested
++        # them), so the adapter may install the question view here - the one
++        # point that is forward-complete, worker-quiescent, and PRE-sampling.
++        _khk = getattr(self, "kvmem_pre_sample_hook", None)
++        if _khk is not None:
++            try:
++                _khk()
++            except Exception:
++                pass
+         sampler_output: SamplerOutput | None
+         if input_batch.num_reqs == 0:
+             # This rank owns no requests this step. It contributes an
+@@ -1746,11 +1914,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # boundaries before the forward. Runs only on real batches, and
              # before model_state.prepare_attn gathers num_accepted_tokens so the
              # boundary reset is visible to the attention metadata.
