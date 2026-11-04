@@ -666,3 +666,30 @@ fork 无 StateImage 名字，但**同等机制已在 spec-rollback 生命周期�
 分工：R3.2 = 步骤1/3/6 wiring + 离线；R3.3 = 4/5 重放与 logits 接管 + 88K 全链；
 R3.4 = 152K/250K 电池 + resume 复用同一原语（observed-prefix：restore 到 cursor +
 skip=不重放只装视图 - 顺路）。
+
+
+## 42. Round 31 R3.2 施工定形：replay-and-replace（非侵入版）
+
+侦察补充定案（本轮后半）：
+- sampler 输入是 execute_model 局部变量（line 1712 `sample_hidden_states`）——
+  hook **无法原地替换 logits**；但插件 wrapper 在 execute_model **返回值**外面——
+  故采用 **replay-and-replace-output** 形态：
+  1. seam 刀装完后，hook 在 runner 上置 `self._d_replay_request = scheduler_output`
+     标志并**自递归调用一次 execute_model(同一 scheduler_output)**（guard 防环）；
+  2. 重放跑完 forward+sampler → 其 ModelRunnerOutput 存 `self._d_replay_output`;
+  3. 首跑 sampler 照常产出（garbage），wrapper 在 return 处把该 req 的
+      sampled token **整体替换**为 replay 的 output（一行 dict 覆盖）；
+  4. 首跑与重放的**账本二次效应全部封锁**（重放不得记账两遍）：
+     view_lens advance（`_d_in_replay` 旗标跳过）、statistics harvest（旗标）、
+     bridge drain（重放前不清 buffer 的时序：首跑 bridge 留到最后 chunk 行，
+     重放覆写同键 - 幂等）、note_engine_* 上报（旗标）；
+  5. **状态快照/回置**：completion 步 forward 前（wrapper 入口）把该 req 行的
+     全层 mamba 主列拷进 scratch 列 - 用 `_get_mamba_group_info` 的 group ctx +
+     `get_mamba_state_copy_funcs`，Python 逐层 clone 起步（48层×2类 ≈ 百个
+     slice copy，毫秒级），kernel 版后换；刀装完后、重放前 scratch→主列回置。
+- D1 合规论证（终版）：token 流/账本/位置通道全程未动；重放=同一 token 序列在
+  同一真坐标上的**幂等再计算**（attention 读问题视图、GDN 从快照再推到同一
+  正确终态）；被替换的只是**采样结果**（本来就要重来的 logits 线）。
+- 施工序：R3.2a 快照/回置 + 单元（假 completion 步离线 round-trip 状态恒等）→
+  R3.2b 自递归重放 + 二次效应旗标 + 输出替换 → R3.3 88K 全链 + coin/logits
+  双证（第一 token 出生视图 needle_in_view=1）→ R3.4 电池。
