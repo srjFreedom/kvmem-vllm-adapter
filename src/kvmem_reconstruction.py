@@ -48,7 +48,8 @@ def adopt_attention_blocks(kv_cache_manager, request_id, physical_pages, block_p
             "free_blocks": kv_cache_manager.block_pool.get_num_free_blocks()}
 
 
-def validate_quiescent_compaction(request, records, tp_size, epoch, kv_cache_manager):
+def validate_quiescent_compaction(request, records, tp_size, epoch, kv_cache_manager,
+                                  d_mode=False):
     """Validate TP proposals on Core's idle boundary without touching GPU or allocator.
 
     Acceptance is not a commit: staged GPU moves and all-rank acknowledgment must follow before
@@ -80,7 +81,14 @@ def validate_quiescent_compaction(request, records, tp_size, epoch, kv_cache_man
             visible = int(record["visible_tokens"])
             if (record["request"] != req_id or int(record["epoch"]) != int(epoch)
                     or int(record["logical_frontier"]) != logical
-                    or int(record["resident_frontier"]) != resident):
+                    or (not d_mode
+                        and int(record["resident_frontier"]) != resident)):
+                # Plan D: the worker's resident book is the VIEW length and
+                # Core's computed book is the TRUE length - the equality this
+                # check enforces has no D meaning (the entry-side twin is
+                # exempted the same way; the logical/frontier equality above,
+                # stamped from the sender, is the surviving time-agreement
+                # guarantee).
                 raise ValueError("TP compaction frontier/epoch differs from EngineCore")
             # Partial tail pages are legal as long as the selection KEEPS the last page (the
             # recent window always does): `visible` is then the sum of per-page token counts,
@@ -96,7 +104,12 @@ def validate_quiescent_compaction(request, records, tp_size, epoch, kv_cache_man
                     # Logical pages and physical slots are distinct namespaces: only require
                     # that the adopted row covers at least the selected pages.
                     or len(physical) < len(selected)
-                    or visible != expected_visible or visible >= resident):
+                    or visible != expected_visible
+                    or (not d_mode and visible >= resident)):
+                # D: `resident` is Core's TRUE book; view-based visible is
+                # smaller by construction only while the window holds room.
+                # The shrinking law is enforced worker-side instead (the
+                # knife must free a real margin before proposing).
                 raise ValueError("invalid or non-shrinking TP compaction proposal")
             candidate = (selected, physical, visible, page, block)
             if proposal is not None and candidate != proposal:

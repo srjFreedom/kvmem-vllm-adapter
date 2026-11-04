@@ -2576,7 +2576,8 @@ def register():
                             return
                         _t_val = _time.perf_counter()
                         result = validate_quiescent_compaction(
-                            request, records, tp_size, epoch, manager)
+                            request, records, tp_size, epoch, manager,
+                            d_mode=bool(_sched_cfg(scheduler).get("plan_d")))
                         if _sched_cfg(scheduler).get("plan_d"):
                             # D apply: NOTHING to do on the Core books. The worker
                             # installed the view (pages moved inside the frozen
@@ -2644,6 +2645,25 @@ def register():
                                            "req": request.request_id,
                                            "reverted": bool(any(reverted or ())),
                                            "error": f"{type(exc).__name__}: {exc}"})
+                        # value-level refuse trace: every rank's stamped
+                        # frontier/epoch vs Core's CURRENT books - names the
+                        # mismatching field without another hypothesis cycle
+                        try:
+                            _trace = [{
+                                "req": (rec or {}).get("request"),
+                                "epoch": (rec or {}).get("epoch"),
+                                "front": (rec or {}).get("logical_frontier"),
+                                "resid": (rec or {}).get("resident_frontier"),
+                            } for rec in records]
+                            _append(log_path, {"kind": "d_refuse_trace",
+                                               "core_epoch": epoch,
+                                               "core_logical": int(getattr(
+                                                   request, "num_logical_tokens", -1)),
+                                               "core_resident": int(getattr(
+                                                   request, "num_computed_tokens", -1)),
+                                               "ranks": _trace})
+                        except Exception:
+                            pass
                         return
                     if request in final:
                         request.kvmem_final_reselect = True

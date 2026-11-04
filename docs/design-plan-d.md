@@ -120,3 +120,25 @@ reason 探针（wrapper exception/is_rebuilt/entry）把"第二刀 idle"完全�
 
 **已验证的正面成果**：88K 两发 needle=True（121.9s / 95.4s——95.4s 比无刀 dense 105s 更快，第一刀语义真实生效）；d_tables_published delta 与 stride 理论吻合；确定性（同代 sha 曾一致）。
 **下一轮唯一缺口**：第二刀 refuse/idle 的死角（先按请求隔离 _d_sender，一发 88K 看 refuse 是否绝迹）→ 然后 152K/250K → 删旧机器 R3。
+
+
+## 10. R2b 协议层收官（2026-11-04 round5）——缺口转移到 decode/MTP 通道
+
+**协议层现状（全部达成，实测）**：
+- 88K 双刀 cadence：vis 24048→23632、delta 16912→50096（滚动增长正确）；
+- scores=true（TP 跨 rank 共识在 D 下改走"同步触发即共识"——trigger 本身 collective，两 rank 同刻进 RPC，各自 core_selection_scores 同长；consensus collective 的 availability 检查在 D 下反而误伤 → 跳过；worker 入口的 `_d_sender` 盖章让提案与 Core 现算值天然相等）；
+- refuse=0：validate 的 D 豁免 = resident 相等 + visible>=resident（两条都是 rewind 世界项）；
+- overrow/margin law：选择必须真空至少 2 chunk，防空转刀。
+
+**唯一剩余缺口 = decode 侧**：prefill 100% 后请求 190s+ 不结束（abort 在 released 前无 crash）。
+嫌疑排序（下一步逐个用 console 断点测，不猜）：
+1. MTP4 draft 的 position/slot 通道在 D 视图坐标下越界（scratch 页、draft block_table 行）；
+2. bonus-token 写位（query_len=5 步）slot=-1 或越窗；
+3. `_resample_kernel/_rejection_kernel` JIT 首编译风暴（慢但会结束——不足以解释 190s 不收尾）。
+判别实验：D boot 上 spec0 × 88K —— 若 spec0 完成且 needle 正确 → MTP 通道独毒；
+若 spec0 也卡 → 主 decode 路径（slot 映射/seq_lens）的视图问题。
+
+**运维事实修正（本回合踩坑）**：生产加载的 runtime 源 = site venv 的 **site-packages**
+（finder 只映射 `vllm/`；repo src/*.py 由 start 脚本拷入 site-packages）——
+**改 src/ 后必须重启才生效，且 patch/版本文件同步要覆盖 site-packages 拷贝链**。
+本轮所有修复实际生效（boot=代码重启），但"改了不重启"的静默窗口骗了两次中期判读。

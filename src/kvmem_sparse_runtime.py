@@ -3677,7 +3677,8 @@ class VllmSparseRuntime:
         if core is None:
             core = getattr(orch, "_last_core", None)
         if (core is not None and len(core) and bool(getattr(self, "_in_quiescent", False))
-                and int(getattr(self, "tp_size", 1) or 1) > 1):
+                and int(getattr(self, "tp_size", 1) or 1) > 1
+                and not getattr(self, "d_mode", False)):
             try:
                 from kvmem_tp_scores import average_reconstruction_scores
                 _sel = getattr(orch, "selector", None)
@@ -3903,7 +3904,8 @@ class VllmSparseRuntime:
         if core is None:
             core = getattr(orch, "_last_core", None)
         if (core is not None and len(core) and bool(self._in_quiescent)
-                and int(getattr(self, "tp_size", 1) or 1) > 1):
+                and int(getattr(self, "tp_size", 1) or 1) > 1
+                and not getattr(self, "d_mode", False)):
             # TP2 consensus: without it each rank ranks the middle by its own shard's scores,
             # the proposals differ and Core refuses ("TP ranks proposed different working
             # sets"). The collective raises SYMMETRICALLY, so degrading to `no ranking` keeps
@@ -3985,11 +3987,21 @@ class VllmSparseRuntime:
         #   view_base = pages_used * pt   (selection + headroom = row size)
         # with a hard ceiling at the frozen physical set (overflow = refused).
         if getattr(self, "d_mode", False):
-            if len(logical_pages) > len(old_row):
+            # D shrinking law: a knife must free REAL room to be worth the
+            # move - the previous attempt collapsed the view to 722 pages and
+            # only grew the base again (refuse loop, measured). Require the
+            # selection to be at least two chunks smaller than the current
+            # view book, i.e. eviction actually happened.
+            # The knife must shrink the VIEW book by a real margin (2 chunks)
+            # while staying inside the frozen physical row.
+            if (len(logical_pages) > len(old_row)
+                    or visible >= resident_before - 2 * 4096):
                 self._last_proposal = None
                 if self.log is not None:
                     self.log({"kind": "blockwise_d_overrow", "req": req,
-                              "pages": len(logical_pages), "row": len(old_row)})
+                              "pages": len(logical_pages), "row": len(old_row),
+                              "visible": int(visible),
+                              "resident_before": int(resident_before)})
                 return st
             resident_before = int(st.seq_len)
             visible = len(logical_pages) * pt
