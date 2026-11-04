@@ -575,3 +575,17 @@ final 刀未落的剩余疑点（两点，下轮一发分辨）：
 - coin 三轮修正后终判：`needle_page=1264 in view=1, logical_len=869, visible=27808` - **页坐标核查（40471//16），非块坐标**（我先 39*64 的块算术差点冤枉了刀）。刀安装、锁定、覆盖全部正确。
 - **D 读路径唯一剩余嫌疑**：问题刀落地后 MID 刀持续 republish 表值（delta 随流增大到 17248+），若 decode 的视图读表在**某一步后不再 republish 或被 flush 顺序错位**，attention 就按错 delta 取行。病灶=表值时间线与视图安装的一致性 - audit 探针因缩进毁损被还原未遂，下轮第一步在 remobilize 与 republish 两处（以 12/16 空格正确缩进）装 slot 解析审计（needle 真位→slot 应得视图位置 vs delta 公式实际给出），一发定最后案。
 - 本轮 boot 13 次，严重超预算；停止。
+
+
+## 37. Round 28 案终：设备内容全程真实；时序定罪——问题刀晚于答案落锤
+
+- needle_trace 直通（KVMEM_TRACE_PAGES）后内容审计铁证：
+  * pre-knife：`compacted_slot=null`（needle 页根本不在视图内 - MID 选择按统计不含它，合法）；
+  * question knife 安装后：`device_sha == store_sha` 全程一致 - **读路径无罪、内容无罪、delta 无罪**。
+- 唯一病灶=时序：问题刀在 prompt 完成步 (b) 落地，但 `prompt 完成 → 第一个 decode 步`的
+  窗口里答案已按"无 needle 页视图"生成（max_tokens=16 全部在问题视图安装前 commit）。
+- 修法（R2b 最后闸门，下轮施工）：问题刀提前到"问题被冻结的瞬间"安装 - 即 prompt 最后一
+  chunk 完成后、第一次采样之前（Core 端：scheduled_new_reqs 的最后一 chunk 步之后立即触发
+  (b)，或 worker 端 prefill_done 首个 decode 步之前置于采样钩子内）。安装点提前一步，
+  答案的第一 token 就出生在带 needle 页的问题视图里。
+- 至此方案 D 的每个部件都有实证无罪/有罪判决：刀✓锁✓覆盖✓表✓内容✓ - 只剩这个安装时机。

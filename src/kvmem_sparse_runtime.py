@@ -126,6 +126,14 @@ class VllmSparseRuntime:
         self.host_mib = int(host_mib)
         self.use_kvmem_plan = bool(use_kvmem_plan)
         self.needle_trace = int(needle_trace)
+        # env直通 (design 37): KVMEM_TRACE_PAGES=1264[,..] makes the commit-time
+        # device-vs-table byte probe watch those logical pages for every
+        # request on this boot - the content audit that settles whether the
+        # needle page's BYTES actually sit under its view slot.
+        _tpg = [int(x) for x in os.environ.get("KVMEM_TRACE_PAGES", "").split(",")
+                if x.strip().lstrip("-").isdigit()]
+        if _tpg:
+            self.trace_pages = _tpg
         self.use_kvmem_host = bool(use_kvmem_host)
         self.sessions = int(sessions)
         # Engine allocation quantum in PAGES (attention block / kernel page). With a hybrid model
