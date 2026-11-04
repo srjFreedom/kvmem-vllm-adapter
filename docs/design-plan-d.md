@@ -360,3 +360,17 @@ return None 只有两个门：take<=0（span=66 排除）或 **buffer/rows 对�
 
 安全面不变：guard 已让越界不可能（两轮 Xid=0），本机可继续实验。
 性能面不变：guard 下 152K 最快 119.6s（dense 219s 的 54%）。
+
+
+## 23. 断供终审（round 16，无 cap 铁证）：请求状态在首刀附近被拆
+
+- 第四次踩 cap 坑（bucket 用 n_new//4096 恒 0 - 每 chunk 都是 4096）后彻底去 cap。
+- 铁证（152K 双跑）：
+  1) `d_hv_funnel` 到 call 10（tok=40960）为止，之后零调用 —— 收割从**第一刀前一步**就停了；
+  2) call 9 起事件里 `tok=None` = **runtime `_state[req]` 已不存在，而 Core 请求仍在跑**；
+  3) 与 round-13 的 `session_checkpoint_retire_aborted`（TP workers did not all
+     prepare a checkpoint）同场景：seal/retire 链半路折断 - 状态拆了、没拆干净。
+- 病灶定名：**D 刀落地时 seal/retire 对请求状态的提前释放**（谁 discard 的：
+  accept_reconstruction? _release_slots 附带? retire 链? 下轮在 `_state.pop/del` 
+  与 session retire 出口装无 cap 值事件，一发点名）。
+- 此前"step-end 循环成员继续"的结论也被坏 bucket 污染，一并作废重查。

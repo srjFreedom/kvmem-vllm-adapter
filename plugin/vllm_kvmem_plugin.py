@@ -3153,6 +3153,29 @@ def _install(cls, module_name, probe, smoke, state):
                 cap = getattr(runtime, "capture", None)
                 state["steps"] = state.get("steps", 0) + 1
                 for req, n_new in scheduled.items():
+                    # MEMBERSHIP evidence (design 22 forensics, cap 3/req):
+                    # does the second big request of a boot appear in the
+                    # step-end scheduled loop AT ALL? The harvest funnel saw
+                    # zero calls for it - upstream silence was never proven
+                    # to be upstream.
+                    _mk = getattr(state, "get", None) and state.get("_mk", None)
+                    if _mk is None:
+                        _mk = state["_mk"] = {}
+                    _mc = _mk.get(req, 0)
+                    _bkt = int(n_new) // 4096   # bucket cap: 3 per 4096-token
+                    _key = (req, _bkt)         # bucket of the stream, NOT of
+                    _mb = state.get("_mb", None)
+                    if _mb is None:
+                        _mb = state["_mb"] = {}
+                    _mcb = _mb.get(_key, 0)
+                    if _mc < 3 or _mcb < 3:
+                        _mk[req] = _mc + 1
+                        _mb[_key] = _mcb + 1
+                        _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "d_loop_member", "req": str(req)[-8:],
+                                "call": _mc, "n_new": int(n_new),
+                                "reqs_in_step": len(scheduled),
+                                "steps": state.get("steps")})
                     # B1c (goal-7833cb61): snapshot the kernel's write addresses while the
                     # static buffer still holds this step's values (the lagged commit reads
                     # it AFTER the compiled pipeline refills the tensor). Gate lives inside.

@@ -1625,8 +1625,18 @@ class VllmSparseRuntime:
         if _fev is None:
             _fev = self._d_funnel = {}
         _fk = _fev.get(req, 0)
-        if _fk < 8 and self.log is not None:
-            _fev[req] = _fk + 1
+        _fev[req] = _fk + 1
+        if self.log is not None:
+            # NO CAP this time (a cap truncated THREE forensic conclusions
+            # this project - bucket math on n_new was wrong too: every
+            # chunk is 4096 so the bucket never moved). Event volume is
+            # bounded by steps per request (~35 at 152K), acceptable.
+            _stf = self._state.get(req)
+            self.log({"kind": "d_hv_funnel", "req": str(req)[-6:],
+                      "call": _fk, "stats_core": bool(self.stats_core),
+                      "has_stats": req in (self._statistics or {}),
+                      "n_tokens": int(n_tokens or 0),
+                      "tok": int(getattr(_stf, "tokens", -1)) if _stf else -1})
             self.log({"kind": "d_hv_funnel", "req": str(req)[-6:],
                       "call": _fk, "stats_core": bool(self.stats_core),
                       "has_stats": req in (self._statistics or {}),
@@ -1798,7 +1808,9 @@ class VllmSparseRuntime:
         stats = self._statistics.get(req)
         if stats is None:
             return {"enabled": bool(self.stats_core), "present": False,
-                    "skipped": self._stats_skipped.get(req)}
+                    "skipped": self._stats_skipped.get(req),
+                    "dict_keys": [str(k)[-8:] for k in (self._statistics or {})],
+                    "funnel_seen": str(req)[:24] in str(getattr(self, "_d_funnel", {}))[:600]}
         out = stats.stats()
         out["written"] = int(self._stats_written.get(req, 0))
         out["next"] = int(self._stats_next.get(req, 0))
