@@ -1254,34 +1254,16 @@ def _attach_sparse(runner, log_path):
                 # A request that disappeared from the batch has finished: give its H share back,
                 # otherwise a long-lived engine leaks the shared host budget.
                 for gone in [r for r in runtime.live_requests() if r not in live]:
-                    # THE DISPOSER, CAUGHT (design 23/24): disappearance from
-                    # ONE step's batch is not completion. Plan D defers steps
-                    # by construction (ceiling guard zeroes num_new_tokens
-                    # while a knife lands), so the sweep used to execute the
-                    # request mid-flight - state gone (funnel tok=None from
-                    # call 9), harvest dead, statistics frozen at the knife,
-                    # the final knife scoring nothing. Release only after
-                    # EIGHT consecutive absent steps (real finishes stay
-                    # absent; a deferred knife costs one or two).
-                    _gs = getattr(runtime, "_gone_streak", None)
-                    if _gs is None:
-                        _gs = runtime._gone_streak = {}
-                    _gs[gone] = _gs.get(gone, 0) + 1
-                    _grace = 8 if getattr(runtime, "d_mode", False) else 1
-                    if _gs[gone] >= _grace:
-                        runtime.release(gone)
-                        _gs.pop(gone, None)
+                    # ONE policy, three call sites (design 24): the unified
+                    # sweeper lives in the runtime; this site used to carry
+                    # its own copy while two sibling sweeps kept the old
+                    # one-shot semantics - the "old-format released events"
+                    # mystery was exactly that divergence, not the loader.
+                    if runtime.sweep_release(gone):
                         _append(log_path, {"kind": "released", "req": gone,
-                                           "pid": os.getpid(),
-                                           "after_absent": _grace})
-                    else:
-                        _append(log_path, {"kind": "d_sweep_spared",
-                                           "req": str(gone)[-6:],
-                                           "streak": _gs[gone]})
+                                           "pid": os.getpid(), "site": "A"})
                 for req in live:
-                    _gs2 = getattr(runtime, "_gone_streak", None)
-                    if _gs2 and req in _gs2:
-                        _gs2.pop(req)  # seen again: the absence was a defer
+                    runtime.seen_alive(req)
                 for req in live:
                     if view.row_index(req) is None:
                         continue
@@ -3439,10 +3421,13 @@ def _install(cls, module_name, probe, smoke, state):
                             # With SESSIONS=1 the old share must be closed/evicted first; doing
                             # this after rt.state(new_req) reused the old budget identity.
                             for gone in [r for r in rt.live_requests() if r not in reqs]:
-                                rt.release(gone)
-                                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
-                                        {"kind": "released", "req": gone, "pid": os.getpid()})
-                            import numpy as _np
+                                if rt.sweep_release(gone):
+                                    _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                            {"kind": "released", "req": gone, "pid": os.getpid(),
+                                             "site": "B"})
+                                for _alive in reqs:
+                                    rt.seen_alive(_alive)
+
                             counts_np = _np.asarray(counts, dtype=_np.int64)
                             csl = _np.concatenate(([0], _np.cumsum(counts_np)))
                             idx = getattr(batch_req_state, "idx_mapping_np", None)

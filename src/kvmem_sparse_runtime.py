@@ -1821,6 +1821,34 @@ class VllmSparseRuntime:
         """Requests the runtime still holds state for (for the worker-side sweep)."""
         return list(self._orch.keys())
 
+    def sweep_release(self, req):
+        """The ONE release policy for sweep callers (design 24): disappearance
+        from one step's batch is NOT completion - Plan D defers steps by
+        construction (ceiling guard zeroes the chunk while a knife lands),
+        so a sweeper must see EIGHT consecutive absences before it may
+        release. Legacy single-shot semantics are kept for non-D boots.
+        Returns True when the release actually happened."""
+        st = self._state.get(req)
+        streak = getattr(self, "_gone_streak", None)
+        if streak is None:
+            streak = self._gone_streak = {}
+        streak[req] = streak.get(req, 0) + 1
+        grace = 8 if getattr(self, "d_mode", False) else 1
+        if streak[req] >= grace:
+            streak.pop(req, None)
+            self.release(req)
+            return True
+        if self.log is not None:
+            self.log({"kind": "d_sweep_spared", "req": str(req)[-6:],
+                      "streak": streak[req],
+                      "tok": int(getattr(st, "tokens", -1)) if st else -1})
+        return False
+
+    def seen_alive(self, req):
+        streak = getattr(self, "_gone_streak", None)
+        if streak and req in streak:
+            streak.pop(req, None)
+
     def release(self, req):
         """Retire a request; only a terminal-output handshake may authorize a session park."""
         st = self._state.get(req)

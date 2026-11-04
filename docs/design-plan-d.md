@@ -387,3 +387,19 @@ return None 只有两个门：take<=0（span=66 排除）或 **buffer/rows 对�
   **若 worker 加载的是 site-packages 的旧拷贝，则过去几轮所有"plugin 修改"对
   该进程可能从未生效**——多个"修了没用"的现象将获得统一解释。
 - funnel/harvest 的 call 停滞机制本身未定名；但先解决 loader 真相等最低层问题。
+
+
+## 25. Round 18：sweep 误杀论成立并被治；新病灶=我自己的 0-token defer
+
+- 统一 release 政策落地（runtime.sweep_release + seen_alive，plugin 三处出口全部
+  改走单一政策；site A/B + retirement 合法路保留终端授权）——"旧格式 released"
+  之谜=三处平行 sweep 代码分叉（不是 loader）。
+- 判决性数据：`d_hv_funnel call=57`（贯穿整个请求生命周期，首刀不再是收割坟墓）
+  + skipped 字典首次可见：**"wrote 0 (frontier 31199 first 31199 n 0)"** ——
+  **新病灶定名：round-14 的 ceiling guard 用 num_new_tokens=0 做 defer，
+  而 vLLM 的 num_scheduled_tokens 收了 0-token 条目，下游（harvest/commit/
+  book）没有为 n=0 的步准备语义；请求时间 119→208s。**
+- 修法（下轮第一件事，非假设）：defer 用"该请求本轮完全不排"（loop 里 skip，
+  scheduled dict 不出现 0 条目）——engine 原生语义即支持某请求跳过一轮。
+  复验判据：wrote-0(n=0) 噪声消失 + 152K 回到 ~120s + funnel 继续贯穿 +
+  statistics frontier 越过首刀位持续增长。
