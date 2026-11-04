@@ -589,3 +589,25 @@ final 刀未落的剩余疑点（两点，下轮一发分辨）：
   (b)，或 worker 端 prefill_done 首个 decode 步之前置于采样钩子内）。安装点提前一步，
   答案的第一 token 就出生在带 needle 页的问题视图里。
 - 至此方案 D 的每个部件都有实证无罪/有罪判决：刀✓锁✓覆盖✓表✓内容✓ - 只剩这个安装时机。
+
+
+## 38. Round 28 终节：push 恢复 + 最后闸门的物理陈述（R3 设计裁决点）
+
+- GitHub push 恢复（21 commits 一次补上，origin/main=7c8fb2c）。
+- 时序闸门的完整物理：(b) 挂在 Core.step 末尾 = `result=original_step` 之后，而**第一个
+  采样 token 在 prompt 完成步的 execute_model 内部已产生**——问题刀在其后安装救不回它；
+  且**问题向量本身来自最后 chunk 的 forward harvest**（q_rows），最后 chunk 之前不存在
+  "已冻结的问题"——**纯安装提前无解**。
+- v0.5.2 靠 child rebuild（重 prefill 末段）跨过此闸；D 禁 rewind/child，等价能力需要
+  "末段视图重写 + GDN 状态回置"——GDN 单槽性质使其无法在不动 token 流的前提下重算末段
+  （重 forward 会覆盖 state——除非有 D6 StateImage 引擎钩子）。
+- **裁决候选（R3 议题，非本轮 hack）**：
+  A. 采样器让路：prompt 完成步**不采样**（scheduler 把完成步排为 forward-only，
+     采样推迟一步；问题刀在步尾安装 → 第一 token 出生在问题视图）。改动在排程语义，
+     不动 GDN/state——**D 不变量完整**，vLLM 有 forward-only 步先例（chunked prefill 步
+     本就不采样）。
+  B. 双答案窗口：接受首 token 出生统计视图，从第二 token 起问题视图（needle 若是
+     长思维链答案，16-token 窗口里可能已足够 - 需实测）。
+  C. StateImage 引擎钩子（D6 完整版）：末段重算 + 状态快照回置 - 改动最深，收益最大
+     （顺带把 R3 resume 深度一起解决）。
+- 倾向序：**A 优先**（最小合法）、C 并入 R3 设计、B 作对照实验。
