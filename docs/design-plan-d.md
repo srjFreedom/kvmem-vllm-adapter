@@ -403,3 +403,25 @@ return None 只有两个门：take<=0（span=66 排除）或 **buffer/rows 对�
   scheduled dict 不出现 0 条目）——engine 原生语义即支持某请求跳过一轮。
   复验判据：wrote-0(n=0) 噪声消失 + 152K 回到 ~120s + funnel 继续贯穿 +
   statistics frontier 越过首刀位持续增长。
+
+
+## 26. Round 19：guard 撤除与倒退链的诚实记录（下轮 git bisect 定标）
+
+同码同 boot 对照（全部 152K spec0，D=1 knife=1）：
+| 代码状态 | 时长 | knives | 异常 |
+|---|---|---|---|
+| round-14 guard（0-entry 版）+ 无 sweep_release | **119.8s** | 15 | 当时判"guard 致 208s"存疑 |
+| round-16 grace sweep + guard(0-entry) | 208.5s | 0(no_row×100) | blockwise_no_row 新病灶 |
+| round-19 guard(native skip) | 208.5s | 0 | 与 0-entry 同症状 → guard 形态无罪 |
+| round-19 guard 撤除 | 221.9s(spec4×2) | **0** | pressure_gate=0、funnel 狂转 476 |
+
+**结论修正**：208s 与 guard 形态无关；**119.8s 是 round-14 代码态（guard 0-entry、无
+sweep 统一政策）的产物**——倒退发生在 round-16/18 的 sweep/grace/seen_alive 系列改动
+里（`blockwise_no_row=100` = worker 状态在 RPC 时刻 row 为空 = **before_step/absorb
+链被 sweep 改动饿死**，或 funnel 476 次里 after_step 主链被跳过：pressure_gate=0）。
+
+**下轮第一动作（方法定死，不再假设）**：git bisect 三个已知状态文件组——
+`033b7eb`（119.8s 态）与 HEAD 之间，文件集锁定
+plugin/vllm_kvmem_plugin.py + src/kvmem_sparse_runtime.py；每态单跑 152K 计时 +
+数 knives/no_row；两三次 boot 之间必收敛。
+guard 已撤（其保护在 cadence 正确时代本就未用到；cadence 修复后按 round-14 判据重加）。
