@@ -3993,9 +3993,22 @@ class VllmSparseRuntime:
             # selection to be at least two chunks smaller than the current
             # view book, i.e. eviction actually happened.
             # The knife must shrink the VIEW book by a real margin (2 chunks)
-            # while staying inside the frozen physical row.
+            # while staying inside the frozen physical row. AND the resulting
+            # view must keep dense coverage up to its own true_base: the
+            # knife executes at a chunk boundary, all pages up to tokens are
+            # resident-covered now, so a selection whose view still covers
+            # past that frontier is honest work (mid-prefill the window IS
+            # the coverage; evicting before the window fills is what killed
+            # the needle page - measured spec0 78.9s False vs 117.1s True).
+            # Laws split by knife kind: MID (statistics ranking) must free a
+            # real 2-chunk margin; FINAL (question ranking) must instead keep
+            # the observed prefix COVERED - the question knife exists to put
+            # the needle-bearing middle back in view.
             if (len(logical_pages) > len(old_row)
-                    or visible >= resident_before - 2 * 4096):
+                    or (not bool(final)
+                        and visible >= resident_before - 2 * 4096)
+                    or (bool(final)
+                        and visible < min(tokens, resident_before + 2 * 4096))):
                 self._last_proposal = None
                 if self.log is not None:
                     self.log({"kind": "blockwise_d_overrow", "req": req,

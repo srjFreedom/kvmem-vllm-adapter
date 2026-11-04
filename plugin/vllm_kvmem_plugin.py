@@ -2459,8 +2459,11 @@ def register():
                     running = [r for r in getattr(scheduler, "running", ())
                                if not bool(getattr(r, "kvmem_rebuilt", False))]
                     _bud = int(cfg.get("budget_tokens", 36864))
+                    _isd = bool(_sched_cfg(scheduler).get("plan_d"))
                     final = [r for r in running
-                             if int(getattr(r, "num_in_flight_tokens", 0) or 0) == 0
+                             if ((int(getattr(r, "num_output_placeholders", 0) or 0) == 0)
+                                 if _isd else
+                                 (int(getattr(r, "num_in_flight_tokens", 0) or 0) == 0))
                              and int(getattr(r, "num_logical_tokens", 0) or 0)
                              >= int(getattr(r, "num_prompt_tokens", 0) or 0)
                              # A pressure boot must behave EXACTLY like the OFF
@@ -2502,15 +2505,30 @@ def register():
                                   # prompt-complete requests belong to the FINAL path; a (c)
                                   # rewind there starves the last chunk (measured: logical
                                   # stuck at 86016 < 86670, need 4751 > window 4096 forever)
-                                  and not (int(getattr(r, "num_prompt_tokens", 0) or 0) > 0
+                                  #
+                                  # PLAN D EXEMPTS this rule: no rewind exists, and the
+                                  # question-driven final knife is the ONLY thing that
+                                  # restores needle-quality view after the question is
+                                  # frozen (mid-prefill knives rank by statistics and can
+                                  # legitimately drop the needle page - measured spec0
+                                  # 78.9s needle False). One final cut per request,
+                                  # marked kvmem_d_final_cut when the proposal lands.
+                                  and (not (int(getattr(r, "num_prompt_tokens", 0) or 0) > 0
+                                            and int(getattr(r, "num_logical_tokens", 0) or 0)
+                                            >= int(getattr(r, "num_prompt_tokens", 0) or 0))
+                                       or (_sched_cfg(scheduler).get("plan_d")
+                                           and not getattr(r, "kvmem_d_final_cut", False)))
+                                  and (int(getattr(r, "num_computed_tokens", 0) or 0)
+                                       - int(_last.get(r.request_id, -10**9)) >= (
+                                           max(4096, int(getattr(r, "kvmem_d_stride",
+                                                                 _hi)))
+                                           if _sched_cfg(scheduler).get("plan_d")
+                                           else _step)
+                                       or (_sched_cfg(scheduler).get("plan_d")
+                                           and int(getattr(r, "num_prompt_tokens", 0) or 0) > 0
                                            and int(getattr(r, "num_logical_tokens", 0) or 0)
-                                           >= int(getattr(r, "num_prompt_tokens", 0) or 0))
-                                  and int(getattr(r, "num_computed_tokens", 0) or 0)
-                                  - int(_last.get(r.request_id, -10**9)) >= (
-                                      max(4096, int(getattr(r, "kvmem_d_stride",
-                                                            _hi)))
-                                      if _sched_cfg(scheduler).get("plan_d")
-                                      else _step)]
+                                               >= int(getattr(r, "num_prompt_tokens", 0) or 0)
+                                           and not getattr(r, "kvmem_d_final_cut", False)))]
                         if _cands:
                             request = max(_cands, key=lambda r: int(r.num_computed_tokens))
                             _last[request.request_id] = int(request.num_computed_tokens)
@@ -2618,6 +2636,14 @@ def register():
                                 # against a 4096 chunk = guaranteed overrun)
                                 _chunk = int(cfg.get("chunk_token_size", 4096))
                                 request.kvmem_d_stride = max(4096, _win - _vis - _chunk)
+                                if (int(getattr(request, "num_prompt_tokens", 0) or 0) > 0
+                                        and int(getattr(request, "num_logical_tokens", 0) or 0)
+                                        >= int(getattr(request, "num_prompt_tokens", 0) or 0)):
+                                    request.kvmem_d_final_cut = True
+                                    # same once-only gate the legacy apply uses for
+                                    # the final reselect (the (b) list would fire
+                                    # every step otherwise, refused-storm measured)
+                                    request.kvmem_final_reselect = True
                             _append(log_path, {"kind": "d_compact_applied",
                                                "req": request.request_id,
                                                "epoch": epoch,

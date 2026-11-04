@@ -142,3 +142,17 @@ reason 探针（wrapper exception/is_rebuilt/entry）把"第二刀 idle"完全�
 （finder 只映射 `vllm/`；repo src/*.py 由 start 脚本拷入 site-packages）——
 **改 src/ 后必须重启才生效，且 patch/版本文件同步要覆盖 site-packages 拷贝链**。
 本轮所有修复实际生效（boot=代码重启），但"改了不重启"的静默窗口骗了两次中期判读。
+
+
+## 11. R2b 质量门达成（round 5 终）+ MTP 门移交
+
+- **单变量矩阵**（88K 数据集 80970tok / needle@~43K）：
+  | 配置 | 时长 | needle |
+  |---|---|---|
+  | D刀+spec0+旧律（final 刀被 2-chunk 律挡死） | 78.9s | **False** |
+  | D刀关+spec0（纯 dense） | 117.1s | True |
+  | D刀+spec0+**分律**（mid 要真空 2 chunk；final 要保覆盖） | 115.9s | **True ✓** |
+  - final 刀接线三连：(c) 候选 D 豁免 prompt-complete 排除、(b) final 集 in-flight 门在 D 下改用 placeholders、apply 打 `kvmem_d_final_cut/kvmem_final_reselect` 防重刷。refused 风暴随之绝迹（本轮 applied=3 refused=0）。
+- **移交门 1（decode/MTP）**：spec4+D 刀 → prefill 100% 后 190s 不收敛（无 crash，abort 后 released）；spec0 正常完成 → **MTP4 draft 通道在 D 视图坐标下的 position/slot 独毒**，下轮 console 断点定位（嫌疑：draft block_table 行/scratch 页/query_len=5 写位）。
+- **移交门 2（152K/250K 电池）**：spec0 口径先验通，再开 MTP 门。
+- 生产恢复：SPECULATIVE=4 + PLAN_D=0（v0.5.2 已验证臂）；刀场保留在 /etc/default 注释位。
