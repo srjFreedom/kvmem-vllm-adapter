@@ -2529,6 +2529,27 @@ def register():
                                            and int(getattr(r, "num_logical_tokens", 0) or 0)
                                                >= int(getattr(r, "num_prompt_tokens", 0) or 0)
                                            and not getattr(r, "kvmem_d_final_cut", False)))]
+                        # (c) observability (measured gap: 152K ran end-to-end
+                        # while the watermark trigger never fired, and nothing
+                        # in the log could distinguish "no candidate" from
+                        # "candidates refused"). Throttled per scheduler pid.
+                        if bool(_sched_cfg(scheduler).get("plan_d")):
+                            _cn = len(_cands)
+                            _best = running and max(
+                                (int(getattr(r, "num_computed_tokens", 0) or 0)
+                                 for r in running), default=0)
+                            _st_c = getattr(scheduler, "_d_c_stats", None)
+                            if _st_c is None:
+                                _st_c = scheduler._d_c_stats = {"fire": 0, "n": 0}
+                            _st_c["n"] += 1
+                            if _cn or _st_c["n"] % 32 == 1:
+                                if _cn:
+                                    _st_c["fire"] += 1
+                                _append(log_path if 'log_path' in dir() else
+                                        "/tmp/kvmem_sparse.jsonl",
+                                        {"kind": "d_c_probe", "cands": _cn,
+                                         "fires": _st_c["fire"], "ticks": _st_c["n"],
+                                         "best": int(_best), "hi": _hi})
                         if _cands:
                             request = max(_cands, key=lambda r: int(r.num_computed_tokens))
                             _last[request.request_id] = int(request.num_computed_tokens)
