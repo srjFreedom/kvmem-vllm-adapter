@@ -2605,6 +2605,32 @@ class VllmSparseRuntime:
                         page = self._grow_from_engine(req, grown,
                                                       self._logical_for_rank(st, len(grown)))
                         if page is None:
+                            if getattr(self, "d_mode", False):
+                                # Plan D: the frozen window row has no room to
+                                # grow by design - reaching the edge means the
+                                # knife is due NOW. Placeholder keeps indexing
+                                # consistent (the page's bytes live in the
+                                # store; the knife re-installs real blocks),
+                                # the guard event names the overrun once, and
+                                # the bookkeeping continues so the quiescent
+                                # RPC that triggered this flush can complete
+                                # the knife (raising here killed every second
+                                # knife - measured).
+                                if not getattr(self, "_d_guard_logged", None):
+                                    self._d_guard_logged = set()
+                                if (req, len(grown)) not in self._d_guard_logged:
+                                    self._d_guard_logged.add((req, len(grown)))
+                                    self.log({"kind": "d_window_guard", "req": req,
+                                              "rank": int(rank),
+                                              "row": len(grown),
+                                              "tokens": int(st.tokens)})
+                                # do NOT grow the row: the frozen capacity is
+                                # an invariant (a -1 placeholder poisoned row
+                                # length and the next validate). Skip the
+                                # page mapping; the knife (now reserved one
+                                # chunk ahead by the stride) restores room.
+                                self._prev_n[req] = 0
+                                return st
                             raise RuntimeError("sparse row has no slot for the next token page")
                         grown.append(int(page))
                     st.row = tuple(grown)
@@ -3070,7 +3096,8 @@ class VllmSparseRuntime:
                           "error": _tb.format_exc()[-400:]})
             return None
 
-    def quiescent_compact(self, req, frontier=None, computed=None, final=None):
+    def quiescent_compact(self, req, frontier=None, computed=None, final=None,
+                          epoch=None):
         """EngineCore-callable compaction on the scheduler thread, between steps.
 
         The worker has completed the previous forward but not yet committed it (the commit runs at
@@ -3087,15 +3114,38 @@ class VllmSparseRuntime:
         so re-installing the old view is a pure store->device copy.
         """
         if not req or req not in self._state:
+            if getattr(self, "d_mode", False) and self.log is not None:
+                self.log({"kind": "d_none_reason", "req": req,
+                          "why": "runtime_no_state"})
             return None
         pending = int(self._prev_n.get(req, 0) or 0)
         if pending:
             self.after_step(req, pending, prefill=pending >= self.page_tokens)
             self._prev_n[req] = 0
+        # The epoch Core validated at trigger time IS authoritative here: we
+        # run at Core's quiescent boundary by construction (this very RPC).
+        # The worker's local counter lags one step behind Core's increment
+        # (advance fires at step end, Core counts the schedule), so proposals
+        # stamped locally refused forever on frontier/epoch (measured refuse
+        # storm at the second knife). Adopt the sender's epoch.
+        if epoch is not None and getattr(self, "d_mode", False):
+            self.epoch = int(epoch)
         st = self._state[req]
-        if frontier is not None and int(frontier) != int(st.tokens):
+        # D EXEMPTS the frontier equality: the proposal is stamped with THIS
+        # call's book state and epoch adopted from Core, so validate below
+        # agrees by construction; requiring equality here raced with Core's
+        # one-step-ahead counter and starved every second knife to idle.
+        # sender's frontier/epoch are remembered for the proposal stamp (D):
+        # the validate contract is "proposal agrees with EngineCore NOW", and
+        # this RPC runs exactly at that quiescent boundary. Non-D keeps the
+        # strict equality check below unchanged.
+        self._d_sender = (None if (frontier is None or epoch is None)
+                          else (int(frontier), int(epoch)))
+        if (frontier is not None and not getattr(self, "d_mode", False)
+                and int(frontier) != int(st.tokens)):
             self.log({"kind": "quiescent_compact_stale", "req": req,
-                      "want": int(frontier), "have": int(st.tokens)})
+                      "want": int(frontier), "have": int(st.tokens),
+                      "d": bool(getattr(self, "d_mode", False))})
             return None
         # Plan D: Core's computed book is TRUE length, the worker's resident book
         # is the VIEW length - they legitimately differ by the delta. The logical
@@ -3974,9 +4024,11 @@ class VllmSparseRuntime:
         except Exception:
             pass
         self._owned_slots[req] = set(int(p) for p in st.row)
+        _dsend = getattr(self, "_d_sender", None)
         self._last_proposal = {
-            "request": str(req), "epoch": int(getattr(self, "epoch", 0) or 0),
-            "logical_frontier": tokens,
+            "request": str(req),
+            "epoch": _dsend[1] if _dsend else int(getattr(self, "epoch", 0) or 0),
+            "logical_frontier": _dsend[0] if _dsend else tokens,
             "resident_frontier": resident_before,
             "selected_pages": [int(p) for p in logical_pages],
             "physical_pages": [int(p) for p in phys_pages],

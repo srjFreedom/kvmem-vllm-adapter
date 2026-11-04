@@ -109,3 +109,14 @@ D3 刀零 truncate；D5 因果=视图升序+前缀性质；GDN 只吃真 token �
   2. 窗口越界守卫：stride 节奏失配时 prefill 写出窗口（本轮 80970 vs 53248 窗，第二刀没落 → 越界 ~8K → 请求 900s 未完被客户端 timeout）。方向：第二刀修好后按 stride 自然落；另加硬保险 = worker 端写游标逼近窗满时同步拒写并报 `d_window_guard`（提案，下轮定）。
 - 夜间遗留：`/tmp` 数据文件全灭（重建了 88K 数据集 80970tok/needle@43K）；site/patch/engine 三树同步状态未受影响（重启无变化）。
 - 本轮证据链：88K runs（125.4s needle True 无表时代 → 修表后 timeout 时代）+ console 直读（d_mode False→True、has_deltas False→True 的对照）。
+
+## 9. R2b 第二轮夜战（2026-11-04，探针驱动的全部根因命名）
+
+reason 探针（wrapper exception/is_rebuilt/entry）把"第二刀 idle"完全解剖，逐层修：
+1. `NameError: epoch` —— quiescent_compact 签名无 epoch 参数（u2 锚当时就断在这里）：补参数闭环 wrapper→runtime ✓ 离线 qc/pp 绿。
+2. **after_step fill 越界 raise** 打断 quiescent RPC → D 分支 `d_window_guard`（不污染 row，占位 -1 方案作废——它把 row 撑成 3334 毒死 validate）。
+3. **stride 没留 chunk** → `_win - _vis - chunk`（刀必须在下 chunk 写越界前落）。
+4. **refuse 风暴**：validate 的 frontier/epoch 与提案不匹配 —— 提案 stamp 采用发送方 (frontier, epoch)（`_d_sender`）+ worker 侧 frontier 相等检查 D 豁免。**残留失败**：stamp 修正后 88K-1 又 timeout（第二刀 cadence 仍有死角，疑似 `_d_sender` 全局态跨请求污染或多请求 RPC 时序）——这是唯一剩下的一门。
+
+**已验证的正面成果**：88K 两发 needle=True（121.9s / 95.4s——95.4s 比无刀 dense 105s 更快，第一刀语义真实生效）；d_tables_published delta 与 stride 理论吻合；确定性（同代 sha 曾一致）。
+**下一轮唯一缺口**：第二刀 refuse/idle 的死角（先按请求隔离 _d_sender，一发 88K 看 refuse 是否绝迹）→ 然后 152K/250K → 删旧机器 R3。

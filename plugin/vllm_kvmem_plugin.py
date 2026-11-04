@@ -1613,6 +1613,9 @@ def register():
                 if runtime is None:
                     return None
                 if bool(runtime.is_rebuilt(str(request_id))):
+                    _append("/tmp/kvmem_sparse.jsonl",
+                            {"kind": "d_none_reason", "req": str(request_id),
+                             "why": "wrapper_is_rebuilt"})
                     # THE REBUILT CHILD MUST NEVER PARTICIPATE IN QUIESCENT COMPACTION.
                     # The child reuses the parent's request_id; a trigger fired for it
                     # produces an empty proposal (its books start from zero), Core
@@ -1626,11 +1629,16 @@ def register():
                     proposal = runtime.quiescent_compact(
                         str(request_id), int(frontier),
                         None if computed is None else int(computed),
-                        None if final is None else bool(final))
+                        None if final is None else bool(final),
+                        int(epoch))
                     _append("/tmp/kvmem_sparse.jsonl",
                             {"kind": "compact_worker_elapsed",
                              "elapsed_s": round(_time.perf_counter() - _t_wc, 3)})
                 except Exception:
+                    _append("/tmp/kvmem_sparse.jsonl",
+                            {"kind": "d_none_reason", "req": str(request_id),
+                             "why": "wrapper_exception",
+                             "traceback": __import__("traceback").format_exc()[-400:]})
                     # A worker RPC must never take the engine down; Core treats None as refusal.
                     proposal = None
                 if isinstance(proposal, dict):
@@ -2602,7 +2610,13 @@ def register():
                                 pass
                             if _vis > 0:
                                 _win = int(cfg.get("budget_tokens", 36864)) +                                     int(cfg.get("gen_reserve_tokens", 16384))
-                                request.kvmem_d_stride = max(4096, _win - _vis)
+                                # reserve one full chunk: the trigger fires
+                                # AFTER the last computed chunk, the knife must
+                                # land BEFORE the next chunk writes past the
+                                # view ceiling (measured: margin of 80 tokens
+                                # against a 4096 chunk = guaranteed overrun)
+                                _chunk = int(cfg.get("chunk_token_size", 4096))
+                                request.kvmem_d_stride = max(4096, _win - _vis - _chunk)
                             _append(log_path, {"kind": "d_compact_applied",
                                                "req": request.request_id,
                                                "epoch": epoch,
