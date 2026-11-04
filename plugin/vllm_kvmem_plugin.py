@@ -1275,6 +1275,15 @@ def _attach_sparse(runner, log_path):
                 from kvmem_session_budget import BudgetError
                 from kvmem_sparse_runtime import SparseViewCapacityError
                 if isinstance(exc, (BudgetError, SparseViewCapacityError)):
+                    # DEATH WATCH (design 33, site=prepare): the re-raise kills
+                    # the TP worker and the manager respawns a fresh instance
+                    # whose EMPTY runtime explains the mid-flight state
+                    # vanishings (tok=None floods, frozen stats, 4 releases per
+                    # request id across rotating pids). Name the poison first.
+                    _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                            {"kind": "d_death_watch", "site": "prepare",
+                             "pid": os.getpid(), "exc": type(exc).__name__,
+                             "msg": str(exc)[:240]})
                     raise
 
         prepare_pos_seq_lens._kvmem_patched = True
@@ -3570,6 +3579,15 @@ def _install(cls, module_name, probe, smoke, state):
                     from kvmem_session_budget import BudgetError
                     from kvmem_sparse_runtime import SparseViewCapacityError
                     if isinstance(exc, (BudgetError, SparseViewCapacityError)):
+                        # DEATH WATCH (design 33, site=pre_install): the re-raise kills
+                        # the TP worker and the manager respawns a fresh instance
+                        # whose EMPTY runtime explains the mid-flight state
+                        # vanishings (tok=None floods, frozen stats, 4 releases per
+                        # request id across rotating pids). Name the poison first.
+                        _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "d_death_watch", "site": "pre_install",
+                                 "pid": os.getpid(), "exc": type(exc).__name__,
+                                 "msg": str(exc)[:240]})
                         raise
                 out = _orig_prepare_inputs(self, scheduler_output, batch_req_state,
                                            batch_desc, *args, **kwargs)
@@ -3689,6 +3707,15 @@ def _install(cls, module_name, probe, smoke, state):
                     from kvmem_session_budget import BudgetError
                     from kvmem_sparse_runtime import SparseViewCapacityError
                     if isinstance(exc, (BudgetError, SparseViewCapacityError)):
+                        # DEATH WATCH (design 33, site=step_end): the re-raise kills
+                        # the TP worker and the manager respawns a fresh instance
+                        # whose EMPTY runtime explains the mid-flight state
+                        # vanishings (tok=None floods, frozen stats, 4 releases per
+                        # request id across rotating pids). Name the poison first.
+                        _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "d_death_watch", "site": "step_end",
+                                 "pid": os.getpid(), "exc": type(exc).__name__,
+                                 "msg": str(exc)[:240]})
                         raise
                     if any(bool(getattr(nr, "kvmem_session_resume", False))
                            for nr in (getattr(scheduler_output, "scheduled_new_reqs", None)

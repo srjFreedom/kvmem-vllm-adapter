@@ -524,3 +524,26 @@ guard 已撤（其保护在 cadence 正确时代本就未用到；cadence 修复
   即便非本案元凶）；decode 桶路径早退（消除 n=0 雪崩的正当性来自 decode 行走
   harvest_decode_rows 专职通道）；RPC 补读删除（与 step_end 竞争同一缓冲）。
 - 预算：13 boots。纪律：停。交还。
+
+
+## 34. Round 25 案卷：三处机械修正落地；final 刀疑点收窄到两点
+
+已修（本轮）：
+- decode 桶路径早退**删**（stats 冻结时它把 decode n=1 的正常入桶也拦了；
+  原 clamp 分支健在，语义回归 v0.5.2 行为）；
+- 复核确认 margin 律现场文本**已经是正确形态**（row-bound only for final）——
+  本窗 overrow×10 是 MID 刀被 margin 律正当拒绝（空转刀），不是 final 被害；
+- death-watch 三处全装（rethrow=0 事件 → worker-respawn 假设**证伪**）；
+- 上轮"state 蒸发 31200"被本窗数据推翻：主请求 funnel 到 call 57 tok 31212
+  一路健康——那是把**前一请求（88K×6 混跑窗口）的终盘**误读成主请求。
+  **教训（第七条取证条律）：跨请求窗口必须按 rid 分组后再读时间线。**
+
+final 刀未落的剩余疑点（两点，下轮一发分辨）：
+1. raw=True 是否真在 runtime 生效（recall.scores 调用点的 selection_blocks
+   截断行为——d_final_scores 若再现且 core_len 仍 704 = raw 没生效）；
+2. (b) 在 88K 短窗口只 fire 一次（d_b_probe=1）而那一发的 pressure 标记与
+   进入段是否吻合（enter 事件按 rid+pressure 分组统计）。
+探针方案：enter 事件已有的话，加 recall.scores 入口的 blocks 参数值事件
+（每请求首次），一发同时读 1+2。
+
+预算纪律：本轮 6 次 boot，停止。产线恢复 spec4/PLAN_D=0。

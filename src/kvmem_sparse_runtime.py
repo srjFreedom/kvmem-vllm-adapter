@@ -1699,8 +1699,6 @@ class VllmSparseRuntime:
         # my wrote0 hold then froze into a permanent jam (measured: frontier
         # stuck at 31,200 with "wrote 0 ... n 0" as top skip reason). The
         # bridge buffer is claimed by the pre-step drain - nothing lost.
-        if decode and not getattr(self, "stats_decode", False):
-            return 0
         try:
             from vllm import kvmem_bridge as bridge
             from kvmem_statistics import stats_from_bridge
