@@ -1636,6 +1636,7 @@ class VllmSparseRuntime:
                       "call": _fk, "stats_core": bool(self.stats_core),
                       "has_stats": req in (self._statistics or {}),
                       "n_tokens": int(n_tokens or 0),
+                      "d_mode": bool(getattr(self, "d_mode", False)),
                       "tok": int(getattr(_stf, "tokens", -1)) if _stf else -1})
             self.log({"kind": "d_hv_funnel", "req": str(req)[-6:],
                       "call": _fk, "stats_core": bool(self.stats_core),

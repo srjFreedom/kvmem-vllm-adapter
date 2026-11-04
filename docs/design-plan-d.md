@@ -463,3 +463,23 @@ guard 已撤（其保护在 cadence 正确时代本就未用到；cadence 修复
   （D 的 cap/defer/epoch 交互），这是收割断供的真正上游。
 - 已排除名单（累计）：capture 写停/读停、align 截断（已修 raw）、坐标锚、
   sweep 误杀（grace 后照旧）、假 finished、_np import（已修）。
+
+
+## 29. Round 22：死亡再上移一层 - step_end 包装器自身约在 step 12-14 停跑
+
+- 本轮探针（snapshot 含 nn_vals；funnel 含 d_mode；warmup 过滤 + cap 120）实测：
+  * d_step_snapshot：step 11-14 `n=1 nn=[4096]` —— 请求持续被排、n_new 恒 4096，
+    **scheduled 内容与数值两罪均证伪**（round-21 的"循环不再含请求"错，
+    round-22 的"n_new=0 静默门"也错 - 双双撤回）；
+  * 但每 pid 的 snapshot 条数停在 ~12：step_end 包装器**自身**不再被调用；
+  * funnel 的 call 计数同样停在 10-11（两事件互证同一时刻）；
+  * pressure_gate 仍 16 次：RPC pending-flush 路径活着（它不依赖 step_end）。
+- 死亡时刻 ≈ step 12-14 = 第二、三刀窗口；请求照常 140.6s 完成（引擎主链路无恙）。
+- **下轮取证（同层再上移）**：execute_model 入口第一行无条件事件（每步一条，含
+  `is_profile/dummy_run` 标志）：若 execute_model 活着而 step_end 死 - wrapper 内部
+  的提前 return 链（`KVMEM_EXEC_POST`/`dummy_run`/`is_profile`）是凶手候补；
+  若 execute_model 也停在同步数 - CUDA graph replay 路径绕过了包装器（decode 步走
+  捕获图，不再进 Python execute_model），harvest 需要挪进 graph 外唯一必经点
+  （quiescent boundary 的 pending flush 已经在这么活）。
+- 累计证伪清单：capture写停 / align截断 / sweep误杀 / 假finished / scheduled缺席 /
+  n_new=0 - 六案皆埋于证据。

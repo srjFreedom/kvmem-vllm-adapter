@@ -3160,6 +3160,29 @@ def _install(cls, module_name, probe, smoke, state):
                 trace = state.get("trace", False)
                 cap = getattr(runtime, "capture", None)
                 state["steps"] = state.get("steps", 0) + 1
+                # STEP-END SNAPSHOT, uncapped, once per step (design 29): the
+                # exact set of requests the worker was handed THIS step. If a
+                # request vanishes from this set after the first knife while
+                # the engine keeps executing it, the eviction is UPSTREAM in
+                # the scheduler->worker payload, not in any worker gate.
+                try:
+                    _sn = getattr(state, "get", None)
+                    _snaps = state.get("_snaps", None)
+                    if _snaps is None:
+                        _snaps = state["_snaps"] = [0]
+                    if _snaps[0] < 120 and (
+                            len(scheduled) == 0
+                            or not all(str(k).startswith("_warmup")
+                                       for k in scheduled)):
+                        _snaps[0] += 1
+                        _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                                {"kind": "d_step_snapshot", "pid": os.getpid(),
+                                 "steps": state.get("steps"),
+                                 "n": len(scheduled),
+                                 "nn_vals": sorted({int(v) for v in scheduled.values()}),
+                                 "keys": [str(k)[-6:] for k in scheduled]})
+                except Exception:
+                    pass
                 for req, n_new in scheduled.items():
                     # MEMBERSHIP evidence (design 22 forensics, cap 3/req):
                     # does the second big request of a boot appear in the
