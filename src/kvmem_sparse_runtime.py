@@ -1648,6 +1648,19 @@ class VllmSparseRuntime:
             from vllm import kvmem_bridge as bridge
             from kvmem_statistics import stats_from_bridge
             first = int(self._stats_next.get(req, 0))
+            # Plan D: anchor the harvest at the engine's TRUE coordinates for
+            # this step (published every prepare while the delta channel is
+            # live). Bucket rows in the bridge align positionally with those
+            # tokens; `_stats_next` book-keeping alone lags whenever a knife
+            # moved the view frame between steps - which is exactly how the
+            # statistics frontier froze at the first-knife position (45,056)
+            # while the true book rolled to 143K: the tail of the prompt had
+            # no score cells, so no selector, however correct, could rank it.
+            if getattr(self, "d_mode", False):
+                _runner = getattr(self.view, "runner", None)
+                _tp = getattr(_runner, "kvmem_step_true_positions", None)
+                if _tp is not None and int(_tp.numel()) >= n:
+                    first = int(_tp[-n].item())
             sums = stats_from_bridge(bridge, range(stats.layers), first, n)
             if not sums:
                 self._skip(req, "no capture")
@@ -1655,6 +1668,26 @@ class VllmSparseRuntime:
             written = stats.write_step(first, n, sums)
             if written == 0:
                 self._skip(req, f"wrote 0 (frontier {stats.frontier} first {first} n {n})")
+                # The silent stagnation killer: when rows refuse to land,
+                # _stats_next used to advance anyway and every later step
+                # read an even more wrong span - statistics froze exactly at
+                # the first knife position (measured: harvest_attempt died
+                # after step 7 / 28672 tokens while the prompt ran to 143K,
+                # core_len stuck at 704). Under D, hold the book at `first`
+                # and surface the fault with values.
+                if getattr(self, "d_mode", False):
+                    self._d_harvest_gap = int(self._d_harvest_gap.get(req, 0) or 0) + 1 \
+                        if getattr(self, "_d_harvest_gap", None) is not None \
+                        else 0
+                    _g = getattr(self, "_d_harvest_gap", {})
+                    _g[req] = int(_g.get(req, 0)) + 1
+                    if _g[req] <= 3 and self.log is not None:
+                        self.log({"kind": "d_harvest_wrote0", "req": req,
+                                  "first": first, "view_first": _view_first,
+                                  "n": n, "stats_frontier": int(stats.frontier),
+                                  "gap": _g[req]})
+                    written = 0
+                    self._stats_next[req] = first  # do NOT advance past the hole
             self._stats_next[req] = first + n
             try:
                 import json as _json, os as _os

@@ -228,3 +228,20 @@ reason 探针（wrapper exception/is_rebuilt/entry）把"第二刀 idle"完全�
 
 **运维教训（第二次踩同一坑并写死）**：给 Core 模块级函数插代码时禁止引用 self；
 探针必须放条件链最外层；except 吞异常 = 取证黑洞（sched_compact_error 现已常开）。
+
+
+## 16. Harvest 死锁定位到最后一层（round 10）
+
+- 破案链：harvest_attempt 事件显示收割停在 step 7（tokens 28672→45056）→
+  `publish_position_offset`/`harvest_decode_rows` 通道考古 → wrote0 拦截修复上线 →
+  本轮事实：statistics_final `frontier=45057, steps=12` ——**45056 之后只有 1 行进入统计**
+  （4096 chunk 全部未落，且 d_harvest_wrote0 事件不存在 = 没走 wrote0 分支——
+  它们在 `stats_from_bridge` 之前/之中被别的路径吞了：候选 `skip("no capture")`/
+  `skip("drafts")` 或 `_tp` 锚在 chunk step 上取不到 n 行）。
+- 本轮落地的机制（都有代码+套件背书）：fork 发布 `kvmem_step_true_positions`（delta
+  通道存活时每步真坐标克隆）；harvest D 分支=真坐标写锚+视图偏移读锚；wrote0 不再推进
+  `_stats_next`（防止错位复读的雪崩）且值级可见（d_harvest_wrote0）。
+- 下轮第一取证点：在 `stats_from_bridge` 返回空/短的地方打值事件（n/layers/rows/buf 容量），
+  一发区分"读不到行"vs"锚没生效"vs"skip 门"。三套 skip 计数现已并进 statistics_final 的
+  skipped 字段——本轮它还是 null（说明连 _skip 都没走——更可能是 harvest_attempt 在
+  step≥8 后就没再触发：plugin 调用点的 n_new 或 prefill 标志在刀后异常——查调用点条件）。

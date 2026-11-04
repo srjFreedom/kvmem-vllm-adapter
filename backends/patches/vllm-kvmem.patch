@@ -2758,7 +2758,7 @@ index 481da20..f12cc94 100644
          LOOKAHEAD_BLOCK=triton.next_power_of_2(num_lookahead),
      )
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 0422c9e..c8a3ca2 100644
+index 0422c9e..6485362 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -181,6 +181,7 @@ from vllm.v1.worker.utils import (
@@ -2926,7 +2926,7 @@ index 0422c9e..c8a3ca2 100644
          seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
  
          # Some input token ids are directly read from the last sampled tokens
-@@ -1510,11 +1613,58 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1510,11 +1613,64 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          )
          # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
          # Kernel pads beyond num_tokens with PAD_SLOT_ID.
@@ -2945,6 +2945,12 @@ index 0422c9e..c8a3ca2 100644
 +        deltas = getattr(self, "kvmem_slot_deltas", None)
 +        if deltas is not None:
 +            slot_positions = input_batch.positions - deltas[input_batch.idx_mapping]
++            # KVMem harvest anchor: the engine's positions ARE the TRUE token
++            # coordinates while Plan D runs (the book never rewinds). Publish
++            # them so statistics harvesting writes each step's bucket rows at
++            # true positions even when the bridge buffer arrived lagged or a
++            # knife moved the view frame between steps.
++            self.kvmem_step_true_positions = input_batch.positions.clone()
 +        if slot_positions is None:
 +            offset = getattr(self, "kvmem_slot_offset", None)
 +            if offset is not None:
@@ -2985,7 +2991,7 @@ index 0422c9e..c8a3ca2 100644
          )
          return block_tables, slot_mappings
  
-@@ -1746,11 +1896,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1746,11 +1902,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # boundaries before the forward. Runs only on real batches, and
              # before model_state.prepare_attn gathers num_accepted_tokens so the
              # boundary reset is visible to the attention metadata.

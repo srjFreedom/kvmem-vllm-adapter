@@ -7,8 +7,8 @@
   "license_file": "engines/vllm/LICENSE",
   "local_changes": "KVMem integration (query bridge with CUDA-graph-capturable capture_k/capture_q, capture_q call sites, scheduler resident books + session checkpoint clip under speculation, re-admission/rebuild, SM75/FP8 profiles, beyond-pool reconstruction). v0.4.0: graph-safe static scratch + bit-exact rotation scoring. Excludes run-logs and triton-cache (JIT artifacts, rebuilt on first run).",
   "patch": "backends/patches/vllm-kvmem.patch",
-  "patch_sha256": "ad5b0c5b3cfaa181bde023e2b8cbe8cc62e177a6142d10433e1c3d5c94a7c072",
-  "patched_tree": "ce8f58d4e3d6b7841ca6834edb2fe8c1536eae6e"
+  "patch_sha256": "85e5410f86ef39e32673906c07f5234e51f1faaf489c3981ba1a2d1eb812ada1",
+  "patched_tree": "2ac7493204630feecd0a0b3544a24f45e6bf402e"
  },
  "model": {
   "note": "weights are not in git (tens of GB); point MODEL at an FP8+MTP export"
