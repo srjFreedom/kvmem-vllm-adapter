@@ -1555,6 +1555,16 @@ class VllmSparseRuntime:
             st = self.state(req)
             offset = max(0, int(getattr(st, "tokens", 0)) - int(getattr(st, "seq_len", 0)))
             from vllm import kvmem_bridge as bridge
+            # Plan D: the capture buckets by `position - offset`; under D the
+            # engine positions are ALREADY true (the book never rewinds), so
+            # publishing the true-view delta here shifted every bucket by
+            # delta past the true coordinate - out of the buffer span - and
+            # the capture silently died exactly when the first knife made the
+            # delta nonzero (measured: statistics froze at 45,057 with
+            # stats_from_bridge returning empty forever after). Zero offset
+            # keeps the bridge at the true frame, where harvest reads it.
+            if getattr(self, "d_mode", False):
+                offset = 0
             bridge.set_position_offset(offset)
         except Exception:
             pass

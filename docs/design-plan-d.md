@@ -262,3 +262,20 @@ reason 探针（wrapper exception/is_rebuilt/entry）把"第二刀 idle"完全�
   is_rebuilt() 谓词——短路盖不住它）；第二嫌疑：capture install 的 per-request 门
   （ARMED/geometry）在刀事件后失活。取证法：capture_slot_mapping/cap.note_tokens 处
   漏斗事件（同 d_hv_funnel 模式），一发看哪层没水。
+
+
+## 18. Round 12: 刀系统全链路已执行到位；断水定位到引擎 capture 内部（最后一根水管）
+
+- zero-offset 假设被字节级证伪（frontier 仍 45,057）；offset 不是病灶（修复保留：
+  D 下推 0 依然是语义正确卫生）。
+- 但本轮 tail 时间线给出新事实：**mid 刀每 ~2 步正常滚动（row_synced 序列
+  29120→23808→27904→32000→23552→27648→31744 = 视图在窗口内健康伸缩）**，
+  **epoch25 问题刀成功落地**（d_knife_enter pressure=False @143134 → blockwise
+  749 pages moved=749 failed=0 → applied vis 23966 → row_synced 继续推进）——
+  **刀的执行系统全部到位，唯一缺的是给问题刀的分数**（statistics 断供）。
+- 断水点收束到最后一个黑盒：bridge 的 capture op 设备侧写行为（stats_from_bridge
+  读取端已证每步在跑、行源为空）。**现成读出**：bridge 自带 `_op_calls`/status
+  （read_all→"statistics" 事件），下轮第一步 = 对比第 12 步前后 op_calls 增量与
+  bucket_writes 增量，一发区分"op 没被调"vs"op 调了没写行"vs"写了读不到"。
+- 结构修复累积（全部保留）：publish_offset D=0、is_rebuilt 短路、wrote0 雪崩保护、
+  真坐标锚、两口径分离、(b) 探针、漏斗探针、epoch 盖章、margins 法、final 刀接线。
