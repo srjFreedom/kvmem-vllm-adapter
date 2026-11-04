@@ -3291,6 +3291,24 @@ class VllmSparseRuntime:
         if pending:
             self.after_step(req, pending, prefill=pending >= self.page_tokens)
             self._prev_n[req] = 0
+            # Plan D: harvest is due in the SAME step_end pass where books
+            # commit (design 29). When the per-step pass did not run (the
+            # wrapper stopped being entered after the first knife - cause
+            # still under forensics), the bridge rows for `pending` tokens
+            # would go unread and statistics freeze at the knife. The bridge
+            # buffer holds the LAST writing step's rows keyed at their true
+            # positions, so draining here reads exactly the chunk that was
+            # just committed: first = tokens - pending.
+            if getattr(self, "d_mode", False) and pending >= self.page_tokens:
+                try:
+                    self._stats_next[req] = int(self._state[req].tokens) - pending
+                    got = self.harvest_key_statistics(req, pending)
+                    if self.log is not None:
+                        self.log({"kind": "d_rpc_harvest", "req": str(req)[-6:],
+                                  "pending": int(pending), "written": int(got or 0)})
+                except Exception:
+                    self.log({"kind": "d_rpc_harvest_error", "req": str(req)[-6:],
+                              "error": __import__("traceback").format_exc()[-160:]})
         # The epoch Core validated at trigger time IS authoritative here: we
         # run at Core's quiescent boundary by construction (this very RPC).
         # The worker's local counter lags one step behind Core's increment

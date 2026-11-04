@@ -2826,6 +2826,27 @@ def _install(cls, module_name, probe, smoke, state):
     original = cls.execute_model
 
     def execute_model(self, scheduler_output, *args, **kwargs):
+        # FIRST-LINE unconditional entry evidence (design 30): distinguishes
+        # "the wrapper is never entered after the knife" (engine-level path
+        # change - cudagraph replay bypass, runner swap, worker routing) from
+        # "entered but gated before step_end" (dummy_run/is_profile/EXEC_POST
+        # early returns). Without this, every step_end-side probe could only
+        # observe its own absence. Cap 90/pid keeps volume honest.
+        try:
+            _ems = state.get("_em", None)
+            if _ems is None:
+                _ems = state["_em"] = [0]
+            if _ems[0] < 90:
+                _ems[0] += 1
+                _sched = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "d_em_entry", "pid": os.getpid(),
+                         "n": len(_sched),
+                         "keys": [str(k)[-6:] for k in _sched],
+                         "dummy": bool(kwargs.get("dummy_run")),
+                         "prof": bool(kwargs.get("is_profile"))})
+        except Exception:
+            pass
         if os.environ.get("KVMEM_EXEC_HOOKS", "1") == "0":
             return original(self, scheduler_output, *args, **kwargs)
         _config_from_runner(self)

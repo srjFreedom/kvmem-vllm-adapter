@@ -483,3 +483,21 @@ guard 已撤（其保护在 cadence 正确时代本就未用到；cadence 修复
   （quiescent boundary 的 pending flush 已经在这么活）。
 - 累计证伪清单：capture写停 / align截断 / sweep误杀 / 假finished / scheduled缺席 /
   n_new=0 - 六案皆埋于证据。
+
+
+## 30. Round 23 案卷：execute_model 全程活着而 step_end 只跑 12 步——矛盾定案
+
+- d_em_entry（包装器第一行）：42 条/pid，真实请求 1227ca 到最后一步都在，
+  dummy=False prof=False 全程；
+- sparse_step_error=0（大 try 无异常）、引擎日志 0 错误、retirement 只在终点；
+- d_step_snapshot（step_end 循环头）：12 条/pid，step 14 后不再出现；
+- **静态已读尽**：em entry 与 snapshot 之间只剩四行代码 + 两个证伪的门
+  （EXEC_POST/dummy）。代码与观测矛盾。
+- RPC 路径补收割（d_rpc_harvest）written=0 也定案：bridge 缓冲只存最后一步的
+  行，且刀后步的 harvest 若在 step_end 死路外补收，锚已错位 - 补救路线关闭。
+- **下轮唯一动作**：snapshot 前再放一个无条件事件（d_preclear：steps、
+  state['sparse'] is None、n_keys），一发闭环"最后四行"之谜；若 d_preclear
+  同样停在 12，则凶手在 result=original() 内（它没返回，worker 线程阻塞后
+  由别的路径继续执行引擎步 - 需要查 async 采样线程与 execute_model 的关系）。
+- 案卷补充：D 臂 spec0 收割死亡史 = 与 spec4 同症状（MTP 通道假设作废）；
+  生产臂 v0.5.2 harvest 无恙（无刀）。问题被精确隔离在"D 刀 + step_end"。
