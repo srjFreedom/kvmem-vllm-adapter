@@ -2542,6 +2542,14 @@ def register():
                             _last = scheduler.kvmem_pressure_last = {}
                         _cands = [r for r in running
                                   if int(getattr(r, "num_computed_tokens", 0) or 0) >= _hi
+                                  # design 35: the QUESTION view is terminal.
+                                  # A later MID knife ranks by harvest and
+                                  # would evict the needle-bearing blocks the
+                                  # question knife just fetched (measured:
+                                  # block 39 reached rank 3 of top8 and the
+                                  # answer STILL failed - a mid knife rolled
+                                  # the view back to statistics pages).
+                                  and not getattr(r, "kvmem_d_final_cut", False)
                                   and (int(getattr(r, "num_in_flight_tokens", 0) or 0) == 0
                                        or _sched_cfg(scheduler).get("plan_d"))
                                   # prompt-complete requests belong to the FINAL path; a (c)
@@ -3340,7 +3348,14 @@ def _install(cls, module_name, probe, smoke, state):
                         # (execute_model entry, before the new forward) is the one safe place
                         # the worker has with the final chunk already committed to the store.
                         _rq = getattr(runtime, "_rebuild_queue", None)
-                        if _rq and req in _rq:
+                        if getattr(runtime, "d_mode", False):
+                            # D-lane: the stage-2 driver must not consume the
+                            # queue even when a straggler enqueued (the
+                            # rebuild_select guard answers, but popping and
+                            # retry-logging here would mask it): drop it.
+                            if _rq and req in _rq:
+                                _rq.pop(req, None)
+                        elif _rq and req in _rq:
                             # act only when the WHOLE prompt is resident (the frozen question is
                             # then in the captured window and the store has every page); re-arm
                             # otherwise - a pressure queue during a long prefill must never

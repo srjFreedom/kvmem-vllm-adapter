@@ -3537,6 +3537,13 @@ class VllmSparseRuntime:
         return proposal
 
     def _rebuild_select(self, req):
+        # Plan D never runs the prompt-end rebuild stage (design 35): no
+        # child, no channel pack, no rebuilt token list handed to Core.
+        # The finish driver and the page-mode branch still CALL this
+        # method unconditionally in a few paths - the guard belongs here,
+        # at the single chokepoint, so no caller can resurrect stage-2.
+        if getattr(self, "d_mode", False):
+            return False, "d-lane: rebuild stage disabled"
         """Stage 2 (v6): official selection+pack, then hand Core the rebuilt token list.
 
         The picker scores the store over the frozen question (the only moment the real query
@@ -4041,6 +4048,17 @@ class VllmSparseRuntime:
             will generate (this fork has NO `kvmem_rope_offset` consumer - pure-copy views
             cannot be corrected at read time and every one of them looped).
         """
+        # design 35 TERMINAL QUESTION LOCK (worker side, immediate): after a
+        # question knife lands for this request, MID knives must not re-
+        # compact it - statistics ranking would roll the question view back
+        # and evict the needle blocks the question fetched (measured: block
+        # 39 reached rank 3 of top8 and installed correctly, yet the answer
+        # failed: the very next (c) mid knife rolled the view back; the
+        # Core-side final_cut flag lands one RPC reply too late).
+        if (getattr(self, "d_mode", False) and bool(pressure)
+                and self._state.get(req) is not None
+                and getattr(self._state[req], "d_question_cut", False)):
+            return st
         # UNCONDITIONAL knife-entry evidence (previous probes sat INSIDE the
         # `if core is not None` gate, so "final ran without scores" and
         # "final never ran" were indistinguishable - the observation hole
@@ -4316,6 +4334,8 @@ class VllmSparseRuntime:
                     _dv.data[_ri] = _true - _d_window_visible
                     _vlv.data[_ri] = _d_window_visible
                     _runner.kvmem_view_active = True
+                    if not bool(pressure) and self._state.get(req) is not None:
+                        self._state[req].d_question_cut = True
                     self.log({"kind": "d_tables_published", "req": req,
                               "row": _ri, "view_base": _d_window_visible,
                               "true_base": _true,

@@ -547,3 +547,25 @@ final 刀未落的剩余疑点（两点，下轮一发分辨）：
 （每请求首次），一发同时读 1+2。
 
 预算纪律：本轮 6 次 boot，停止。产线恢复 spec4/PLAN_D=0。
+
+
+## 35. Round 26：旧机器链锁死 + 终末问题视图锁落地；问题收窄到"视图→decode 读"最后一环
+
+本轮定案成果：
+1. **stage-2 rebuild 链在 D 臂彻底锁死**（_rebuild_select 函数级守卫 + finish 驱动
+   出口丢弃队列项）：rebuild_select_diag/compact_rebuild_queued/reconstruction_started
+   三事件全归零（此前每轮 6-8 条 - v0.5.2 机器在 D 臂的幽灵执行被消灭，
+   目标"删除旧机器"完成此项）。
+2. **raw 分数覆盖证实生效**：core_len 704→1178、block_scores_len 29→**49/49 全覆盖**，
+   且 **needle 块 39 打进 top8 rank3** - 问题打分正确命中。
+3. **终末问题视图锁（TQL）**：问题刀落地后 MID 刀拒绝对该请求再压缩
+   （worker 端 d_question_cut 即时标记 - Core 端 final_cut 要晚一个 RPC 回复，
+   实测拦不住紧随的下一步）。双发同 sha 确定性成立，applied 序列含问题刀。
+4. 期间两次"我以为写了"（cw1/fl3 锚败未写盘）都被诚实事件数据当场拆穿 - 教训：
+   每处编辑后 grep 目标文本计数是唯一可信的落盘证明。
+
+**剩余唯一问题（精确）**：问题视图已安装、锁定、确定性稳定，但 needle 仍 False。
+病灶候选只剩两枚：(a) 安装后 view_lens/deltas 表的值与视图内容不一致（decode 读错行）；
+(b) 问题刀 install 的页集与 kept 列表不一致（restore 未真正搬到 needle 页）。
+下轮第一诊断：问题刀落地时快照 st.logical 是否含 needle block 的页 + 表值三元组
+(view_base/delta/needle_page)，一发分辨 (a)/(b)。
