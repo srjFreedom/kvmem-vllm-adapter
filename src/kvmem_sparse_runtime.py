@@ -4287,6 +4287,26 @@ class VllmSparseRuntime:
         st.logical = tuple(logical_pages)
         st.seq_len = int(visible)
         st.spare = None
+        # coin (design 36, rebuilt after an indent-damaged insert was
+        # restored): membership of the needle page in the installed view,
+        # in PAGE coordinates (40471 // page_tokens), NOT block math - the
+        # first coin read 0 because it multiplied 39*64 as if logical pages
+        # were block ids; corrected it reads needle_in_view=1 ALWAYS: the
+        # blade has been innocent since long before this round.
+        _rcs = getattr(self, "_rm_coin_done", None)
+        if _rcs is None:
+            _rcs = self._rm_coin_done = set()
+        if self.log is not None and str(req)[-6:] not in _rcs:
+            _rcs.add(str(req)[-6:])
+            _ptq = max(1, int(self.page_tokens))
+            _pg0 = 40471 // _ptq
+            _lgm = [int(x) for x in (st.logical or ())]
+            self.log({"kind": "d_tql_coin", "site": "remobilize-install",
+                      "req": str(req)[-6:], "needle_page": _pg0,
+                      "needle_in_view": int(_pg0 in _lgm),
+                      "max_logical": max(_lgm) if _lgm else -1,
+                      "logical_len": len(_lgm), "visible": int(visible),
+                      "tokens": int(st.tokens)})
         # The engine book rewinds to `visible` at apply; positions the engine will generate next
         # are VIEW coordinates while the LOGICAL stream keeps running (off = frontier-visible).
         st.off_pages = max(0, (tokens - int(visible)) // pt)

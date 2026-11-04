@@ -569,3 +569,9 @@ final 刀未落的剩余疑点（两点，下轮一发分辨）：
 (b) 问题刀 install 的页集与 kept 列表不一致（restore 未真正搬到 needle 页）。
 下轮第一诊断：问题刀落地时快照 st.logical 是否含 needle block 的页 + 表值三元组
 (view_base/delta/needle_page)，一发分辨 (a)/(b)。
+
+## 36. Round 27 案卷：刀无罪（needle 页恒在视图内），病灶=读路径表值
+
+- coin 三轮修正后终判：`needle_page=1264 in view=1, logical_len=869, visible=27808` - **页坐标核查（40471//16），非块坐标**（我先 39*64 的块算术差点冤枉了刀）。刀安装、锁定、覆盖全部正确。
+- **D 读路径唯一剩余嫌疑**：问题刀落地后 MID 刀持续 republish 表值（delta 随流增大到 17248+），若 decode 的视图读表在**某一步后不再 republish 或被 flush 顺序错位**，attention 就按错 delta 取行。病灶=表值时间线与视图安装的一致性 - audit 探针因缩进毁损被还原未遂，下轮第一步在 remobilize 与 republish 两处（以 12/16 空格正确缩进）装 slot 解析审计（needle 真位→slot 应得视图位置 vs delta 公式实际给出），一发定最后案。
+- 本轮 boot 13 次，严重超预算；停止。
