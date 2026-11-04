@@ -2508,6 +2508,14 @@ def register():
                     pressure = pressure_due(free, reserve)
                     request = None
                     if final:
+                        # design 38-A seam: flag the completing requests so the
+                        # EngineCore.step seam (between execute_model forward
+                        # and sample_tokens) lands the QUESTION knife BEFORE
+                        # the first token of this request is sampled. The old
+                        # (b) sweep below stays as the safety net (final_cut
+                        # and the once-only mark make the two idempotent).
+                        for _rf in final:
+                            _rf.kvmem_d_knife_pending = True
                         request = max(final, key=lambda r: int(r.num_logical_tokens))
                         # (b) decision evidence (throttled per request kind):
                         # final-set size and the chosen request - closes the
@@ -2819,7 +2827,78 @@ def register():
                     return result
 
                 step._kvmem_session_retire_patched = True
-                EngineCore.step = step
+
+                _inner_step = EngineCore.step
+
+                def _seam_step(self, *a, **kw):
+                    # design 38-A gate: run one engine step; if it returned
+                    # model outputs WITHOUT executing (the V2 two-phase form:
+                    # execute_model deferred, sampling happens in the NEXT
+                    # sample_tokens call), any request flagged knife-pending
+                    # gets its question knife installed RIGHT HERE - inside
+                    # the forward->sample seam, while the worker is quiescent
+                    # exactly like the step-end RPC. The first sampled token
+                    # is then born inside the question view, closing the last
+                    # timing gate (measured: knife at step END loses that race
+                    # by design - the answer's first tokens precede it).
+                    outs, executed = _inner_step(self, *a, **kw)
+                    try:
+                        if executed:
+                            return outs, executed
+                        sched = getattr(self, "scheduler", None)
+                        cfgx = _sched_cfg(sched)
+                        if not cfgx.get("plan_d"):
+                            return outs, executed
+                        pend = [r for r in getattr(sched, "running", ())
+                                if getattr(r, "kvmem_d_knife_pending", False)
+                                and not getattr(r, "kvmem_d_final_cut", False)]
+                        if not pend:
+                            return outs, executed
+                        req = max(pend, key=lambda r: int(
+                            getattr(r, "num_logical_tokens", 0) or 0))
+                        req.kvmem_d_knife_pending = False
+                        # the completion chunk is COMMITTED but not yet in the
+                        # store - exclude only it from selection by shrinking
+                        # the sender frontier (question tail rows are already
+                        # harvested by the forward that just finished)
+                        _plq = int(getattr(req, "num_prompt_tokens", 0) or 0)
+                        _lgq = int(getattr(req, "num_logical_tokens", _plq) or 0)
+                        _fqc = self.model_executor
+                        _lpx = cfgx.get("probe_log") or "/tmp/kvmem_sparse.jsonl"
+                        try:
+                            _tpx = int(getattr(
+                                self.vllm_config.parallel_config,
+                                "tensor_parallel_size", 1) or 1)
+                        except Exception:
+                            _tpx = 1
+                        _epx = int(getattr(sched, "kvmem_compact_epoch", 0) or 0)
+                        sched.kvmem_compact_epoch = _epx
+                        _mgr = getattr(sched, "kv_cache_manager", None)
+                        try:
+                            _recs = _fqc.collective_rpc(
+                                "kvmem_quiescent_compact", timeout=120,
+                                args=(req.request_id, _lgq, _epx,
+                                      int(req.num_computed_tokens), True))
+                            from kvmem_reconstruction import (
+                                validate_quiescent_compaction)
+                            validate_quiescent_compaction(
+                                req, _recs, _tpx, _epx, _mgr, d_mode=True)
+                            # D apply: no books touched; mark terminal state.
+                            req.kvmem_d_final_cut = True
+                            req.kvmem_final_reselect = True
+                            _append(_lpx, {"kind": "d_seam_knife",
+                                           "req": req.request_id,
+                                           "epoch": _epx, "frontier": _lgq})
+                        except Exception as _sex:
+                            _append(_lpx, {"kind": "d_seam_knife_error",
+                                           "req": str(req.request_id)[-8:],
+                                           "error": str(_sex)[:220]})
+                    except Exception:
+                        pass
+                    return outs, executed
+
+                _seam_step._kvmem_seam_patched = True
+                EngineCore.step = _seam_step
         except Exception:
             _append("/tmp/kvmem_sparse.jsonl",
                     {"kind": "session_checkpoint_engine_hook_error",

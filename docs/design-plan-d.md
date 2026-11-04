@@ -611,3 +611,18 @@ final 刀未落的剩余疑点（两点，下轮一发分辨）：
   C. StateImage 引擎钩子（D6 完整版）：末段重算 + 状态快照回置 - 改动最深，收益最大
      （顺带把 R3 resume 深度一起解决）。
 - 倾向序：**A 优先**（最小合法）、C 并入 R3 设计、B 作对照实验。
+
+
+## 39. Round 29：step 间缝不存在（nosync），候选 A 真形态=worker 内 pre-sampler 刀
+
+- 装 step 级 seam（forward→sample 之间下刀）：d_seam_knife 零事件 + 完成步返回
+  executed=True - **本 fork nosync 调度：EngineCore.step 同步包含采样**，Core 层
+  不存在 forward/sample 消息间隙。88K 80s 完成（seam 层无副作用，保留作 async 模式保险）。
+- **候选 A 真形态（下轮施工）**：间隙在 worker 内部 - GPUModelRunner.execute_model 的
+  forward 完成后、sampler 调用前。且 D 刀的安装**本来就全是 worker 侧动作**
+  （选择/restore/row 写/表发布皆不碰 Core 账本）- **worker 本地 pre-sampler 刀**合法：
+  完成步 forward 后（问题向量此刻刚被 harvest），runner 钩子调 runtime 的
+  `d_local_question_knife(req)`：确定性选择（raw 分数、两 rank 同输入同结果 - consensus
+  在 D 下已跳过）+ remobilize 安装 + 表发布，然后才 sampler - **第一 token 出生在问题视图**。
+  风险登记：TP 两 rank 需同轮执行（确定性输入成立）；与 (c)/(b) 的幂等（final_cut 标记已有）。
+- 本轮预算：4 boots 止，seam 保险层代码保留（D 门内无害）。
