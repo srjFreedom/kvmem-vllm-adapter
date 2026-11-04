@@ -9,8 +9,24 @@ def retire_finished_worker_requests(runtime, scheduler_output):
     finished = set(getattr(scheduler_output, "finished_req_ids", ()) or ())
     released = []
     for req in runtime.live_requests():
-        if req in finished and runtime.release(req):
-            released.append(req)
+        if req in finished:
+            # ARRIVAL evidence for the false-finished case (design 28): a
+            # request retired while the SAME scheduler_output still schedules
+            # it (or while its prefill is behind the prompt) is Core marking
+            # completion that is not - the exact event that de-registers the
+            # runtime ledger mid-flight and freezes statistics at the knife.
+            sched = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+            st = runtime._state.get(req)
+            plen = int(getattr(runtime, "_prompt_len", {}).get(req, 0) or 0)
+            tok = int(getattr(st, "tokens", -1)) if st else -1
+            if runtime.log is not None:
+                runtime.log({"kind": "d_retire_arrival", "req": str(req)[-8:],
+                             "still_scheduled": bool(req in sched),
+                             "scheduled_n": int(sched.get(req, -1) or -1),
+                             "tokens": tok, "prompt_len": plen,
+                             "unfinished": bool(plen and tok < plen)})
+            if runtime.release(req):
+                released.append(req)
     return released
 
 

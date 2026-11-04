@@ -444,3 +444,22 @@ guard 已撤（其保护在 cadence 正确时代本就未用到；cadence 修复
   computed/prompt 进度对照）+ 引擎日志 preempt/abort grep。
 - 若=preempt：D 的 cap（R2a 临时 book 改写）需与 scheduler 的资源判定和解——
   这条线索把"刀 cadence"与"假 finished"统一（也解释 round-14 15 knives 后统计仍冻结）。
+
+
+## 28. Round 21：假 finished 论证伪；死亡收束到"首刀后 step_end 不再含该请求"
+
+- 到达探针（d_retire_arrival）实测：真实请求的 retirement 只在**正常终点**发生
+  （tokens=143140 ≥ prompt=143134，unfinished=false，still_scheduled=false）——
+  round-20 的"Core 假 finished"判决**错误**，撤回。合法 retirement 无罪。
+- 新的收束（全部无 cap 探针互证）：
+  * d_hv_result：22 条（11×2pid），sums_layers=16 全健康，first 止于 40960；
+  * funnel 止于 call 10-11；**没有 stats_rows_error、没有 sparse_step_error、
+    skipped=None** ——harvest 不是死在内部任何门，是**根本不再被调用**；
+  * pressure_gate 仍 16 次（它们走 quiescent RPC 的 pending flush 路径，不经
+    step_end）→ **首刀之后，worker 的 step_end scheduled 循环不再包含该请求**。
+- **下轮唯一取证**（一处无 cap 事件）：step_end 循环入口打印
+  {pid, steps, sorted(scheduled keys)}——一发对比首刀前后 scheduled 内容；
+  若请求真不在 scheduled 里：查 scheduler→worker 的 num_scheduled_tokens 构造
+  （D 的 cap/defer/epoch 交互），这是收割断供的真正上游。
+- 已排除名单（累计）：capture 写停/读停、align 截断（已修 raw）、坐标锚、
+  sweep 误杀（grace 后照旧）、假 finished、_np import（已修）。
