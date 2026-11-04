@@ -2460,10 +2460,19 @@ def register():
                                if not bool(getattr(r, "kvmem_rebuilt", False))]
                     _bud = int(cfg.get("budget_tokens", 36864))
                     _isd = bool(_sched_cfg(scheduler).get("plan_d"))
+                    # D gate: prompt-complete alone qualifies. Measured truth:
+                    # num_output_placeholders is >0 for EVERY scheduled decode
+                    # step (the engine posts the placeholder it is about to
+                    # fill) - gating on it made the final knife untriggerable
+                    # (d_b_probe produced zero events while mid knives rolled
+                    # through seven 16K buckets). The once-only property comes
+                    # from kvmem_d_final_cut, set the moment a prompt-complete
+                    # proposal applies; in-flight bookkeeping is meaningless in
+                    # D anyway (the true book always runs ahead by the delta).
                     final = [r for r in running
-                             if ((int(getattr(r, "num_output_placeholders", 0) or 0) == 0)
-                                 if _isd else
-                                 (int(getattr(r, "num_in_flight_tokens", 0) or 0) == 0))
+                             if ((True if _isd else
+                                  int(getattr(r, "num_in_flight_tokens", 0) or 0) == 0)
+                                 and not (_isd and getattr(r, "kvmem_d_final_cut", False)))
                              and int(getattr(r, "num_logical_tokens", 0) or 0)
                              >= int(getattr(r, "num_prompt_tokens", 0) or 0)
                              # A pressure boot must behave EXACTLY like the OFF
@@ -2483,6 +2492,22 @@ def register():
                     request = None
                     if final:
                         request = max(final, key=lambda r: int(r.num_logical_tokens))
+                        # (b) decision evidence (throttled per request kind):
+                        # final-set size and the chosen request - closes the
+                        # loop entry(RPC final arg)->knife(blockwise pressure
+                        # =False) that the log could not answer last round
+                        _bs = getattr(scheduler, "_d_b_seen", None)
+                        if _bs is None:
+                            _bs = scheduler._d_b_seen = set()
+                        _bk = (request.request_id,
+                               int(request.num_logical_tokens) // 16384)
+                        if _bk not in _bs:
+                            _bs.add(_bk)
+                            _append(log_path if 'log_path' in dir() else
+                                    "/tmp/kvmem_sparse.jsonl",
+                                    {"kind": "d_b_probe", "req": request.request_id,
+                                     "final_n": len(final),
+                                     "logical": int(request.num_logical_tokens)})
                     if request is None and cfg.get("prefill_pressure"):
                         # (c) BUDGET watermark (B2, goal-7833cb61): bounded residency means
                         # the resident BOOK - Core's own num_computed_tokens - never runs far

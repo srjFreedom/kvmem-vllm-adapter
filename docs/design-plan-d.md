@@ -206,3 +206,25 @@ reason 探针（wrapper exception/is_rebuilt/entry）把"第二刀 idle"完全�
 **生产线决议**：验收线未达，**生产保持 spec4 + PLAN_D=0（v0.5.2 验证臂）**；D 臂继续在
 实验环境迭代。raw/consensus/sanitize 改动对 classic 臂零影响（classic 不走这些分支），
 已五套件验证。
+
+
+## 15. Final 刀结构公案破案（round 9）+ 最后的深水区定性
+
+**破案过程（事件链完整）**：
+1. 无条件入口探针 d_knife_enter（上轮探针埋错位置的教训修正）+ Core (b) 决策探针 d_b_probe；
+2. 发现 (b) 探针零事件 → 值级探针 → 也零事件 → 把 step 外层 except 从吞掉改为记录
+   sched_compact_error → **抓到 NameError 真凶：round 8 我给 (b) 上方插值探针时写了
+   `if _isd and self is not None:`——`_quiescent_compaction(core)` 模块级函数里没有
+   `self`！异常被外层吞 → (b)(final 集/RPC/d_b_probe)整段死码，而 (c) 在异常之前的位置
+   正常执行（这正是"刀全落地但 final 永不发生"的诡异组合的源头）**；
+3. 清除毒块后：**final 刀首次真实执行**（d_b_probe=1、pressure=false 入口出现、
+   d_final_scores 出事件）。
+
+**最终定性（下一轮唯一问题）**：d_final_scores 显示 core_len=704——recall.scores 的输出
+长度 = (frontier+63)//64，frontier=45056 = **statistics 收割冻结在首刀位**。152K 的 45K 之后
+97K tokens 从未被打分收割 → 无论选择算法怎么改，分数世界里根本没有 needle 区的格子。
+**问题从"选择/坐标/网格"全部收束为一个**：D 滚动刀下 statistics harvest 的 frontier 为什么不
+随真账本推进（读 v0.19 收割协议：谁喂 harvest、刀窗内/外、harvest 与视图安装的关系）。
+
+**运维教训（第二次踩同一坑并写死）**：给 Core 模块级函数插代码时禁止引用 self；
+探针必须放条件链最外层；except 吞异常 = 取证黑洞（sched_compact_error 现已常开）。

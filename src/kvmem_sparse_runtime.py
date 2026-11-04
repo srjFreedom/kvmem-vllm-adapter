@@ -3898,6 +3898,24 @@ class VllmSparseRuntime:
             will generate (this fork has NO `kvmem_rope_offset` consumer - pure-copy views
             cannot be corrected at read time and every one of them looped).
         """
+        # UNCONDITIONAL knife-entry evidence (previous probes sat INSIDE the
+        # `if core is not None` gate, so "final ran without scores" and
+        # "final never ran" were indistinguishable - the observation hole
+        # that invalidated one root-cause round). Throttled once per
+        # (kind, 16K-token bucket).
+        _kmark = (req, bool(pressure), int(getattr(self._state.get(req, None), "tokens", 0) or 0) // 16384) if self._state.get(req) is not None else None
+        _kseen = getattr(self, "_d_knife_seen", None)
+        if _kseen is None:
+            _kseen = self._d_knife_seen = set()
+        if _kmark is not None and _kmark not in _kseen:
+            _kseen.add(_kmark)
+            _kst = self._state[req]
+            if self.log is not None:
+                self.log({"kind": "d_knife_enter", "req": req,
+                          "pressure": bool(pressure),
+                          "tokens": int(_kst.tokens),
+                          "seq_len": int(_kst.seq_len),
+                          "row": len(_kst.row or ())})
         st = self._state[req]
         orch = self._orch[req]
         pt = int(self.page_tokens)
