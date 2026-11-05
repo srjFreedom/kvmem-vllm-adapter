@@ -3501,6 +3501,22 @@ class VllmSparseRuntime:
 
     def quiescent_compact(self, req, frontier=None, computed=None, final=None,
                           epoch=None):
+        # TRUTH probe at the REAL knife entry (design 46, uncapped loud
+        # cap 60): every RPC lands HERE; nothing above this line is the
+        # knife. Previous "zero-knife" readings were probes anchored on
+        # helpers that the D flow does not enter.
+        _tk = getattr(self, "_truth_n", None)
+        if _tk is None:
+            _tk = self._truth_n = [0]
+        if _tk[0] < 60:
+            _tk[0] += 1
+            if self.log is not None:
+                self.log({"kind": "d_truth", "req": str(req)[-6:],
+                          "n": _tk[0], "final": bool(final),
+                          "frontier": int(frontier or 0),
+                          "computed": int(computed or 0),
+                          "d_mode": bool(getattr(self, "d_mode", False)),
+                          "blockwise": bool(getattr(self, "blockwise_view", False))})
         """EngineCore-callable compaction on the scheduler thread, between steps.
 
         The worker has completed the previous forward but not yet committed it (the commit runs at
@@ -4241,6 +4257,13 @@ class VllmSparseRuntime:
                       "tokens": tokens, "budget": budget, "pages": len(row)})
         return st
 
+    def _knive_count(self):
+        _kc = getattr(self, "_knive_n", None)
+        if _kc is None:
+            _kc = self._knive_n = [0]
+        _kc[0] += 1
+        return _kc[0]
+
     def _reselect_blockwise(self, req, pressure=False):
         """The NO-MOVE block view - the only view this engine's kernel table can express.
 
@@ -4284,6 +4307,15 @@ class VllmSparseRuntime:
         # that invalidated one root-cause round). Throttled once per
         # (kind, 16K-token bucket).
         _kmark = (req, bool(pressure), int(getattr(self._state.get(req, None), "tokens", 0) or 0) // 16384) if self._state.get(req) is not None else None
+        # UNBOUNDED call evidence (design 46, the probe that lies last):
+        # fires on EVERY knife entry regardless of throttle state - the
+        # bucket throttle froze when the tokens book froze, which is what
+        # silenced the whole knife log and made a True run look like 0
+        # knives. Loud, uncapped, self-evident.
+        if getattr(self, "d_mode", False) and self.log is not None and \
+                self._knive_count() < 40:
+            self.log({"kind": "d_knife_call", "req": str(req)[-6:],
+                      "pressure": bool(pressure)})
         _kseen = getattr(self, "_d_knife_seen", None)
         if _kseen is None:
             _kseen = self._d_knife_seen = set()

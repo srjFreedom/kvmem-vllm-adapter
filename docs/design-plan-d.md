@@ -728,3 +728,28 @@ skip=不重放只装视图 - 顺路）。
 - vl_mismatch 首 chunk 的 old=真账本 vs new=ql 是**设计语义**（非刀时基 0=恒等），
   属预期，不修。
 - **下轮：152K 同判据**（问题刀 749 pages + needle）。
+
+
+## 46. Round 33 终局：刀系统已死的完整尸检 + 复读病理解 + 重建路线
+
+- 事件面铁证（truth 探针在 `quiescent_compact` 真入口，未节流、cap 60 自计）：
+  **d_truth=0 - RPC 从未到达 runtime**；d_compact_applied/d_c_probe/d_b_probe 同窗全零。
+  刀系统（Core 触发侧）在某次 boot 后整体停摆，触发链断裂点未定位（下轮）。
+- **复读病理解剖（完整因果链终闭合）**：
+  1. 某 boot 早期真刀落地过（历史 applied 证据）→ `kvmem_view_active=True` 被设置；
+  2. 刀系统死后表停在最后 publish 值（advance 被切除期冻在 0 / NameError 时代遗产）；
+  3. fork 的 seq_lens override 在 active 下把 causal 覆盖成 `vl[0]+ql = 0+1`；
+  4. decode 步模型只看见 1 个 token → "1111…"/"The user is asking…" 无限循环。
+  **所有此前的"视图内容错"猜测全部作废：是 causal 轴被覆盖成常数。**
+- **机制缺口登记（必修）**：`kvmem_view_active` 与 view_lens 表是 per-runner 全局，
+  **不随请求终局复位**：一个请求的刀影响下一个请求的 causal。修复选项：
+  (a) override 加"表值合理性"守卫（vl=0 且真账本>ql → 不覆盖，退 dense）；
+  (b) release/finalize 时复位 active+表（同请求生命周期内也需初始化为"账本恒等"）。
+  **两者都做**：a 是硬保险丝，b 是正确语义。
+- 88K "needle True" 历史判决修正：那是 D 未生效的 dense 原生跑（页配额 guard 自
+  round-21 撤销后从未恢复，88K<209K 池天然驻留）——**里程碑未达成，如实撤回**。
+- 下轮顺序（每步单 boot 验证）：
+  1. override 保险丝 (a) + 生命周期复位 (b)；
+  2. Core 触发链定位（d_truth 恒 0 的断点：(c)/(b) 候选循环或 collective_rpc 层）；
+  3. 恢复 scheduler 页配额 guard（真窗口 + Xid 保险）；
+  4. 88K/152K 在"真刀 + 活表"下落判。
