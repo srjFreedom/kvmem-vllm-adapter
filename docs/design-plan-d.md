@@ -847,3 +847,24 @@ skip=不重放只装视图 - 顺路）。
 - 250K: False x1（290.2s）
 - **定案：无 union 基线（stats fallback 恢复 + RR 保留）就是 D 迄今最优配置** - round-41 全部 union 变体都被这次干净对照判死。
 - 250K 待解剖（下一个独立缺口）：其问题刀 top8=[148, 71,72,73,146,138,140,145] 与 needle 块的真实对应需要先校准重建版 250K 数据的 needle 块号（我 39/69 的公式对 250K 未验），再判"挤掉/低分/未入场"。电池余一站。
+
+## 59. Round 43：250K 数据冤案 + union 假说整体证伪（stats 资产恒不含 needle）
+
+- 250K 重建版 v1 数据缺陷：needle 句写成 "KEY-ZX-4417-QJ7"（无 KEY-MID 标签），问句引用不到 - v2 重建为 88K 同款 "KEY-MID special access code ZX-4417-QJ7" 配对句式（needle token 112591 block 109/230）。
+- v2 纯基线读数：问题刀 top8=[71,72,73,74,140,145,82,129]，**needle block 109 rank 9**，room=10 - 一步之遥。union v2（保留 stats 中间 top-2 槽位）实测：`stats_top6=[413,414,416,...]` **统计场全局顶到末 chunk 自身区域**，中间排名头两名=[7,8] 零 needle 价值；预留槽反把 88K/152K 基线拖 False×1。已缴械（if False 门+判词入码）。
+- **union 假说家族（v1 页资产 / RR / score-ordered / asset-synced / v2 stats 预留）全部证伪**：深水位统计资产从不含 needle（其相似度场由"最近读过的块"主导） - 检索资产层没有免费午餐，109 掉出 top8 是打分器对 tail 相似场的真弱点。
+- 三发纯基线验证跑在中（250K x2 / 88K / 152K）。
+- 250K 若仍 False：唯一未测的打分层直球 = **问句纯净化**（force_tail 从未有事件 - 探针先修活），问句 6-24 行单独成 query，clone 场被 "KEY-MID" 专名拉开。那是设计 51 想做没做成的那一发。
+
+### 60. Round 43 终节：基线三发 False 复现 - flaky 带存在且比样本大（下轮同 boot 重采样定身位）
+
+- kb157 三发（250K/88K/152K）全 False，同码 kb153 曾 6/6 全 True - **代码状态存疑优先于答案随机性**：待把运行码 diff 到 fc2c40f 后同 boot 重打。
+- 本轮有效新知：250K 真 needle block=109（token 112591/234563 校准），问题刀 top8=[71,72,140,145,134,73,147,144] - **71-74 = KEY-MID 标签复读段**（filler 中的 KEY-MID special 句），非 needle 正文段 - 打分器对"标签文本"敏感对"答案正文"钝，与 152K 的 top8=[90,89...]（clone 段）同构。
+- 收束预算：4 boots，停。
+
+## 61. Round 43 终节：flaky 定量化 + 确定性 tie-break 落地 + 波动源锁定到分数值层
+
+- 同 boot 五发 88K：True/False/False/False/False（含 tie-break 前后各测）；问题刀**每发都 apply**（vis 11086 形态在场）- flaky 不在刀落地与否。
+- **波动现形**：top8 五发近同但 **rank 7-9 抖动**（27↔36↔46 互换、38/43/45 进出）- needle 块恰在这些名次徘徊 → 答案翻面。修复 step1：`sorted(key=(-score, block))` **确定性平局裁决**（旧排序回落 dict 插入序，而插入序随 TP all_reduce 到达序漂 - **同 boot 非确定性的直接来源**，此修复永久保留）。
+- step1 后 top8 仍 ±1 漂 → 剩余波动在**分数值本身**：候选 = 问题刀打分时 last-chunk bucket 行的 harvest 在途差异（未证实）。下轮诊断：同 prompt 同 boot 两次问题刀对比 `needle_score` 数值（d_final_scores 已有该字段），数值同而名次动=tie-break 未覆盖的浮点微差；数值动=harvest 时序，再查刀前 drain 完备性。
+- 电池：88K 1/5、152K 0/2、250K 0/2（v2 数据正确后） - **比 fc2c40f 时代读数差是统计巧合还是回归，需 tie-break 版重跑积累样本**（每尺寸 ≥5 发才有判决资格，此前"3/3 全绿"样本量同样不足 - 诚实修正：所有单发/三发结论降级为"倾向"）。

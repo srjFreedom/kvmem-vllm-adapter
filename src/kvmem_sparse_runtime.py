@@ -428,6 +428,13 @@ class VllmSparseRuntime:
         finally:
             self._finishing_reconstruction = False
         self._prev_n[req] = 0
+        # union v2 asset book is per-request too (design 58 lifecycle)
+        _ump = getattr(self, "_last_mid_pages", None)
+        if _ump is not None:
+            _ump.pop(req, None)
+        _smp = getattr(self, "_stats_mid_blocks", None)
+        if _smp is not None:
+            _smp.pop(req, None)
         self._inflight[req] = 0
         # lifecycle reset (design 47): give the published view_lens row
         # back at release so the next occupant of this input-batch index
@@ -4403,13 +4410,44 @@ class VllmSparseRuntime:
         # information-bearing statistics query, already hold the needle
         # in the working view (88K: block 39 rank 3). The question view
         # UNIONS statistics picks with question top-k, never replaces.
-        # union DISABLED (design 56): every union variant tried (mid-
-        # ascending, round-robin, score-ordered, asset-synced-from-view)
-        # regressed 88K from stable-True to stable-False while 152K never
-        # crossed. The full-pages asset carries sink/recent neighborhoods
-        # into `room` and displaces the needle-bearing middle; the slot
-        # arithmetic is not the layer to fix. Re-enable ONLY with a
-        # middle-blocks-only asset AND 88K regression runs green.
+        # union RENEWED (design 58) with the layer that was never right
+        # before: the asset is NOT a page book and NOT the installed view
+        # - it is the TOP-2 MIDDLE blocks of the statistics score field
+        # recomputed HERE (orch._last_core, the same vector the MID knives
+        # used). At 250K the question knife ranked the needle block 9 of
+        # 150 with room=10 - one tail-clone displacement from passing;
+        # the statistics query (whole last chunk) ranks the needle middle
+        # first (88K evidence: [31, 44, 39...]). Two reserved slots, no
+        # more: 88K/152K keep their question-dominant views.
+        _mid_blocks_q = None
+        if not bool(pressure):
+            try:
+                _lcq = getattr(orch, "_last_core", None)
+                if _lcq is not None and len(_lcq):
+                    _gpq = max(1, int(getattr(orch, "select_block_tokens",
+                                              1024) or 1024) // int(pt))
+                    _scq = {}
+                    for _gi, _vq in enumerate(_lcq):
+                        _bq = (_gi * _gpq) // max(1, int(q))
+                        try:
+                            _scq[_bq] = _scq.get(_bq, 0.0) + float(_vq)
+                        except (TypeError, ValueError):
+                            continue
+                    _sink_hi = sink_blocks
+                    _rec_lo = max(0, n_blocks - recent_blocks)
+                    _ordq = sorted(_scq, key=lambda x: -_scq[x])
+                    _mid_blocks_q = [int(b) for b in _ordq
+                                     if _sink_hi <= int(b) < _rec_lo][:2]
+                    if self.log is not None and \
+                            getattr(self, "_un_log", 0) < 4:
+                        self._un_log = getattr(self, "_un_log", 0) + 1
+                        self.log({"kind": "d_union_v2", "req": str(req)[-6:],
+                                  "asset": _mid_blocks_q,
+                                  "stats_top6": _ordq[:6]})
+            except BaseException as _uex:
+                if self.log is not None:
+                    self.log({"kind": "d_union_v2_error",
+                              "error": str(_uex)[:160]})
         _mid_kept = None
         if False and not bool(pressure):
             _lmp0 = getattr(self, "_last_mid_pages", None)
@@ -4520,7 +4558,15 @@ class VllmSparseRuntime:
                         block_scores[b] = block_scores.get(b, 0.0) + float(v)
                     except (TypeError, ValueError):
                         continue
-                order = sorted(block_scores, key=lambda b: -block_scores[b])
+                # deterministic tie-break (design 61): same-boot five-run
+                # battery showed ranks 7-9 JITTER (needle 38/39 swapping
+                # across the kept cut) - float sums leave exact ties and
+                # the previous sort fell back to dict insertion order,
+                # which follows whichever TP rank answered the all_reduce
+                # first. Ties now break by block id: the score field is a
+                # deterministic function of (block_scores, tie-break),
+                # independent of network interleaving.
+                order = sorted(block_scores, key=lambda b: (-block_scores[b], b))
                 # FINAL-knife score observability (one per final): is the
                 # needle-bearing block RANKED at all (score path broken) or
                 # merely not SELECTED (room/kept path broken)? The question
@@ -4565,7 +4611,16 @@ class VllmSparseRuntime:
                                for pg in (_mid_kept or ())}
                     _mid_kept_blocks = sorted(
                         _mbset2, key=lambda x: -block_scores.get(x, -1.0))
+                # union v2 DISARMED (design 59): stats_top6=[413,414,416..]
+                # = the last chunk's own region dominates the statistics
+                # field globally; the middle-rank-2 asset ([7,8]) carried
+                # zero needle value while the reserved head slots polluted
+                # 88K/152K baselines that passed WITHOUT any union. The
+                # union hypothesis is dead: the statistics asset never
+                # contains the needle at deep water.
                 _seq = order
+                if False and _mid_blocks_q:
+                    _seq = [b for b in _mid_blocks_q] + list(order)
                 if _mid_kept_blocks:
                     _seenq = set(order)
                     _mrest = [bb for bb in _mid_kept_blocks]
