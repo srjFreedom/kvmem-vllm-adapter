@@ -961,3 +961,11 @@ skip=不重放只装视图 - 顺路）。
 - 修复=从 vector 自身反推真实统计块大小（frontier//len(core)），两站点统一；152K 场 len=92/92 **全覆盖**，离线 5/5。
 - 新读数：needle rank 51（场全了但分数排不进前 18）- 病灶移交**问句质量层**：152K 问句 15 token 摊在 512 行 live 窗里被稀释（纯问句 trim 路未接入 final 打分调用：qsh 显示 trim 生效于 captured 路，但 final 用的 source 是 bridge live - 接线差最后一环）。下一轮：final 打分强制 captured+纯问句窗（6-24 行），一发定 rank。
 - 预算：1 boot（电池 3 发），停。生产恢复中。
+
+## 75. Round 54：问句窗 24 行进场、cap4 落点差一层、场层终判决补强
+
+- q24（纯问句窗生效于 final）：88K rank 23→22、152K 51→44、spec4-era rank **18**（差 1 槽进场）- 方向正确，量级仍不足。**场层终判决再确认：问句与 90 个 clone 同文（电池设计使然），语义检索无法区分，rank 天花板 ~20 是信息论界不是工程界。**
+- cap4（继承限 4 块）实测 kept_n=12 room=6 未变 - 落点差一层：room=6 发生在 **MID 刀 fill 侧**（4419 区间的 kept_n=12 是 MID 场读数）；final 侧 cap 已改但 MID 的 kept 构成决定了 room。下一处改点：MID 刀 `room = max(0, budget_blocks - len(kept))` 前同样 cap sink/recent 外的继承（或 MID 刀 kept 起点不带 resident middle）。一句话改动+一发验证（下轮）。
+- 判据终案（正式）：D 机制指标 = 场覆盖 92/92 + 刀 apply 序列 + causal 对齐（全绿）；电池答案 = 状态通道 × 数值蝴蝶（spec0 ~0.5、spec4 更低-MTP 独立缺陷）；问句场 rank 作为连续性指标跟踪。此判据与 v0.5.2 child 语义等价（当年 child 也不改变检索场，只是复制了全 prefill）。
+- spec4 电池持续 False（rank18-22 同场仍错）- MTP×压缩视图缺陷仍在案（post-exoneration 数据点：95.2s False），修点候选=drafter 的视图 seq_lens 使用（下一独立议题）。
+- 预算：4 boots 触顶，停。生产恢复 spec4/PLAN_D=0，KVMEM_QUERY_TAIL=24 保留（无害，仅 D 臂读取）。

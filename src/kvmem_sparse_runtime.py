@@ -4418,7 +4418,16 @@ class VllmSparseRuntime:
                 _res_mid = {int(pg) // max(1, int(q)) for pg in (st.logical or ())}
                 _res_mid = {b for b in _res_mid
                             if sink_blocks <= b < max(0, n_blocks - recent_blocks)}
-                kept |= _res_mid
+                # CAP the inheritance (design 75): unlimited resident picks
+                # filled kept to 11-12 and starved `room` to 6, ejecting
+                # even an improved question field's rank-18 needle block.
+                # Four blocks is enough to keep the statistics continuity
+                # (the knife's own view rolls fast anyway); the rest of the
+                # budget belongs to the CURRENT question ranking, which
+                # with the 24-row window is the most informative field D
+                # has ever produced (88K rank 22->18, 152K 51->44).
+                for _rb in sorted(_res_mid)[:4]:
+                    kept.add(_rb)
             except BaseException as _pex:
                 if self.log is not None:
                     self.log({"kind": "d_preserve_error", "req": str(req)[-6:],
