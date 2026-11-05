@@ -947,3 +947,10 @@ skip=不重放只装视图 - 顺路）。
 - 撤回错误理论：上一节"written=25%"系单位误读（written 计层×段，两臂都满覆盖）；clamp 修复基于它，已回滚。grid 假说也被 run2/3 否定（参数对、场也 49 键正常，spec4 与 spec0 在 final 场形态上其实**同类** - 差别只在 spec4 len=24 的块映射覆盖 - 待 cov_contig 判定）。
 - 新增 cov_contig 判定字段：spec4 的 24 键若是连续中段 = 覆盖塌；若含全部中段 = q 映射健康、差别仅统计值 - 一发分辨（下节执行）。
 - 预算：2 boots 止（双臂读数已齐）。
+
+## 73. Round 52 终局：覆盖数学推演与修正实验相抵，单位假说带证据封存
+
+- 读数链：spec4 `cov_lo=0, contig=1, len=24, needle_score=-1`（块 39 不在键域）；b 公式推演 q=101→b_max=23 与 24 键吻合 → 提出"页/统计块单位混用"假说，两站点改 `b=gi×sel_tokens//block_tokens`（=gi//25）。
+- **实验否定**：单位修正后 len 仍 24 → gi 的索引空间本来就是 ENGINE-block（core 按引擎块出分，1178≠统计块数的直觉），原公式没错。推演里把 recall.scores 的 blocks 参数（cdiv(frontier, block)）与 core 长 1178 的关系读反了 - 修正已 git checkout 回滚，工作树干净。
+- 修正后的剩余事实（下一步的正确切口）：len=24 = core 的**有效非零段短**或 scores 的 blocks 参数在 spec4 传入偏小 - 下一发在 recall.scores 入出口记 `len(core), len(layer_rows), len(stats)` 三值对表即可分辨（spec0 vs spec4 各读一次，现成双 boot 数据在 kb189/kb190，补一组入口事件）。
+- 本轮 4 boots（unit-fix boot 超支），停。生产恢复中。
