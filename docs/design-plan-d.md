@@ -909,3 +909,11 @@ skip=不重放只装视图 - 顺路）。
 - spec4×D 电池仍 0/3（88K）+ 0/1（152K），但**形态变了**：final 场 top8=[12,22,4,18..]（头部区！）且 **needle block rank=-1 不在场**、wrote0 显示 `first 139268 vs frontier 143134` 缺口 3866 行 - **末 chunk 的 bucket 在 spec4 下没有完整写入**。spec0 同 prompt 无此洞（wrote0 零）。第一嫌疑=MTP 的 prefill 尾步与 bridge KEY_ROWS 语义交互（boundary gate 保证 prefill 无 draft，但 harvest 的 drafts 判定 `req in spec_reqs` 在 spec4 boot 对 prefill 步请求可能误判为 draft-carrying → n 折 1 → 末 chunk 只写 1 行）。下轮一发：在 harvest 入口事件打 n_new/drafts/decode 三元组对照 spec4 前 3 步。
 - commit_map_probe_error×8：探针自身 OOM（旧时代残留，卸载列入 R4 清探针）。
 - 预算：5 boots 触顶，停。生产恢复 spec4/PLAN_D=0。
+
+## 68. Round 48：三个假说的死亡与一次自我纠错（wrote0 冤案）
+
+- 假说"纯问句 query 是杠杆"**死**：limit0 修复后 trim 真执行（d_query_trim×2 首响），rank 仍 23、top8 形态不变 - query 内容层全线证伪（512/96/6/纯问句四形态同果）。
+- 假说"spec4 末 chunk bucket 洞"**死在自我纠错**：wrote0×124 是 Counter 总量，事件本体受 gap≤3 throttle - 账本其实每步正确 +n 推进；decode 步走桶路径是**设计内 no-op**（decode rows 归 harvest_decode_rows 专职通道），stats 覆盖完好（frontier 143135 在案）。**差点又为冤案改代码**（dn1 锚败反而救场 - 该补丁未写入，现场无残留）。engine boundary gate（prefill 无 draft）在 D 臂同样生效，spec_reqs 来自 scheduled_spec_decode_tokens，判据自洽。
+- 剩余事实：spec0×D 88K True/False **同 boot 同输入翻面** → 非确定性源仍未定位，候选 (i) GPU 端 atomics/图-eager 混合路径，(ii) harvest/刀序与 decode 采样在异步管线下的到达序。下一发审计：同 prompt 双连发对比**输出 token id 序列**（第一个分歧 token 位置=非确定性显形处）+ 对比两发的 final top8（若场相同而答案分岔→分歧在 forward 数值，不在任何调度层）。
+- spec4×D 病灶与 stats 无关（本轮排除），回到 MTP draft 通路审计（上轮记录）。
+- 预算：2 boots（其一未计入修复因锚败免烧），本轮代码净零改动（四修已在昨日提交）。
