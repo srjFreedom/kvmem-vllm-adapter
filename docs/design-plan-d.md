@@ -926,3 +926,10 @@ skip=不重放只装视图 - 顺路）。
 - 88K flaky 本质同上：True/False 是数值蝴蝶样本 - 机制判据应改用场层指标（needle 在场率/rank/覆盖），那些已证明确定且健康。
 - 下一步：电池判据重定义（机制指标）+ spec4×D 单独审计（那个 0/4 是系统性，不是蝴蝶）。
 - 预算：2 boots（含 crash 重启），停。
+
+## 70. Round 50：spec4×D 病灶定位到最后一段：bridge 排空时机 vs 末 chunk 折叠
+
+- 对照实验（同 promptÌ）：spec0 场 `block_scores_len=49Ì, top8=克隆尾, needle 1.96/rank23, True` vs spec4 场 `len=24 (collapse), rank1=16 头部, needle 不在场 (-1), False`。
+- fold 序列铁证：prefill 35 chunk 全部折叠、零 gap、重复对齐——**中段 K 统计健康**（39 地盘被普通 chunk 正确覆盖）。场塌源必在 spec4 的**末 chunk 步×bridge 排空时机**：downtime 后的 drain 与 harvest 先后关系在 MTP 开启时不同（或 KEY_ROWS_LIMIT 被 draft 步钉在1），末 chunk 行被流排空/截断 → query 仅剩残缀 → 头部场取代克隆尾场（所有形态皆容）。
+- 下轮探针：末 chunk 步事件旁发 `bridge_pending_rows / KEY_ROWS_LIMIT / 本步 drain 行数` 三元组（两臂×1 发），一发定流排时机。
+- 预算：2 boots 用完。生产恢复 spec4/PLAN_D=0。
