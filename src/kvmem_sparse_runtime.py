@@ -4429,6 +4429,16 @@ class VllmSparseRuntime:
                         _ord0 = sorted(_sc0, key=lambda x: -_sc0[x])
                         _sink_hi0 = sink_blocks * q
                         _rec_lo0 = max(0, n_blocks - recent_blocks) * q
+                        _probe_rec = getattr(self, "log", None)
+                        if _probe_rec is not None:
+                            _probe_rec({"kind": "d_harvest_shape",
+                                        "req": str(req)[-6:],
+                                        "lc_len": len(_lc0),
+                                        "blocks_scored": len(_sc0),
+                                        "sink_hi": int(_sink_hi0),
+                                        "rec_lo": int(_rec_lo0),
+                                        "q": int(q), "pt": int(pt),
+                                        "n_blocks": int(n_blocks)})
                         _mid_kept = sorted(int(b) for b in _ord0
                                            if _sink_hi0 <= int(b) * q < _rec_lo0)
                         _lmp0[req] = _mid_kept
@@ -4436,8 +4446,12 @@ class VllmSparseRuntime:
                             self.log({"kind": "d_stats_asset_harvested",
                                       "req": str(req)[-6:],
                                       "blocks": _mid_kept[:12]})
-                except Exception:
-                    pass
+                except BaseException as _hexc:
+                    if self.log is not None:
+                        self.log({"kind": "d_harvest_error",
+                                  "req": str(req)[-6:],
+                                  "error": str(_hexc)[:200],
+                                  "tb": __import__("traceback").format_exc()[-260:]})
         core = None
         try:
             core = orch.core_selection_scores(

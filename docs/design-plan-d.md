@@ -816,3 +816,11 @@ skip=不重放只装视图 - 顺路）。
 - 250K 读数修正认知：其 top8=[148, 71, 72, 73, 146, 138, 140, 145] - **问题分数并不差**（needle@75 在块 71-73 邻域进 top8！），flaky 属 decode 期其它刀回滚视图（round-robin 未验证该臂）。
 - **下轮单诊断（一次 boot 定生死）**：把 harvest 的 except 全改出声 + 打印 `hasattr(orch,"_last_core")` 与 pressure 路径的 core fetch 结果是否落 `_last_core`；同时验证 250K 是否只需 final 刀后再无 MID（terminal lock 在 250K 的覆盖度）。
 - 预算纪律：本轮 8 boots，停止。
+
+## 55. Round 40：harvest 代码在、事件零 - `_last_core` 为空是唯一静默路径（下轮 orch 身份结案）
+
+- 诊断面（kb148/149 两 boot）：d_final_merge 有、d_harvest_error 零、d_harvest_shape 零、d_stats_asset_harvested 零、d_question_core_missing 零、d_query_trim 零。
+- 逐分支排除：harvest 代码存在（4406-4448，awk 窗口曾误导）；事件全哑 = **`getattr(orch,"_last_core")` 恒 None/空**（shape 日志深在 `if _lc0` 块内，lc 空则整段无声 - 这条日志放置本身是个设计错误，事件应在判空前无条件出）。
+- 矛盾点：MID 刀 applied×10 的 kept 明显含中间块（vis 26-28K）→ 它们的 core fetch 成功 → `orch._last_core=list(core)` 应写进同一 per-req orch 对象 → final 刀读同一 `self._orch[req]` 却为空。候选：(a) MID 路径的 orch 与 final 的**不同实例**（per-call 重建?）；(b) MID 刀走了另一函数（3866/3668 的 core 直接喂 kept 不经 orch 属性）；(c) 赋值在 return 之后不可达。
+- **下轮单发**：在 orch 属性写/读两侧各放一条 `id(orch)` + pid 事件，一发定实例身份；同时把 harvest 的 shape 日志提到判空之前（诊断卫生）。
+- 本轮 3 boots；生产恢复 spec4/PLAN_D=0。
