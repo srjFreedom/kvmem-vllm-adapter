@@ -883,3 +883,10 @@ skip=不重放只装视图 - 顺路）。
 - **方法论定案**：D 协议层（刀/锁/共识/安装）全绿且被 v0.5.2 生产臂的对比证明必要；剩余全部 flaky 与 D 协议无关，在**检索打分器对电池自相似结构的无力** - v0.5.2 用 child rebuild 掩盖了它（全量重 prefill 使 needle 进 GDN）。D 若"不留兼容"，这个打分器弱点就是必须直面的**正主问题**：要么纯问句 query（治稀释），要么接受检索天花板并把 R3 的 D6 re-eval 作为电池的一部分。
 - 生产臂 152K 本轮也 False（spec0 误配 + spec4 正常时未测）- 明日回归测试须覆盖生产臂 152K 对照。
 - 预算：本轮 4 boots，停。
+
+## 65. Round 45 终节：自相似电池的死结被完全解剖（附死锁证明链）
+
+- 今日修复（全部保留，各自正确）：tie-break by block id；runtime hint 断链修复（force_tail 首响，纯问句 query 实测 rank 23）；问句刀 resident middle 保全；保险槽；nb2/rank/score drift 仪表。
+- **drift 仪表五连发：rank=23 纹丝不动**（order 完全确定）→ flaky 源不在排序、不在数值（±0.03 分不动名次）——**在 MID 场本身**：MID 刀的 query=当步 chunk 行（recency 场），其中间 10 槽每刀滚到最新 chunk 区，**问题刀保全它时保全的是"chunk-18 邻域"而非 needle**；True 发=某 MID 刀 query 恰好扫过 needle 区。88K 2/4 由此完全解释。
+- **死结（本节的证明价值）**：能稳定识别 needle 的 query 只有问句文本；问句文本的检索场被 90 个同文 clone 块霸榜（rank23）；chunk-query 有 recency 偏置不能稳定含 needle；**统计检索通道在自相似电池上没有可靠解** —— v0.5.2 过电池靠 child rebuild 把 needle 挤进 GDN 全量状态；**D 的 GDN 本来就在吃全量**（True 发证明状态里挖得出），但 attention 是检索的唯一输出通道——**两阶段自举检索**（第一轮问句 top18 视图生成 8 token，第二轮用含 needle 片段的输出行当 query）是打破死锁的下一个设计选项（约一轮工程），或在电池判据上接受"检索天花板"并把 D6 re-eval 列为验收部件。**两个选择都是设计决策，非 bug 修。**
+- 电池现状：88K 2/4（保全版），152K 0/1 同版，250K 未测新方案。协议层全绿不变。生产臂已恢复。

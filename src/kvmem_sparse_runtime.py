@@ -4400,8 +4400,31 @@ class VllmSparseRuntime:
         recent_blocks = max(1, -(-int(getattr(self, "recent_tokens", 0) or 0) // block_tokens))
         if sink_blocks + recent_blocks >= budget_blocks:
             recent_blocks = max(1, budget_blocks - sink_blocks - 1)
+        # design 65 final causal chain (all five drift runs rank 23
+        # identically - ordering was never the flaky source): the MID
+        # knives already keep the needle middle in the view at prefill
+        # (88K True runs = the statistics knife hit); the QUESTION knife
+        # then RE-PICKS the middle from scratch and its top-18 clone band
+        # EVICTS the resident needle pages. The question knife must
+        # therefore PRESERVE the current view's middle blocks and spend
+        # only the INCREMENT of question hits, never a full replace.
+        _question_preserve = not bool(pressure)
         kept = set(range(min(sink_blocks, n_blocks))) \
             | set(range(max(0, n_blocks - recent_blocks), n_blocks))
+        if _question_preserve:
+            # inherit the resident middle (the statistics view's picks -
+            # deterministic per-run set, NOT a score threshold - no new
+            # mechanism, this is the same view-continuity the MID knives
+            # already practice between themselves)
+            try:
+                _res_mid = {int(pg) // max(1, int(q)) for pg in (st.logical or ())}
+                _res_mid = {b for b in _res_mid
+                            if sink_blocks <= b < max(0, n_blocks - recent_blocks)}
+                kept |= _res_mid
+            except BaseException as _pex:
+                if self.log is not None:
+                    self.log({"kind": "d_preserve_error", "req": str(req)[-6:],
+                              "error": str(_pex)[:150]})
         kept.add((n_pages - 1) // q)                     # Core validates the tail page
         # two-tier final view (design 52): question ranking alone cannot
         # separate the needle - the battery tail IS a clone of the
@@ -4531,6 +4554,20 @@ class VllmSparseRuntime:
                                   "tb": __import__("traceback").format_exc()[-260:]})
         core = None
         _core_src = "none"
+        if not bool(pressure):
+            # pure-question query (design 64): demand the CAPTURED tail of
+            # the question rows (env KVMEM_QUERY_TAIL rows, default 96)
+            # instead of the live last-chunk bridge - the wiring on the
+            # orchestrator side existed but the runtime half was lost in
+            # the round-39/40 recovery checkouts, which is why the trim
+            # probe never fired in four rounds of "testing" it.
+            try:
+                _ft = int(__import__("os").environ.get(
+                    "KVMEM_QUERY_TAIL", "96") or 96)
+                if _ft > 0:
+                    orch._force_captured_tail = _ft
+            except Exception:
+                pass
         try:
             core = orch.core_selection_scores(
                 raw=bool(getattr(self, "d_mode", False)))
@@ -4589,9 +4626,14 @@ class VllmSparseRuntime:
                     try:
                         _nb = int(tokens // 1024)  # needle-adjacent block guess
                         _nb2 = int(tokens * 0.5) // 1024 if int(tokens) > 100000 else 39
+                        _nb2 = int(tokens * 0.5) // 1024 if int(tokens) > 100000 else 39
                         _core0 = [int(b) for b in order[:8]]
                         self.log({"kind": "d_final_scores", "req": req,
                                   "core_src": _core_src,
+                                  "nb2": _nb2,
+                                  "needle_score": round(block_scores.get(_nb2, -1.0), 6) if block_scores else None,
+                                  "needle_rank": (sorted(block_scores, key=lambda x: (-block_scores[x], x)).index(_nb2) if block_scores and _nb2 in block_scores else -1),
+                                  "rank1_score": round(max(block_scores.values()), 6) if block_scores else None,
                                   "core_len": len(core),
                                   "n_blocks": n_blocks,
                                   "top8": _core0,
