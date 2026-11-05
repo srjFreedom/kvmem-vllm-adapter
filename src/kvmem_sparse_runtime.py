@@ -4422,7 +4422,7 @@ class VllmSparseRuntime:
         _mid_blocks_q = None
         if not bool(pressure):
             try:
-                _lcq = getattr(orch, "_last_core", None)
+                _lcq = (getattr(self, "_stats_core_by_req", None) or {}).get(req)
                 if _lcq is not None and len(_lcq):
                     _gpq = max(1, int(getattr(orch, "select_block_tokens",
                                               1024) or 1024) // int(pt))
@@ -4548,6 +4548,15 @@ class VllmSparseRuntime:
                 _core_src = "fallback-lastcore"
         if core is None and self.log is not None:
             self.log({"kind": "d_question_core_missing", "req": str(req)[-6:]})
+        if bool(pressure) and core is not None:
+            # statistics-era vector, kept SEPARATELY from _last_core (the
+            # final knife overwrites _last_core with the question field,
+            # which is why every earlier "stats asset" read actually read
+            # the question vector and produced junk ranks 7-8)
+            _sc = getattr(self, "_stats_core_by_req", None)
+            if _sc is None:
+                _sc = self._stats_core_by_req = {}
+            _sc[req] = list(core)
         # Unified consensus protocol (helper handles D sanitize vs strict collective)
         if core is not None and len(core):
             core = self._core_consensus(orch, core, req, int(st.tokens),
@@ -4579,6 +4588,7 @@ class VllmSparseRuntime:
                 if (not bool(pressure)) and self.log is not None:
                     try:
                         _nb = int(tokens // 1024)  # needle-adjacent block guess
+                        _nb2 = int(tokens * 0.5) // 1024 if int(tokens) > 100000 else 39
                         _core0 = [int(b) for b in order[:8]]
                         self.log({"kind": "d_final_scores", "req": req,
                                   "core_src": _core_src,
@@ -4625,8 +4635,16 @@ class VllmSparseRuntime:
                 # union hypothesis is dead: the statistics asset never
                 # contains the needle at deep water.
                 _seq = order
-                if False and _mid_blocks_q:
-                    _seq = [b for b in _mid_blocks_q] + list(order)
+                if _mid_blocks_q:
+                    # insurance slots AFTER the question ranking: the
+                    # question field at 88K puts the needle block rank
+                    # 9-12 with room=10 (frontier of one slot); the
+                    # statistics field ranks it 3rd - appending its top
+                    # middle blocks after question top-k fills the LAST
+                    # room slots with cross-view insurance and cannot
+                    # displace any question pick
+                    _seq = (list(order)[:max(0, room - len(_mid_blocks_q))]
+                            + [b for b in _mid_blocks_q])
                 if _mid_kept_blocks:
                     _seenq = set(order)
                     _mrest = [bb for bb in _mid_kept_blocks]
