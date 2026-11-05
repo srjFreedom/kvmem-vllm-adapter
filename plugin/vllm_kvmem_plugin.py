@@ -3236,6 +3236,17 @@ def _install(cls, module_name, probe, smoke, state):
         if _rtb is not None:
             self.kvmem_pre_sample_hook = (
                 lambda: _rtb.d_question_knife_seam(scheduler_output))
+            # design 42 step 1: recurrent-state snapshot BEFORE the
+            # completing forward (restore handle for the R3.2b replay).
+            try:
+                _rtb.d_preflight_snapshot(scheduler_output)
+            except BaseException as _pex:
+                # LOUD (design 42): a swallowed exception here would make
+                # the whole re-eval chain silently absent.
+                with open("/tmp/kvmem_preflight_err.txt", "a") as _pef:
+                    _pef.write(repr(_pex)[:240] + "\n"
+                               + __import__("traceback").format_exc()[-420:]
+                               + "---\n")
         result = original(self, scheduler_output, *args, **kwargs)
         try:
             _exs = state.get("_exs", None)

@@ -693,3 +693,23 @@ skip=不重放只装视图 - 顺路）。
 - 施工序：R3.2a 快照/回置 + 单元（假 completion 步离线 round-trip 状态恒等）→
   R3.2b 自递归重放 + 二次效应旗标 + 输出替换 → R3.3 88K 全链 + coin/logits
   双证（第一 token 出生视图 needle_in_view=1）→ R3.4 电池。
+
+
+## 43. Round 32：R3.2a 完成 - 状态快照在线运转（48 tensor/请求/完成步）
+
+- `d_state_snapshot/d_state_restore` + `d_preflight_snapshot`（完成步 forward 前）
+  端到端验证：`d_preflight_snap row 0 tensors 48`（双 rank 各一次）。
+- 施工中学到的三个接口真值（全部由探针链逼出，非猜测）：
+  1. `runner.input_batch.req_id_to_index` 在 execute_model **入口不可用**
+     （V2 内部才 build）→ 行号改用 `st.row_index`（view.row_index）；
+  2. `BlockTables` 不可下标 → 真接口 `runner.block_tables.block_tables[gid].gpu`
+     （live view 同源）；
+  3. `MambaSpec` 是 frozen dataclass（单元用 object.__setattr__ 构造）。
+- 快照覆盖=48 mamba 层（conv+ssm 同 tensor 家族），attention 缓存**故意不快照**
+  （位置键写、幂等重放自然复原）。
+- 离线：state_snapshot 单元 5/5 新入列（graceful None/只选 mamba 组/round-trip
+  恒等/行→块列 0 解析/部分失败计数）；全套 11 项绿。
+- 下轮 R3.2b：seam 刀安装后 **restore→重放同一 scheduler_output→wrapper 处
+  用重放 output 替换**；重放旗标封 view_lens advance/harvest/engine-notes。
+- 取证方法自白：本轮 6 次 boot 全部是"一发一断"纪律执行——每次只测一个未知，
+  零假设叠加零猜测。

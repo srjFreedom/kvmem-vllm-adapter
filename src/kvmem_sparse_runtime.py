@@ -1857,6 +1857,168 @@ class VllmSparseRuntime:
         """Requests the runtime still holds state for (for the worker-side sweep)."""
         return list(self._orch.keys())
 
+    def d_state_snapshot(self, row):
+        """D6 re-eval primitive (design 42, step 1): snapshot the request's
+        FULL recurrent state (every mamba/GDN layer: conv window + ssm tile,
+        main column) on the completion step BEFORE the forward that consumes
+        the last chunk. Returns [(cache_tensor_ref, block_id, cpu/GPU clone)]
+        - restore writes the clones back. Under spec0 the state occupies one
+        column; block id is group-table col 0 for the row. Attention caches
+        are deliberately NOT snapshotted: their writes are position-keyed
+        and idempotent (same tokens, same slots -> same bytes), so a replay
+        needs no KV rollback - only the recurrent state advances non-
+        idempotently. Returns None if the runner lacks the layout needed."""
+        runner = getattr(self.view, "runner", None)
+        if runner is None or row is None:
+            return None
+        try:
+            from vllm.v1.kv_cache_interface import MambaSpec
+            caches = getattr(runner, "kv_caches", None)
+            _lay = [hasattr(runner, "kv_cache_group_ids"),
+                    hasattr(runner, "kv_cache_config"),
+                    hasattr(runner, "block_tables")]
+            if not all(_lay) and self.log is not None:
+                self.log({"kind": "d_snap_layout_miss", "have": _lay})
+            _mseen = getattr(self, "_snap_trace", None)
+            if _mseen is None:
+                _mseen = self._snap_trace = [0]
+            _tr = self.log is not None and _mseen[0] < 4
+            gids = getattr(runner, "kv_cache_group_ids", None)
+            groups = getattr(
+                getattr(runner, "kv_cache_config", None),
+                "kv_cache_groups", None)
+            bts = getattr(runner, "block_tables", None)
+            if not caches or not gids or not groups or bts is None:
+                return None
+            # BlockTables is not subscriptable; per-group row tables live
+            # at .block_tables[gid].gpu (same accessor the live view uses).
+            _group_rows = getattr(bts, "block_tables", None)
+            if _group_rows is None:
+                return None
+            snap = []
+            for cache, gid in zip(caches, gids):
+                spec = getattr(groups[gid], "kv_cache_spec", None)
+                if not isinstance(spec, MambaSpec):
+                    continue
+                try:
+                    t = _group_rows[gid].gpu
+                    blk = int(t[row, 0])
+                except Exception as _bex:
+                    if _tr:
+                        _mseen[0] += 1
+                        self.log({"kind": "d_snap_stage", "stage": "blk_exc",
+                                  "gid": gid, "err": str(_bex)[:100]})
+                    return None
+                if blk < 0:
+                    if _tr:
+                        _mseen[0] += 1
+                        self.log({"kind": "d_snap_stage", "stage": "blk_neg",
+                                  "gid": gid, "blk": blk})
+                    return None
+                if _tr:
+                    _mseen[0] += 1
+                    self.log({"kind": "d_snap_stage", "stage": "blk_ok",
+                              "gid": gid, "blk": blk,
+                              "shape": list(cache.shape)})
+                snap.append((cache, blk, cache[blk].clone()))
+            if _tr:
+                self.log({"kind": "d_snap_stage", "stage": "done",
+                          "tensors": len(snap),
+                          "groups_total": len(groups)})
+            return snap or None
+        except Exception:
+            if self.log is not None:
+                self.log({"kind": "d_state_snapshot_error",
+                          "error": __import__("traceback").format_exc()[-240:]})
+            return None
+
+    def d_state_restore(self, snap):
+        """Write a snapshot back (restore to the cursor). Pairing with a
+        replay is MANDATORY (design 42 step 4): restored state without the
+        tail re-forward would skip the last chunk in GDN forever. Returns
+        the number of tensors restored."""
+        if not snap:
+            return 0
+        n = 0
+        for cache, blk, val in snap:
+            try:
+                cache[blk].copy_(val)
+                n += 1
+            except Exception:
+                pass
+        if self.log is not None:
+            self.log({"kind": "d_state_restore", "restored": int(n),
+                      "of": len(snap)})
+        return n
+
+    def d_preflight_snapshot(self, scheduler_output):
+        """Design 42 step 1 wiring: BEFORE the completing forward, snapshot
+        the recurrent state of every request this step will finish. The
+        snapshot is the replay's restore handle (R3.2b pairs restore + tail
+        replay atomically; restore alone NEVER happens - GDN would skip the
+        chunk). Cheap: one GPU clone per mamba layer for at most one request
+        per step."""
+        if not getattr(self, "d_mode", False):
+            return
+        _pe = getattr(self, "_pf_entry", None)
+        if _pe is None:
+            _pe = self._pf_entry = [0]
+        _pe[0] += 1
+        if _pe[0] <= 3 and self.log is not None:
+            self.log({"kind": "d_pf_entry", "call": _pe[0],
+                      "d_mode": True,
+                      "pid": __import__("os").getpid()})
+        try:
+            ns = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+        except Exception:
+            return
+        runner = getattr(self.view, "runner", None)
+        if runner is None:
+            if self.log is not None and _pe[0] <= 5:
+                self.log({"kind": "d_pf_nolayout", "why": "runner_none"})
+            return
+        # row index comes from the view's OWN book (the runtime keeps
+        # st.row_index per request via bind_step) - runner.input_batch is
+        # not populated at execute_model ENTRY under V2 (it is built inside
+        # original()), which made the previous ridx lookup raise every step
+        # (d_pf_nolayout:ridx_exc). The view row is the correct source and
+        # matches what d_state_snapshot's block-table row needs.
+        row_of = getattr(self.view, "row_index", None)
+        for rid, n_new in ns.items():
+            st = self._state.get(rid)
+            if st is None or getattr(st, "d_question_cut", False):
+                continue
+            pl = int(self._prompt_len.get(rid, 0) or 0)
+            if not pl or int(st.tokens) + int(n_new) < pl:
+                continue
+            if int(st.tokens) <= int(self.budget_tokens) + 4096:
+                if self.log is not None and pl:
+                    self.log({"kind": "d_gate_trace", "req": str(rid)[-6:],
+                              "gate": "dense", "tokens": int(st.tokens)})
+                continue
+            try:
+                row = int(row_of(rid)) if callable(row_of) else None
+            except Exception:
+                row = None
+            if row is None or row < 0:
+                if self.log is not None:
+                    self.log({"kind": "d_gate_trace", "req": str(rid)[-6:],
+                              "gate": "no_row"})
+                continue
+            snap = self.d_state_snapshot(int(row))
+            if snap is None and self.log is not None:
+                self.log({"kind": "d_gate_trace", "req": str(rid)[-6:],
+                          "gate": "snap_none", "row": int(row)})
+            if snap is not None:
+                _snaps = getattr(self, "_d_snaps", None)
+                if _snaps is None:
+                    _snaps = self._d_snaps = {}
+                _snaps[rid] = snap
+                if self.log is not None:
+                    self.log({"kind": "d_preflight_snap",
+                              "req": str(rid)[-8:], "row": int(row),
+                              "tensors": len(snap)})
+
     def d_question_knife_seam(self, scheduler_output):
         """Design 39-A: install the question view on the completion step,
         BEFORE the sampler runs. Trigger: a scheduled chunk whose step
