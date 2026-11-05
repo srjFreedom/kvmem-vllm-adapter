@@ -832,3 +832,18 @@ skip=不重放只装视图 - 顺路）。
 - 根因层次修正：所有 union 都在治"needle 不在 kept"的表症；真层在**打分器对 tail 复读段的偏好**（clone 块 90/89/88 无论什么 query 都霸榜 - 它们的 K 与任何"最近读过的文本"都高相似）。**下一步进打分层**：block_scores 的近重复降权（对 top-N 相邻块做冗余惩罚，MID/FINAL 两臂共用），或者问题向量只取纯问句（force_tail 探针 5 boots 零事件 - trim 从未真正执行，那条路本身没测过）。这是 v0.5.x 也存在的共同天花板（当年靠 child rebuild 全量重 prefill 绕过，D 必须直球解决）。
 - 电池现状（诚实版）：88K flaky（约五五开）、152K/250K False、协议层 10/0 与 causal 保险丝不动。
 - 预算：3 boots，停。
+
+## 57. Round 42：窗口混叠冤案 - 152K 在纯基线（无 union）已过线 True
+
+- 判读事故：kb153 窗口把 88K×2 与 152K 的事件混在一起读，`core_scores top=[633..]` 实为 88K 的请求（frontier 45056=88K 首刀时刻）；`applied vis 12128` 全是 88K 形态 - **152K 那一发当时根本没跑到问题刀**（run 被 timeout 截断）。"union 四连败"的部分判决被这条混叠污染。
+- 纯基线重跑（union 停用、env 干净、同 boot）：**152K needle=True**（"…code ZX-4417-QJ7 filed under vault M-118"完整句）+ 问题刀 enter tokens=143134 pressure=False 全链在案。
+- **推翻/确立**：round-41 的"union 全灭"结论降级 - 对照实验里 152K 的 False 从未被干净测过（每次都混在别的 run 窗口/别的代码状态里）。正确事实待四连发：152K x2 + 88K x3 - 若稳定则基线（无 union、RR fill 保留、stats fallback 恢复）就是当前最优配置；88K 的 flaky 带也需这轮样本重定。
+- 教训条律（第八律）：**电池判读必须按请求 rid+prompt 长度隔离事件窗口，跑一发判一发**；混窗判读已经两次（round-27 分组、本轮窗口）制造假结论。
+
+### 57b. 基线电池定案读数（kb153 boot，零重启连打七发）
+
+- 88K: True / True / True（x1 115.6s、x2 82.2s、x3 115.6s）
+- 152K: True / True（204.4s、153.4s）
+- 250K: False x1（290.2s）
+- **定案：无 union 基线（stats fallback 恢复 + RR 保留）就是 D 迄今最优配置** - round-41 全部 union 变体都被这次干净对照判死。
+- 250K 待解剖（下一个独立缺口）：其问题刀 top8=[148, 71,72,73,146,138,140,145] 与 needle 块的真实对应需要先校准重建版 250K 数据的 needle 块号（我 39/69 的公式对 250K 未验），再判"挤掉/低分/未入场"。电池余一站。
