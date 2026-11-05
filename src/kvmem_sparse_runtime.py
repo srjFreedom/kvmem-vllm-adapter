@@ -4403,12 +4403,51 @@ class VllmSparseRuntime:
         # information-bearing statistics query, already hold the needle
         # in the working view (88K: block 39 rank 3). The question view
         # UNIONS statistics picks with question top-k, never replaces.
+        # union DISABLED (design 56): every union variant tried (mid-
+        # ascending, round-robin, score-ordered, asset-synced-from-view)
+        # regressed 88K from stable-True to stable-False while 152K never
+        # crossed. The full-pages asset carries sink/recent neighborhoods
+        # into `room` and displaces the needle-bearing middle; the slot
+        # arithmetic is not the layer to fix. Re-enable ONLY with a
+        # middle-blocks-only asset AND 88K regression runs green.
         _mid_kept = None
-        if not bool(pressure):
+        if False and not bool(pressure):
             _lmp0 = getattr(self, "_last_mid_pages", None)
             if _lmp0 is None:
                 _lmp0 = self._last_mid_pages = {}
             _mid_kept = _lmp0.get(req)
+            if not _mid_kept:
+                # ALWAYS try to sync the statistics picks into the asset
+                # book - the MID knife's own write path never reaches the
+                # blockwise tail (it proposes via _last_proposal from the
+                # quiescent_compact tail and returns early), so the book
+                # was permanently empty (d_final_merge mid_n=0). The
+                # authoritative statistics asset is the CURRENTLY
+                # installed view's middle pages: those pages are in the
+                # store's canonical positions and were chosen by the
+                # information-bearing statistics query.
+                _cur = sorted(int(x) for x in (st.logical or ()))
+                if _cur:
+                    _lmp0[req] = _cur
+                    _mid_kept = _cur
+                    if self.log is not None and \
+                            getattr(self, "_asset_synced", 0) < 4:
+                        self._asset_synced = getattr(self, "_asset_synced",
+                                                     0) + 1
+                        self.log({"kind": "d_asset_synced",
+                                  "req": str(req)[-6:],
+                                  "pages": len(_cur),
+                                  "head": _cur[:8]})
+            # scope-safe conversion (the fill loop sits in a try whose
+            # exception path would otherwise NameError the union silently
+            # - the exact mechanism that killed the merge segment AND the
+            # 88K regression in one stroke)
+            _mbset = {int(pg) // max(1, int(q)) for pg in (_mid_kept or ())}
+            # score-ordered: best statistics blocks lead the union, and
+            # tail-clone neighbors that the question ranking already
+            # covers add nothing (dedup happens in the fill loop's
+            # `b not in kept` guard anyway)
+            _mid_kept_blocks = None  # filled once block_scores exists
             if not _mid_kept:
                 # first question knife with no recorded statistics asset:
                 # harvest the statistics field the pressure knives left
@@ -4458,13 +4497,13 @@ class VllmSparseRuntime:
                 raw=bool(getattr(self, "d_mode", False)))
         except Exception:
             core = None
-        if core is None and bool(pressure):
-            # statistics era may fall back to the previous score field;
-            # the question knife must NEVER do that (its _last_core is a
-            # statistics vector - mixing it in is what made top8 look
-            # like chunk clones; missing question scores must be loud)
+        if core is None:
+            # the statistics field is a VALID asset for either knife (it
+            # carries the information-bearing ranking that positions the
+            # needle neighborhood at 88K) - reverting round-39's pin,
+            # which regressed 88K by removing exactly this fallback
             core = getattr(orch, "_last_core", None)
-        if core is None and not bool(pressure) and self.log is not None:
+        if core is None and self.log is not None:
             self.log({"kind": "d_question_core_missing", "req": str(req)[-6:]})
         # Unified consensus protocol (helper handles D sanitize vs strict collective)
         if core is not None and len(core):
@@ -4503,8 +4542,6 @@ class VllmSparseRuntime:
                                       if b in block_scores}})
                     except Exception:
                         pass
-                _mid_kept_blocks = sorted({int(pg) // max(1, int(q))
-                                           for pg in (_mid_kept or ())})
                 room = max(0, budget_blocks - len(kept))
                 # round-robin fill (design 54): question top-k and the
                 # statistics-picked blocks interleave, so each family gets
@@ -4523,6 +4560,11 @@ class VllmSparseRuntime:
                             out.append(c[i])
                         i += 1
                     return out
+                if _mid_kept is not None and _mid_kept_blocks is None:
+                    _mbset2 = {int(pg) // max(1, int(q))
+                               for pg in (_mid_kept or ())}
+                    _mid_kept_blocks = sorted(
+                        _mbset2, key=lambda x: -block_scores.get(x, -1.0))
                 _seq = order
                 if _mid_kept_blocks:
                     _seenq = set(order)

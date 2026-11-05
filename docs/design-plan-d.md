@@ -824,3 +824,11 @@ skip=不重放只装视图 - 顺路）。
 - 矛盾点：MID 刀 applied×10 的 kept 明显含中间块（vis 26-28K）→ 它们的 core fetch 成功 → `orch._last_core=list(core)` 应写进同一 per-req orch 对象 → final 刀读同一 `self._orch[req]` 却为空。候选：(a) MID 路径的 orch 与 final 的**不同实例**（per-call 重建?）；(b) MID 刀走了另一函数（3866/3668 的 core 直接喂 kept 不经 orch 属性）；(c) 赋值在 return 之后不可达。
 - **下轮单发**：在 orch 属性写/读两侧各放一条 `id(orch)` + pid 事件，一发定实例身份；同时把 harvest 的 shape 日志提到判空之前（诊断卫生）。
 - 本轮 3 boots；生产恢复 spec4/PLAN_D=0。
+
+## 56. Round 41：union 全灭判决 + 基线诚实化（88K 本就是 flaky）
+
+- 四种 union（mid-ascending / round-robin / score-ordered / asset-synced-view）实测：**152K 无一过线，88K 反而从 3×True 滑向全 False** - slot 层调参宣告失败并全部停用（`if False` 门保留代码+重开条件：middle-only 资产 **且** 88K 回归跑绿）。
+- 基线归位（去 env 残留 + union 停用）后 88K x1 False / x2 True - **此前的"三轮连 True 稳定"证伪：88K 一直处在 flaky 带内**，union 只是把概率推向坏侧。接受这个真相比接受一个假绿灯有价值。
+- 根因层次修正：所有 union 都在治"needle 不在 kept"的表症；真层在**打分器对 tail 复读段的偏好**（clone 块 90/89/88 无论什么 query 都霸榜 - 它们的 K 与任何"最近读过的文本"都高相似）。**下一步进打分层**：block_scores 的近重复降权（对 top-N 相邻块做冗余惩罚，MID/FINAL 两臂共用），或者问题向量只取纯问句（force_tail 探针 5 boots 零事件 - trim 从未真正执行，那条路本身没测过）。这是 v0.5.x 也存在的共同天花板（当年靠 child rebuild 全量重 prefill 绕过，D 必须直球解决）。
+- 电池现状（诚实版）：88K flaky（约五五开）、152K/250K False、协议层 10/0 与 causal 保险丝不动。
+- 预算：3 boots，停。
