@@ -4155,8 +4155,9 @@ class VllmSparseRuntime:
             grid_pages = max(1, int(getattr(orch, "select_block_tokens", 2 * pt)
                                     or 2 * pt) // pt)
             block_scores: dict[int, float] = {}
+            _sel_real2 = max(1, int(round(int(tokens) / max(1, len(core)))))
             for gi, v in enumerate(core):
-                b = (gi * grid_pages) // q
+                b = (gi * _sel_real2) // max(1, int(block_tokens))
                 try:
                     block_scores[b] = block_scores.get(b, 0.0) + float(v)
                 except (TypeError, ValueError):
@@ -4600,8 +4601,18 @@ class VllmSparseRuntime:
                 grid_pages = max(1, int(getattr(orch, "select_block_tokens", 2 * pt)
                                         or 2 * pt) // pt)
                 block_scores = {}
+                # derive the REAL statistics-block size from the vector the
+                # scorer produced (frontier / len(core)) instead of trusting
+                # select_block_tokens, which disagreed with the statistics
+                # content (config 32 vs actual 64-token buckets) and made
+                # b = (gi*grid_pages)//q collapse coverage to engine blocks
+                # 0..23 at q=101 while yielding the intended 0..48 only in
+                # the stale-boot accident q=49 - the true root cause behind
+                # the "spec4 field collapse" that was in fact arm-neutral.
+                _sel_real = max(1, int(round(int(tokens) / max(1, len(core)))))
+                _blk_real = max(1, int(block_tokens))
                 for gi, v in enumerate(core):
-                    b = (gi * grid_pages) // q
+                    b = (gi * _sel_real) // _blk_real
                     try:
                         block_scores[b] = block_scores.get(b, 0.0) + float(v)
                     except (TypeError, ValueError):

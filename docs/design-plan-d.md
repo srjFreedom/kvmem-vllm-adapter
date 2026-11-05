@@ -954,3 +954,10 @@ skip=不重放只装视图 - 顺路）。
 - **实验否定**：单位修正后 len 仍 24 → gi 的索引空间本来就是 ENGINE-block（core 按引擎块出分，1178≠统计块数的直觉），原公式没错。推演里把 recall.scores 的 blocks 参数（cdiv(frontier, block)）与 core 长 1178 的关系读反了 - 修正已 git checkout 回滚，工作树干净。
 - 修正后的剩余事实（下一步的正确切口）：len=24 = core 的**有效非零段短**或 scores 的 blocks 参数在 spec4 传入偏小 - 下一发在 recall.scores 入出口记 `len(core), len(layer_rows), len(stats)` 三值对表即可分辨（spec0 vs spec4 各读一次，现成双 boot 数据在 kb189/kb190，补一组入口事件）。
 - 本轮 4 boots（unit-fix boot 超支），停。生产恢复中。
+
+## 74. Round 53：覆盖修复实锤生效（len 24→92 全覆盖），新切口=问句质量
+
+- 决定性推导：spec0-era len=49 系 **stale boot 参数巧合**（q=49 时 2gi//49 恰≈gi/24.5 正确值），新 boot q=101 下 2gi//101 把覆盖腰斩到 24 - 两臂同病、spec4 冤案坐实（前轮"spec4 系统性缺陷"读数全部作废，归因为 boot 参数代际）。
+- 修复=从 vector 自身反推真实统计块大小（frontier//len(core)），两站点统一；152K 场 len=92/92 **全覆盖**，离线 5/5。
+- 新读数：needle rank 51（场全了但分数排不进前 18）- 病灶移交**问句质量层**：152K 问句 15 token 摊在 512 行 live 窗里被稀释（纯问句 trim 路未接入 final 打分调用：qsh 显示 trim 生效于 captured 路，但 final 用的 source 是 bridge live - 接线差最后一环）。下一轮：final 打分强制 captured+纯问句窗（6-24 行），一发定 rank。
+- 预算：1 boot（电池 3 发），停。生产恢复中。
