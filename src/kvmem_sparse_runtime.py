@@ -4453,7 +4453,7 @@ class VllmSparseRuntime:
                 _mid_kept_blocks = sorted({int(pg) // max(1, int(q))
                                            for pg in (_mid_kept or ())})
                 room = max(0, budget_blocks - len(kept))
-                for b in ((sorted(_mid_kept_blocks, key=lambda x: -x)
+                for b in ((sorted(_mid_kept_blocks)
                            + [bb for bb in order]) if _mid_kept else order):
                     if room <= 0:
                         break

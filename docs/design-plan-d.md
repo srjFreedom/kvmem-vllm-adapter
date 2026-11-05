@@ -802,3 +802,9 @@ skip=不重放只装视图 - 顺路）。
 - **对策（施工中）= 两级视图**：D 的 MID 刀以统计 query 打分 - 88K 实测 needle block 39 rank 3（统计 query 含真实信息内容）；问题刀视图 = **统计 in-place 选块 ∪ 问题 top-k**（mid picks 先进 room，问题排名续填）- 保住 needle 邻域不被 tail-clone 挤掉。改动三处（scoped 在 _reselect_blockwise 内部）：记录 `_last_mid_pages[req]`（MID apply 时刻 logical 页集）、final 视图填块先 mid 后 order、`_mid_kept_blocks` 页→块换算。
 - 教训入档：三次锚事（wt1/wt2/b2）全因**同形代码存在于 quiescent 与 blockwise 两区** - 函数级编辑必须先切函数边界再匹配（本次 head/tail 分割法一次到位）。
 - 预算：本轮 7 boots 超支停止；union 验证=下轮第一发（152K+88K 双判）。
+
+## 53. Round 38 终节：D 电池首次双绿（152K+250K），88K flaky 定罪=room 抢占顺序
+
+- union 首验：**152K True**（答案完整句"…code is ZX-4417-QJ7 filed under vault M-118"）、**250K True** - D 臂首次过两发深水位；88K flaky（x1 False/x2 True，同 boot 同输入）。
+- flaky 机制定形：88K budget 48 块里 sink+recent 占 ~40，room 仅 ~8；mid blocks **ascending** 先吃 room=前排 sink 邻域块，把 order rank3 的 39 挤出去；152K room=10 反而够用（order 全 clones 顶前排时 mid 补位保命）。两向需求相反 → **静态顺序规则无解，必须按分数合并**（mid blocks 用 order 的分数加权排序，或 room 五五分）。下轮一发调参。
+- 里程碑如实：D 电池 152K/250K True（union era），88K 待稳定化；这已是方案 D 迄今最深验证（v0.5.2 同等长度靠 child rebuild，D 全程无 rewind 无 child）。
