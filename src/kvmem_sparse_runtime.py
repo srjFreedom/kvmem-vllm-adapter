@@ -1960,6 +1960,12 @@ class VllmSparseRuntime:
         per step."""
         if not getattr(self, "d_mode", False):
             return
+        # a replay must never snapshot again (it would overwrite the only
+        # good handle with post-restore values mid-flight)
+        _rb = getattr(getattr(self.view, "runner", None), "_d_replaying",
+                      False)
+        if _rb:
+            return
         _pe = getattr(self, "_pf_entry", None)
         if _pe is None:
             _pe = self._pf_entry = [0]
@@ -2043,6 +2049,14 @@ class VllmSparseRuntime:
                 continue  # dense view already covers the whole prompt
             try:
                 self._reselect_blockwise(rid, pressure=False)
+                # design 45: the R3.2b self-recursion replay is REMOVED -
+                # restore-to-cursor followed by a single completing step is
+                # NOT a re-eval: the middle of the last chunk would never be
+                # re-consumed by GDN (wrong end state, worse than no replay).
+                # The snapshot machinery stays (preflight + restore methods,
+                # offline-tested) for a future full tail re-prefill design.
+                # First diagnostic now: does the QUESTION VIEW actually reach
+                # attention? (kvmem_vl_mismatch evidence, fork-side hook.)
                 if self.log is not None:
                     self.log({"kind": "d_seam_local_knife", "req": str(rid)[-8:],
                               "tokens": int(st.tokens), "prompt": pl,

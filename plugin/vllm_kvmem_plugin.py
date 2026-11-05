@@ -3234,8 +3234,15 @@ def _install(cls, module_name, probe, smoke, state):
         # sampled token of a completing prompt under nosync scheduling.
         _rtb = state.get("sparse")
         if _rtb is not None:
-            self.kvmem_pre_sample_hook = (
-                lambda: _rtb.d_question_knife_seam(scheduler_output))
+            # design 45: the seam knife is DISARMED. It installs at the
+            # pre-sampler point - BEFORE after_step commits the last chunk
+            # to the store - so its restore copied UNCOMMITTED pages,
+            # breaking the R2b contract (a knife may only land after the
+            # quiescent flush). The question knife lands at step END (b)
+            # exactly as in the healthy 119.8s era; the remaining lesion is
+            # the read-path table disagreement (kvmem_vl_mismatch), which
+            # the seam never touched.
+            self.kvmem_pre_sample_hook = None
             # design 42 step 1: recurrent-state snapshot BEFORE the
             # completing forward (restore handle for the R3.2b replay).
             try:
@@ -3263,21 +3270,34 @@ def _install(cls, module_name, probe, smoke, state):
         except Exception:
             pass
 
+        # design 44: the replay (fired from the pre-sampler seam INSIDE the
+        # forward->sampler window of this step) stashed its sampler output -
+        # the FIRST TOKEN born inside the question view. Swap it in; the
+        # first run's tokens came from statistics-view logits. Only the
+        # OUTER frame swaps (replay frames return before the stash exists).
+        if not getattr(self, "_d_replaying", False):
+            _rp = getattr(self, "_d_replay_output", None)
+            if _rp is not None:
+                self._d_replay_output = None
+                result = _rp
+                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "d_replay_swapped", "pid": os.getpid()})
         # hold the NEXT step's base. view_lens advances by this step's write
         # count; a row without any knife advances 0 -> n -> num_computed, i.e.
         # identity for stock arithmetic. Delta is constant between knives.
-        if getattr(self, "kvmem_view_active", False):
-            try:
-                _ns = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
-                if _ns:
-                    _vlv = self.kvmem_view_lens
-                    _ridx = self.input_batch.req_id_to_index
-                    for _rq, _cnt in _ns.items():
-                        _ri = _ridx.get(_rq)
-                        if _ri is not None:
-                            _vlv.data[_ri] += int(_cnt)
-            except Exception:
-                pass
+        # REPLAY FRAMES DO NOT ADVANCE (design 44): the first run already
+        # rolled the tables; double-advancing would corrupt view_lens.
+        # design 45: the view_lens advance is REMOVED - the knife is the
+        # ONLY writer of view_base (published at install), and the fork's
+        # override adds this step's query length live (seq_lens =
+        # view_lens[row] + ql). The old block advanced the SAME table by
+        # n_new each step on top of knife publishes: a double writer that
+        # silently died mid-run (its `except Exception: pass` swallowed a
+        # NameError - the fourth occurrence of that exact trap in this
+        # project; the visible symptom was vl_vec=[0] frozen tables and
+        # seq_lens regressing to ql at every step past the first knife).
+        # With one writer the invariant is mechanical: view_lens == base at
+        # last knife; attention axis = base + live writes of THIS step.
         if os.environ.get("KVMEM_EXEC_POST", "1") == "0":
             return result
         # Profiling/dummy runs are not real steps.
@@ -3320,7 +3340,8 @@ def _install(cls, module_name, probe, smoke, state):
                          "sched_n": len(getattr(scheduler_output,
                                                 "num_scheduled_tokens",
                                                 None) or {})})
-            if state.get("sparse") is not None:
+            if state.get("sparse") is not None and \
+                    not getattr(self, "_d_replaying", False):
                 # Hook 2: commit what this step wrote, and reselect when due.
                 runtime = state["sparse"]
                 scheduled = getattr(scheduler_output, "num_scheduled_tokens", None) or {}

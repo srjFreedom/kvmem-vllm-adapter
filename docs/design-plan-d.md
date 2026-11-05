@@ -713,3 +713,18 @@ skip=不重放只装视图 - 顺路）。
   用重放 output 替换**；重放旗标封 view_lens advance/harvest/engine-notes。
 - 取证方法自白：本轮 6 次 boot 全部是"一发一断"纪律执行——每次只测一个未知，
   零假设叠加零猜测。
+
+
+## 45. Round 33 里程碑：**88K needle TRUE** - 单写者定案 + seam 违约定罪
+
+- **答案**：plugin advance 块（每步 `_vlv.data[_ri] += _cnt`）与刀 publish 双写者冲突，
+  且块内引用 replay 时代死变量 → NameError → `except: pass` 吞 → **表冻死**；
+  fork 的 seq_lens override 本就 = view_lens + live ql（刀是唯一需要写表的人）。
+  advance 块**整体切除**（第 N 次 except-pass 陷阱入档：任何 except-pass 必须计数）。
+- seam 刀违 R2b 契约（install-after-commit：restore 拷未 commit 末 chunk）→ 缴械。
+- replay 自递归方案废弃：restore-to-cursor + 单步 ≠ 重评（漏吃末 chunk 中段）；
+  快照机器保留（未来全末段 re-prefill 用）。
+- 88K ×64：**needle True**，79.9-82.1s。D 臂第一次绿电池。
+- vl_mismatch 首 chunk 的 old=真账本 vs new=ql 是**设计语义**（非刀时基 0=恒等），
+  属预期，不修。
+- **下轮：152K 同判据**（问题刀 749 pages + needle）。
