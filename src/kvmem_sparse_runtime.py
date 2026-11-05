@@ -3496,8 +3496,14 @@ class VllmSparseRuntime:
                 self.log({"kind": "d_core_sanitized", "req": req,
                           "bad": int(bad), "len": len(core)})
             return clean
-        if not (bool(getattr(self, "_in_quiescent", False))
-                and int(getattr(self, "tp_size", 1) or 1) > 1):
+        # D skips the collective BUT the ranking must still agree across
+        # ranks: the question rows are rank-local attention queries whose
+        # means diverge without the exchange (measured: MID knives, which
+        # DO average, proposed identically on both ranks 5/5; the final
+        # knife without averaging produced rank-divergent selections ->
+        # "different logical working sets" -> 0 applies). Route D through
+        # the same collective; ranks are lockstep inside the boundary RPC.
+        if not (int(getattr(self, "tp_size", 1) or 1) > 1):
             return core
         try:
             from kvmem_tp_scores import average_reconstruction_scores

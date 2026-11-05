@@ -760,3 +760,13 @@ skip=不重放只装视图 - 顺路）。
 - 三件套生效：fork fuse（vl=0 行不覆盖 causal）、release 清零（跨请求毒化闭合）、advance 重建（decode 步 cache 缺失时从 scheduler_output 重算）——**kvmem_vl_mismatch 归零**（88K+152K 全程），**152K 统计账本首次写满 143135/36 步**（harvest 死亡彻底终结，advance 是真凶）。
 - 152K 仍 False，病灶收敛为一句话：**问题视图安装后会被后续 MID 视图覆盖**（终末锁只守 runtime/_c 一条路，refused×97 提示 Core 侧还有第二扇门）。下一刀：锁贯通 Core 谓词（plan_d 的 (c) 谓词已含 final_cut——查 refused 是否 MID 被拒后问题刀又被拒……读 refused 详情+applied epoch 序列）。
 - 性能现状：探针全开 163s/88K（R4 卸载后预期回到 ~80/140s）。
+
+## 48. Round 35：TP 共识三层修正史 + 问题刀仍不落（剩余战场）
+
+- 改动三连（全离线绿，commit 只写内容）：
+  1. validate 的 TP 等值比较改**逻辑页集合**（D 下各 rank 物理槽/可见数天然异）；
+  2. 上界律 `selected[-1]*page>=logical` 修正为跨界尾页合法的 `selected[-1] >= ceil(logical/page)`（69x "invalid or non-shrinking" 元凶，两臂共用正确形式）；
+  3. D 的共识分支恢复 **tp collective**（问题向量均值跨 rank 交换）——sanitize 版让排名各自漂，实测问题刀两次 enter 都不落地。
+- 现状读数：refused 从 "different working sets" 转为 "different **logical** working sets"×68 + non-shrinking×69——**两个 rank 的问题分数排名本身不同**（MID 靠 consensus 平均过；final 的 `_last_core` 兜底路径 rank-local）。问题刀仍未 apply。
+- 下一步（不混）：a) 把 final 也走 `_core_consensus` 集体平均（与 MID 同路，恢复原状）；b) 若仍分歧，取证两 rank 的 top16 差异（是分数还是行数）。锁语义之后：refused×68 里还有多少是 MID 被误伤（D-scoped 比较后 MID 应该 100% 通过——它没通过说明**问题分数被 MID 复用**？）。
+- 性能注记：探针全开 295s（R4 卸载预期 ~140s）。

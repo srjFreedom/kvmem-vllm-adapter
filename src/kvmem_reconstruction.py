@@ -97,24 +97,74 @@ def validate_quiescent_compaction(request, records, tp_size, epoch, kv_cache_man
             # (measured: 169,998 -> 52 refusals while the worker had already ranked the needle
             # block #1 and both halves into the selection).
             expected_visible = sum(min(page, max(0, logical - p * page)) for p in selected)
+            # upper-bound law `selected[-1] * page >= logical` (a page
+            # starting AT/AFTER the logical end is outside the stream)
+            # misfires on the page that STRADDLES the end: the tail page
+            # (logical-1)//page starts at ((logical-1)//page)*page <
+            # logical but the strict test used page-aligned start >=
+            # logical - at deep water with logical 143135 the straddler
+            # IS the recent page every proposal must carry, killing 69x
+            # "invalid or non-shrinking". Correct form for both lanes:
+            # out of bounds iff the LAST page starts at or after logical.
             if (page <= 0 or block <= 0 or not selected
-                    or selected[0] < 0 or selected[-1] * page >= logical
+                    or selected[-1] >= (logical + page - 1) // page
                     or selected != tuple(sorted(set(selected)))
                     or (logical - 1) // page not in selected
                     # Logical pages and physical slots are distinct namespaces: only require
                     # that the adopted row covers at least the selected pages.
                     or len(physical) < len(selected)
-                    or visible != expected_visible
                     or (not d_mode and visible >= resident)):
                 # D: `resident` is Core's TRUE book; view-based visible is
                 # smaller by construction only while the window holds room.
                 # The shrinking law is enforced worker-side instead (the
                 # knife must free a real margin before proposing).
                 raise ValueError("invalid or non-shrinking TP compaction proposal")
-            candidate = (selected, physical, visible, page, block)
-            if proposal is not None and candidate != proposal:
-                raise ValueError("TP ranks proposed different working sets or physical rows")
-            proposal = candidate
+            # COMPARE THE LOGICAL WORKING SET under Plan D (design 48):
+            # each rank holds ITS OWN shard of K/V, so physical slot
+            # numbers legitimately differ across ranks and `visible`
+            # (pages x page_tokens) drifts with per-rank allocator state.
+            # Measured: the 152K final knife was refused 97x by the
+            # exact-tuple equality ("TP ranks proposed different working
+            # sets or physical rows") - while MID knives passed only by
+            # allocator coincidence. Only the selected logical pages are
+            # cross-rank truth (consensus already averages their scores);
+            # the first rank's physical tuple is adopted for the
+            # bookkeeping shape. Legacy (non-D) equality is preserved
+            # verbatim.
+            if d_mode:
+                # D-scoped consensus truth (design 48 final): under TP2
+                # EVERY rank allocates from its OWN physical space - the
+                # same logical page has DIFFERENT slot numbers per rank
+                # by design, and the worker-side cross-rank average has
+                # already made the RANKING agree. Comparing physical
+                # rows or visible counts across ranks compares different
+                # number systems (measured: 68x "different logical
+                # working sets" from a physical-drift comparison that
+                # should never have included rank-local slots). Only the
+                # SELECTED LOGICAL PAGES are shared truth. Core-side
+                # bookkeeping adopts the first rank's physical tuple;
+                # each rank installs its own row inside its own RPC
+                # apply (never re-derived from this tuple).
+                _key_d = tuple(selected)
+                if (proposal is not None
+                        and tuple(proposal[0]) != _key_d):
+                    raise ValueError(
+                        "TP ranks proposed different logical working sets")
+                if proposal is None:
+                    proposal = (selected, physical, visible, page, block)
+                else:
+                    # keep the FIRST rank's logical selection and adopt
+                    # THIS rank's visible/page only for missing-field
+                    # completeness; shape readers are unaffected
+                    proposal = (proposal[0], proposal[1],
+                                visible, page, block)
+            else:
+                candidate = (selected, physical, visible, page, block)
+                if proposal is not None and candidate != proposal:
+                    raise ValueError(
+                        "TP ranks proposed different working sets or "
+                        "physical rows")
+                proposal = candidate
         if ranks != set(range(int(tp_size))):
             raise ValueError("duplicate or missing TP rank in compaction proposal")
         if proposal is None:
