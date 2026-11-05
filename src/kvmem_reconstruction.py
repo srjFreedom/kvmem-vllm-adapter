@@ -109,6 +109,17 @@ def validate_quiescent_compaction(request, records, tp_size, epoch, kv_cache_man
             if (page <= 0 or block <= 0 or not selected
                     or selected[-1] >= (logical + page - 1) // page
                     or selected != tuple(sorted(set(selected)))
+                    # the straddler law, SHARED (design 49): every page
+                    # strictly inside the stream must be selected. D
+                    # proposals were dying at the "different logical"
+                    # line only AFTER this check passed on both ranks -
+                    # but each rank's local visible/physical drift made
+                    # the earlier per-rank shape checks accept sets that
+                    # differed by one page (the straddler): measured
+                    # 68x "different logical working sets" where rank0
+                    # held the tail page and rank1 did not. Enforcing
+                    # it for both lanes removes the asymmetry at the
+                    # source instead of papering over it in compare.
                     or (logical - 1) // page not in selected
                     # Logical pages and physical slots are distinct namespaces: only require
                     # that the adopted row covers at least the selected pages.

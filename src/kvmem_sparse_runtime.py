@@ -3490,19 +3490,20 @@ class VllmSparseRuntime:
         ranking must survive cells the statistics never covered."""
         if not (core is not None and len(core)):
             return core
+        # D sanitizes the vector (NaN/inf cells from uncovered statistics)
+        # and THEN joins the SAME collective average as the legacy lane
+        # (design 49): each rank scores from its own head shard, so the
+        # question ranking only agrees across ranks after the exchange.
+        # Measured before the fix: final knives diverged per rank (68x
+        # "different logical working sets", 0 applies) while MID - which
+        # had always gone through this collective - proposed identically.
+        core = list(core)
         if bool(getattr(self, "d_mode", False)):
             clean, bad = self._sanitize_core(core)
             if self.log is not None and bad:
                 self.log({"kind": "d_core_sanitized", "req": req,
                           "bad": int(bad), "len": len(core)})
-            return clean
-        # D skips the collective BUT the ranking must still agree across
-        # ranks: the question rows are rank-local attention queries whose
-        # means diverge without the exchange (measured: MID knives, which
-        # DO average, proposed identically on both ranks 5/5; the final
-        # knife without averaging produced rank-divergent selections ->
-        # "different logical working sets" -> 0 applies). Route D through
-        # the same collective; ranks are lockstep inside the boundary RPC.
+            core = clean
         if not (int(getattr(self, "tp_size", 1) or 1) > 1):
             return core
         try:

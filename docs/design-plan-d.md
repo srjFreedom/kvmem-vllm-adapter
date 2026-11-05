@@ -770,3 +770,10 @@ skip=不重放只装视图 - 顺路）。
 - 现状读数：refused 从 "different working sets" 转为 "different **logical** working sets"×68 + non-shrinking×69——**两个 rank 的问题分数排名本身不同**（MID 靠 consensus 平均过；final 的 `_last_core` 兜底路径 rank-local）。问题刀仍未 apply。
 - 下一步（不混）：a) 把 final 也走 `_core_consensus` 集体平均（与 MID 同路，恢复原状）；b) 若仍分歧，取证两 rank 的 top16 差异（是分数还是行数）。锁语义之后：refused×68 里还有多少是 MID 被误伤（D-scoped 比较后 MID 应该 100% 通过——它没通过说明**问题分数被 MID 复用**？）。
 - 性能注记：探针全开 295s（R4 卸载预期 ~140s）。
+
+## 49. Round 36：共识统一 - 协议全绿，152K 转入打分质量层
+
+- 根因终审：`_core_consensus` 的 D 分支 sanitize 后 `return` - **collective 从未为 D 跑过**（上轮改的是非-D 条件，未命中）。修正=sanitize→fall-through 同一条 `average_reconstruction_scores` 集体路。
+- 判决读数（一发）：**applied 10 / refused 0**（历史最好：上轮 5/75）；问题刀 epoch 25 真实落地（b_probe→enter pressure=False→applied 全链）。D 刀协议层（选、共、锁、装、拒零）**完整闭环**。
+- 152K needle 仍 False，但病灶换层：**问题向量被 prompt 里字面 "MID." 段落污染**（答案里 "for the MID" 双证），top8=[90,89,45,88...] 全是尾部文本块，needle 块 39 掉出前排。这是**打分质量**（冻结问题行的选取/去噪），不再是刀协议 - R3.4：对比 88K（同题面 top8 含 39）与 152K 的 q_rows 冻结位（问题文本在 prompt 尾部哪几行、MID. 段在哪几行），把"问题=最后 N 行"的 N 定准。
+- 协议层验收推进：88K ✓真刀；152K 协议 ✓（等质量层）；Xid=0 全程（保险丝+锁在岗）。
