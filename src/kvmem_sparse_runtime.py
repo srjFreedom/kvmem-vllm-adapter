@@ -4623,10 +4623,16 @@ class VllmSparseRuntime:
                     try:
                         _nb = int(tokens // 1024)  # needle-adjacent block guess
                         _nb2 = int(tokens * 0.5) // 1024 if int(tokens) > 100000 else 39
-                        _nb2 = int(tokens * 0.5) // 1024 if int(tokens) > 100000 else 39
                         _core0 = [int(b) for b in order[:8]]
+                        _nz = sum(1 for _v in core if _v == _v)
+                        _cov = sorted(block_scores) if block_scores else []
+                        _cont = bool(_cov) and _cov == list(range(_cov[0], _cov[0] + len(_cov)))
                         self.log({"kind": "d_final_scores", "req": req,
                                   "core_src": _core_src,
+                                  "gp": int(grid_pages), "q": int(q),
+                                  "pt": int(pt),
+                                  "cov_contig": int(_cont), "cov_lo": (_cov[0] if _cov else None),
+                                  "core_nonzero": int(_nz),
                                   "nb2": _nb2,
                                   "needle_score": round(block_scores.get(_nb2, -1.0), 6) if block_scores else None,
                                   "needle_rank": (sorted(block_scores, key=lambda x: (-block_scores[x], x)).index(_nb2) if block_scores and _nb2 in block_scores else -1),

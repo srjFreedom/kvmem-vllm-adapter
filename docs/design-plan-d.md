@@ -940,3 +940,10 @@ skip=不重放只装视图 - 顺路）。
 - 硬事实链：① spec4 场 block_scores_len=24 恒等于 sink+recent+room → **统计中段贡献 0 个有效块**；② spec0 同场 49 健康；③ query 健康（qsh=[96,16]）；④ 统计 written 两臂一致。**矛盾指向 recall.scores 的层输入**：源码注释"ABSENT layers, not zero rows"——某些层在 spec4 的 layer_rows dict 里缺失/None，或 page-softmax 内核路径在 spec4 下对部分层返回空。
 - 下轮决定实验：final 事件补 `layers_present/layers_total` 字段，两臂各一发。若 spec4 层数缺 → capture_q 在 MTP 步的层循环被跳过（forward hook 与 draft 共享 stream 状态问题）；若层数全 → scores 内部聚合丢块（cudnn 路径嫌疑）。
 - 预算：3 boots，停。收尾切回生产。
+
+## 72. Round 52：两臂 grid 读数对照与一个被撤回的错误理论
+
+- 读数（同 boot 三发，稳定）：spec0 run1 异常态 `q=49 pt=32`，run2/3 与 spec4 全部 `q=101 pt=16`（engine block 1616 的正确换算）。**spec0 run2/3 参数健康却场形态仍 clone 尾、答案 False（蝴蝶侧）**；spec0 run1 的 49/32 为 boot 首请求瞬态（未复现）。
+- 撤回错误理论：上一节"written=25%"系单位误读（written 计层×段，两臂都满覆盖）；clamp 修复基于它，已回滚。grid 假说也被 run2/3 否定（参数对、场也 49 键正常，spec4 与 spec0 在 final 场形态上其实**同类** - 差别只在 spec4 len=24 的块映射覆盖 - 待 cov_contig 判定）。
+- 新增 cov_contig 判定字段：spec4 的 24 键若是连续中段 = 覆盖塌；若含全部中段 = q 映射健康、差别仅统计值 - 一发分辨（下节执行）。
+- 预算：2 boots 止（双臂读数已齐）。
