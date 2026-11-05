@@ -507,6 +507,36 @@ class SparseOrchestrator:
             # captured on the prompt tail ARE the question, so prefer them unconditionally.
             saved = getattr(self.retrieval_index, "_q_rows", None) or {}
             frozen = bool(getattr(self.retrieval_index, "_query_frozen", False))
+            # QUESTION-knife dilution fix (design 51): the D final knife
+            # runs at prompt completion, BEFORE freeze_query arms on the
+            # first decode step - so the live bridge (whole last chunk =
+            # tail filler + the ~15-token question) is the scorer's query
+            # and ranking collapses to tail-filler self-similarity
+            # (measured: needle block at rank 23 behind 80-90 clones of
+            # the same sentence). The runtime sets _force_captured_tail=N
+            # on this call to demand the CAPTURED question tail instead.
+            _force_tail = getattr(self, "_force_captured_tail", 0) or 0
+            if _force_tail:
+                self._force_captured_tail = 0
+                frozen = True
+                limit0 = int(__import__("os").environ.get(
+                    "KVMEM_QUERY_TAIL", "0") or 0) or int(_force_tail)
+                def _trim_q(val, lim):
+                    # _q_rows values are (q_tensor, positions) tuples per
+                    # layer (or bare tensors in older captures) - trim
+                    # whichever form actually has row dimensionality
+                    if isinstance(val, tuple) and len(val) >= 1:
+                        q = val[0]
+                        if hasattr(q, "shape") and q.shape[0] > lim:
+                            pos = val[1] if len(val) > 1 else None
+                            if hasattr(pos, "shape") and pos.shape[0] == q.shape[0]:
+                                pos = pos[-lim:]
+                            return (q[-lim:], pos) + tuple(val[2:])
+                        return val
+                    if hasattr(val, "shape") and val.ndim >= 2 and val.shape[0] > lim:
+                        return val[-lim:]
+                    return val
+                saved = {k: _trim_q(v, limit0) for k, v in saved.items()} if saved else saved
             if saved and (frozen or not any(
                     q is not None and getattr(q, "numel", lambda: 0)() > 0
                     for q, _pos in source.values())):

@@ -4396,6 +4396,15 @@ class VllmSparseRuntime:
         kept = set(range(min(sink_blocks, n_blocks))) \
             | set(range(max(0, n_blocks - recent_blocks), n_blocks))
         kept.add((n_pages - 1) // q)                     # Core validates the tail page
+        # two-tier final view (design 52): question ranking alone cannot
+        # separate the needle - the battery tail IS a clone of the
+        # question sentence (92 matching blocks; measured needle rank 23
+        # with a clean query). D's MID knives, ranked by the
+        # information-bearing statistics query, already hold the needle
+        # in the working view (88K: block 39 rank 3). The question view
+        # UNIONS statistics picks with question top-k, never replaces.
+        _mid_kept = (getattr(self, "_last_mid_pages", None) or {}).get(req) \
+            if not bool(pressure) else None
         core = None
         try:
             core = orch.core_selection_scores(
@@ -4441,8 +4450,11 @@ class VllmSparseRuntime:
                                       if b in block_scores}})
                     except Exception:
                         pass
+                _mid_kept_blocks = sorted({int(pg) // max(1, int(q))
+                                           for pg in (_mid_kept or ())})
                 room = max(0, budget_blocks - len(kept))
-                for b in order:
+                for b in ((sorted(_mid_kept_blocks, key=lambda x: -x)
+                           + [bb for bb in order]) if _mid_kept else order):
                     if room <= 0:
                         break
                     if 0 <= b < n_blocks and b not in kept:
@@ -4450,6 +4462,13 @@ class VllmSparseRuntime:
                         room -= 1
             except Exception:
                 pass
+        if bool(pressure):
+            # statistics picks (page space) recorded for the question
+            # knife's union - inherit the information-bearing view
+            _lmp = getattr(self, "_last_mid_pages", None)
+            if _lmp is None:
+                _lmp = self._last_mid_pages = {}
+            _lmp[req] = sorted(int(x) for x in (st.logical or ()))
         kept = sorted(kept)
         while len(kept) < budget_blocks:                 # nearest-missing middle blocks
             nxt = max(kept) + 1
