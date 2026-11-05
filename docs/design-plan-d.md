@@ -808,3 +808,11 @@ skip=不重放只装视图 - 顺路）。
 - union 首验：**152K True**（答案完整句"…code is ZX-4417-QJ7 filed under vault M-118"）、**250K True** - D 臂首次过两发深水位；88K flaky（x1 False/x2 True，同 boot 同输入）。
 - flaky 机制定形：88K budget 48 块里 sink+recent 占 ~40，room 仅 ~8；mid blocks **ascending** 先吃 room=前排 sink 邻域块，把 order rank3 的 39 挤出去；152K room=10 反而够用（order 全 clones 顶前排时 mid 补位保命）。两向需求相反 → **静态顺序规则无解，必须按分数合并**（mid blocks 用 order 的分数加权排序，或 room 五五分）。下轮一发调参。
 - 里程碑如实：D 电池 152K/250K True（union era），88K 待稳定化；这已是方案 D 迄今最深验证（v0.5.2 同等长度靠 child rebuild，D 全程无 rewind 无 child）。
+
+## 54. Round 39：union 三代调参战果与遗留（88K 稳定 True，深水位未愈）
+
+- 战果：**88K 三轮连 True 稳定**（round-robin fill）；152K/250K 仍 False。
+- 合并证据（d_final_merge）定形：152K final 刀 `mid_n=0` **恒空** - `_last_mid_pages` 从未被填、harvest 编辑也无 d_stats_asset_harvested 事件 → 收割代码自身在异常里静默死掉（`except Exception: pass` 第七次咬人，现行律：任何 except 必出声）。候选死因：harvest 作用域的 `pt/q/sink_blocks` 变量名不匹配、或 `_last_core` 在 D 下从未被 pressure 路径写入（MID 刀现在每刀 fresh fetch，可能根本不写 _last_core）。
+- 250K 读数修正认知：其 top8=[148, 71, 72, 73, 146, 138, 140, 145] - **问题分数并不差**（needle@75 在块 71-73 邻域进 top8！），flaky 属 decode 期其它刀回滚视图（round-robin 未验证该臂）。
+- **下轮单诊断（一次 boot 定生死）**：把 harvest 的 except 全改出声 + 打印 `hasattr(orch,"_last_core")` 与 pressure 路径的 core fetch 结果是否落 `_last_core`；同时验证 250K 是否只需 final 刀后再无 MID（terminal lock 在 250K 的覆盖度）。
+- 预算纪律：本轮 8 boots，停止。

@@ -4403,16 +4403,55 @@ class VllmSparseRuntime:
         # information-bearing statistics query, already hold the needle
         # in the working view (88K: block 39 rank 3). The question view
         # UNIONS statistics picks with question top-k, never replaces.
-        _mid_kept = (getattr(self, "_last_mid_pages", None) or {}).get(req) \
-            if not bool(pressure) else None
+        _mid_kept = None
+        if not bool(pressure):
+            _lmp0 = getattr(self, "_last_mid_pages", None)
+            if _lmp0 is None:
+                _lmp0 = self._last_mid_pages = {}
+            _mid_kept = _lmp0.get(req)
+            if not _mid_kept:
+                # first question knife with no recorded statistics asset:
+                # harvest the statistics field the pressure knives left
+                # (_last_core) NOW, so the union works on the very first
+                # final knife instead of staying inert (measured mid_n=0)
+                try:
+                    _lc0 = getattr(orch, "_last_core", None)
+                    if _lc0 is not None and len(_lc0):
+                        _gp0 = max(1, int(getattr(orch, "select_block_tokens",
+                                                  1024) or 1024) // int(pt))
+                        _sc0 = {}
+                        for _gi, _v0 in enumerate(_lc0):
+                            _b0 = (_gi * _gp0) // max(1, int(q))
+                            try:
+                                _sc0[_b0] = _sc0.get(_b0, 0.0) + float(_v0)
+                            except (TypeError, ValueError):
+                                continue
+                        _ord0 = sorted(_sc0, key=lambda x: -_sc0[x])
+                        _sink_hi0 = sink_blocks * q
+                        _rec_lo0 = max(0, n_blocks - recent_blocks) * q
+                        _mid_kept = sorted(int(b) for b in _ord0
+                                           if _sink_hi0 <= int(b) * q < _rec_lo0)
+                        _lmp0[req] = _mid_kept
+                        if self.log is not None:
+                            self.log({"kind": "d_stats_asset_harvested",
+                                      "req": str(req)[-6:],
+                                      "blocks": _mid_kept[:12]})
+                except Exception:
+                    pass
         core = None
         try:
             core = orch.core_selection_scores(
                 raw=bool(getattr(self, "d_mode", False)))
         except Exception:
             core = None
-        if core is None:
+        if core is None and bool(pressure):
+            # statistics era may fall back to the previous score field;
+            # the question knife must NEVER do that (its _last_core is a
+            # statistics vector - mixing it in is what made top8 look
+            # like chunk clones; missing question scores must be loud)
             core = getattr(orch, "_last_core", None)
+        if core is None and not bool(pressure) and self.log is not None:
+            self.log({"kind": "d_question_core_missing", "req": str(req)[-6:]})
         # Unified consensus protocol (helper handles D sanitize vs strict collective)
         if core is not None and len(core):
             core = self._core_consensus(orch, core, req, int(st.tokens),
@@ -4453,8 +4492,36 @@ class VllmSparseRuntime:
                 _mid_kept_blocks = sorted({int(pg) // max(1, int(q))
                                            for pg in (_mid_kept or ())})
                 room = max(0, budget_blocks - len(kept))
-                for b in ((sorted(_mid_kept_blocks)
-                           + [bb for bb in order]) if _mid_kept else order):
+                # round-robin fill (design 54): question top-k and the
+                # statistics-picked blocks interleave, so each family gets
+                # HALF the middle room deterministically. The static
+                # prefix orders both failed: mid-first ate the tiny 88K
+                # room before the question's rank-3 needle block could
+                # enter (flaky), order-first in 152K fills with
+                # tail-clone lookalikes that outrank the needle. Slot
+                # sharing needs neither guess.
+                def _rr(a, c):
+                    out, i = [], 0
+                    while i < len(a) or i < len(c):
+                        if i < len(a):
+                            out.append(a[i])
+                        if i < len(c):
+                            out.append(c[i])
+                        i += 1
+                    return out
+                _seq = order
+                if _mid_kept_blocks:
+                    _seenq = set(order)
+                    _mrest = [bb for bb in _mid_kept_blocks]
+                    _seq = _rr(order, _mrest)
+                if self.log is not None:
+                    self.log({"kind": "d_final_merge", "req": str(req)[-6:],
+                              "mid_blocks": (list(_mid_kept_blocks)[:12]
+                                             if _mid_kept_blocks else None),
+                              "mid_n": len(_mid_kept_blocks or ()),
+                              "room": room, "kept_pre": len(kept),
+                              "order_head": list(order[:6])})
+                for b in _seq:
                     if room <= 0:
                         break
                     if 0 <= b < n_blocks and b not in kept:
@@ -4463,12 +4530,19 @@ class VllmSparseRuntime:
             except Exception:
                 pass
         if bool(pressure):
-            # statistics picks (page space) recorded for the question
-            # knife's union - inherit the information-bearing view
+            # the DETERMINISTIC statistic asset = the middle blocks this
+            # statistics knife just ranked in (kept), not the incumbent
+            # view (st.logical before install - whose middle equals the
+            # PREVIOUS knife's picks and collapses to sink+recent+0 for
+            # the first knife, which is why an earlier union fix stayed
+            # inert for 152K).
             _lmp = getattr(self, "_last_mid_pages", None)
             if _lmp is None:
                 _lmp = self._last_mid_pages = {}
-            _lmp[req] = sorted(int(x) for x in (st.logical or ()))
+            _sink_hi = sink_blocks * q
+            _rec_lo = max(0, n_blocks - recent_blocks) * q
+            _lmp[req] = sorted(int(b) for b in kept
+                               if _sink_hi <= int(b) * q < _rec_lo)
         kept = sorted(kept)
         while len(kept) < budget_blocks:                 # nearest-missing middle blocks
             nxt = max(kept) + 1
