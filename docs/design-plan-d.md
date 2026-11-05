@@ -933,3 +933,10 @@ skip=不重放只装视图 - 顺路）。
 - fold 序列铁证：prefill 35 chunk 全部折叠、零 gap、重复对齐——**中段 K 统计健康**（39 地盘被普通 chunk 正确覆盖）。场塌源必在 spec4 的**末 chunk 步×bridge 排空时机**：downtime 后的 drain 与 harvest 先后关系在 MTP 开启时不同（或 KEY_ROWS_LIMIT 被 draft 步钉在1），末 chunk 行被流排空/截断 → query 仅剩残缀 → 头部场取代克隆尾场（所有形态皆容）。
 - 下轮探针：末 chunk 步事件旁发 `bridge_pending_rows / KEY_ROWS_LIMIT / 本步 drain 行数` 三元组（两臂×1 发），一发定流排时机。
 - 预算：2 boots 用完。生产恢复 spec4/PLAN_D=0。
+
+## 71. Round 51：spec4 病灶收窄到"统计中段 0 有效块"，一次错误定位已回滚
+
+- 写入量冤案第二次：spec0-era written=19032 与 spec4-era **相同**（我把 19032 当作 19032/75420 的"25%"，实际计数单位是层×块段，两臂都满覆盖）。基于错误计算的 clamp 修复已 git checkout 回滚（工作树干净）。
+- 硬事实链：① spec4 场 block_scores_len=24 恒等于 sink+recent+room → **统计中段贡献 0 个有效块**；② spec0 同场 49 健康；③ query 健康（qsh=[96,16]）；④ 统计 written 两臂一致。**矛盾指向 recall.scores 的层输入**：源码注释"ABSENT layers, not zero rows"——某些层在 spec4 的 layer_rows dict 里缺失/None，或 page-softmax 内核路径在 spec4 下对部分层返回空。
+- 下轮决定实验：final 事件补 `layers_present/layers_total` 字段，两臂各一发。若 spec4 层数缺 → capture_q 在 MTP 步的层循环被跳过（forward hook 与 draft 共享 stream 状态问题）；若层数全 → scores 内部聚合丢块（cudnn 路径嫌疑）。
+- 预算：3 boots，停。收尾切回生产。

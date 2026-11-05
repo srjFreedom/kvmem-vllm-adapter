@@ -604,6 +604,7 @@ class SparseOrchestrator:
             self._core_error = recall.last_error
             return None
         self._core_error = None
+        self._q_rows_shape = (int(rows), len(layer_rows))
         self._last_core = list(core)
         if not getattr(self, "_core_logged", False):
             self._core_logged = True
