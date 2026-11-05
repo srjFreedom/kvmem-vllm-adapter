@@ -2605,9 +2605,9 @@ def register():
                         # "candidates refused"). Throttled per scheduler pid.
                         if bool(_sched_cfg(scheduler).get("plan_d")):
                             _cn = len(_cands)
-                            _best = running and max(
+                            _best = max(
                                 (int(getattr(r, "num_computed_tokens", 0) or 0)
-                                 for r in running), default=0)
+                                 for r in running), default=0) if running else 0
                             _st_c = getattr(scheduler, "_d_c_stats", None)
                             if _st_c is None:
                                 _st_c = scheduler._d_c_stats = {"fire": 0, "n": 0}

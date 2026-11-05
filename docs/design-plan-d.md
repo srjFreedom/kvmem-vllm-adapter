@@ -898,3 +898,14 @@ skip=不重放只装视图 - 顺路）。
 - 新优先级序：R3.5a 修 MTP×D（draft slot/hidden 同步完整审计）→ R3.5b 漂移提纯（4/6→稳）→ resume 深度 → 双臂统一发布。
 - 判据修正（诚实记录）：目标文本"needle 全对"在此电池上测的其实是"状态挖掘+无漂移"，与视图检索质量弱相关 - 这是电池的固有性质（filler≡needle 句式），不是 D 的缺陷；双臂在此性质上等价可比。
 - 本轮 3 boots，停。当前服务=生产臂 spec4（探针即电池 3/3）。
+
+## 67. Round 47：spec4×D 病灶收窄至末 chunk 统计空洞（四修落地清单）
+
+- 本轮修复（全部验证有效、永久保留）：
+  1. `_d_harvest_gap` 自毁行删（dict→int 血案）；
+  2. orchestrator `limit0` 前置引用（**纯问句 trim 自此真执行**：d_query_trim×8 首响）；
+  3. (c) 探针 `int(_best)` 崩溃修（曾中断刀体路径）；
+  4. wrote0 日志两处 NameError（_view_first→真字段、st→无作用域变量）。
+- spec4×D 电池仍 0/3（88K）+ 0/1（152K），但**形态变了**：final 场 top8=[12,22,4,18..]（头部区！）且 **needle block rank=-1 不在场**、wrote0 显示 `first 139268 vs frontier 143134` 缺口 3866 行 - **末 chunk 的 bucket 在 spec4 下没有完整写入**。spec0 同 prompt 无此洞（wrote0 零）。第一嫌疑=MTP 的 prefill 尾步与 bridge KEY_ROWS 语义交互（boundary gate 保证 prefill 无 draft，但 harvest 的 drafts 判定 `req in spec_reqs` 在 spec4 boot 对 prefill 步请求可能误判为 draft-carrying → n 折 1 → 末 chunk 只写 1 行）。下轮一发：在 harvest 入口事件打 n_new/drafts/decode 三元组对照 spec4 前 3 步。
+- commit_map_probe_error×8：探针自身 OOM（旧时代残留，卸载列入 R4 清探针）。
+- 预算：5 boots 触顶，停。生产恢复 spec4/PLAN_D=0。

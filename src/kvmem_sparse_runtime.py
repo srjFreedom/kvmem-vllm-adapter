@@ -1772,14 +1772,11 @@ class VllmSparseRuntime:
                 # core_len stuck at 704). Under D, hold the book at `first`
                 # and surface the fault with values.
                 if getattr(self, "d_mode", False):
-                    self._d_harvest_gap = int(self._d_harvest_gap.get(req, 0) or 0) + 1 \
-                        if getattr(self, "_d_harvest_gap", None) is not None \
-                        else 0
                     _g = getattr(self, "_d_harvest_gap", {})
                     _g[req] = int(_g.get(req, 0)) + 1
                     if _g[req] <= 3 and self.log is not None:
                         self.log({"kind": "d_harvest_wrote0", "req": req,
-                                  "first": first, "view_first": _view_first,
+                                  "first": first, "next_book": int(self._stats_next.get(req, -1)),
                                   "n": n, "stats_frontier": int(stats.frontier),
                                   "gap": _g[req]})
                     written = 0

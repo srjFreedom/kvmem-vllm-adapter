@@ -519,6 +519,8 @@ class SparseOrchestrator:
             if _force_tail:
                 self._force_captured_tail = 0
                 frozen = True
+                limit0 = int(__import__("os").environ.get(
+                    "KVMEM_QUERY_TAIL", "0") or 0) or int(_force_tail)
                 if True:  # uncapped while the wire is unproven
                     self._qt_logged = getattr(self, "_qt_logged", 0) + 1
                     try:
@@ -533,8 +535,6 @@ class SparseOrchestrator:
                     except BaseException as _qex:
                         _probe_write({"kind": "d_query_trim_error",
                                       "error": str(_qex)[:160]})
-                limit0 = int(__import__("os").environ.get(
-                    "KVMEM_QUERY_TAIL", "0") or 0) or int(_force_tail)
                 def _trim_q(val, lim):
                     # _q_rows values are (q_tensor, positions) tuples per
                     # layer (or bare tensors in older captures) - trim
