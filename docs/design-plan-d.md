@@ -777,3 +777,20 @@ skip=不重放只装视图 - 顺路）。
 - 判决读数（一发）：**applied 10 / refused 0**（历史最好：上轮 5/75）；问题刀 epoch 25 真实落地（b_probe→enter pressure=False→applied 全链）。D 刀协议层（选、共、锁、装、拒零）**完整闭环**。
 - 152K needle 仍 False，但病灶换层：**问题向量被 prompt 里字面 "MID." 段落污染**（答案里 "for the MID" 双证），top8=[90,89,45,88...] 全是尾部文本块，needle 块 39 掉出前排。这是**打分质量**（冻结问题行的选取/去噪），不再是刀协议 - R3.4：对比 88K（同题面 top8 含 39）与 152K 的 q_rows 冻结位（问题文本在 prompt 尾部哪几行、MID. 段在哪几行），把"问题=最后 N 行"的 N 定准。
 - 协议层验收推进：88K ✓真刀；152K 协议 ✓（等质量层）；Xid=0 全程（保险丝+锁在岗）。
+
+
+## 50. Round 37：query 稀释假设证伪 + 新主嫌疑=零自由刀让 MID 逐出 needle
+
+- 判别三连（152K 同题面）：QUERY_TAIL=6 / QUERY_ROWS=24 / 默认 —— **top8 完全相同
+  [90,89,45,88,46,85,84,86]**。问题打分对窗口大小不敏感 ⇒ **稀释假说死**。
+  （诚实记录：我的 KVMEM_QUERY_ROWS 加错了路——真评分 query 走 core_selection_scores
+  的 _q_rows 裁剪，即 QUERY_TAIL；两路实验同 top8 反而成了双保险证据。）
+- 真形态重构：needle 块 39 在 MID 刀时代**曾经在场**（88K 首刀窗口期答对证明），
+  152K 问题刀 top8 前排全是 tail 块（filler 自相似主导，问题向量只有 15 token 对
+  640-token 模板头+tail 的相对权重）→ kept 8 块无 needle → **问题刀安装即逐出
+  needle**；此后 MID 零自由（749 页满窗）刀再钉死。
+- **下一轮手术（R3.5）：自由页法则贯通**——零自由选择（chosen 页数 ≥ 当前在场 resident
+  覆盖）：(a) Core 谓词拒绝（D 模式 pressure/非 pressure 皆查）；(b) 选择器给问题刀
+  保底把"统计高分且含 needle 历史"的中间块纳入（tail 自相似挤占问题前排的修法=
+  对 q 与块 K 的匹配做 top-k 稀疏化/去 tail 重复段冗余）。两步各一 boot，先 (a)。
+- 88K 保持真刀 True；协议层 10/0 保持；本轮 3 boots。

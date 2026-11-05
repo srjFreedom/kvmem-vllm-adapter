@@ -119,6 +119,13 @@ class KvmemRetrievalIndex:
             return
         vec = q_pre.to(self.dtype)
         tail = max(1, int(getattr(self, "query_tail", 512) or 512))
+        # quality-window knob (design 50): a full 512-row tail window at
+        # deep water is prompt filler, not the question (15-20 tokens);
+        # the average dilutes the query until ranking forgets the needle
+        # block. KVMEM_QUERY_ROWS caps the window rows from the end.
+        _qr = __import__("os").environ.get("KVMEM_QUERY_ROWS", "").strip()
+        if _qr.isdigit() and int(_qr) > 0:
+            tail = min(tail, int(_qr))
         if vec.ndim == 3:
             vec = vec[-tail:].mean(dim=1)
         if vec.ndim == 2:
@@ -146,6 +153,13 @@ class KvmemRetrievalIndex:
             return
         vec = q_pre.to(self.dtype)
         tail = max(1, int(getattr(self, "query_tail", 512) or 512))
+        # quality-window knob (design 50): a full 512-row tail window at
+        # deep water is prompt filler, not the question (15-20 tokens);
+        # the average dilutes the query until ranking forgets the needle
+        # block. KVMEM_QUERY_ROWS caps the window rows from the end.
+        _qr = __import__("os").environ.get("KVMEM_QUERY_ROWS", "").strip()
+        if _qr.isdigit() and int(_qr) > 0:
+            tail = min(tail, int(_qr))
         if vec.ndim == 3:
             vec = vec[-tail:].mean(dim=1)
         if vec.ndim == 2:
