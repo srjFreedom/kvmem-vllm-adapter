@@ -917,3 +917,12 @@ skip=不重放只装视图 - 顺路）。
 - 剩余事实：spec0×D 88K True/False **同 boot 同输入翻面** → 非确定性源仍未定位，候选 (i) GPU 端 atomics/图-eager 混合路径，(ii) harvest/刀序与 decode 采样在异步管线下的到达序。下一发审计：同 prompt 双连发对比**输出 token id 序列**（第一个分歧 token 位置=非确定性显形处）+ 对比两发的 final top8（若场相同而答案分岔→分歧在 forward 数值，不在任何调度层）。
 - spec4×D 病灶与 stats 无关（本轮排除），回到 MTP draft 通路审计（上轮记录）。
 - 预算：2 boots（其一未计入修复因锚败免烧），本轮代码净零改动（四修已在昨日提交）。
+
+## 69. Round 49：确定性审计收口 - 非确定性定身于 GPU 数值层
+
+- 服务死因=未提交的 fork 编辑（chat 协议 logprobs 清零 + msgspec 反序列化崩）- 已 revert；四修本体完好。
+- 审计（同 boot 四发 88K）：shas 四异，分歧全部在字符 35-53（生成 token 10-15，思维链中段）；前缀完全一致；分数场 6 位小数全同。结论：调度层、刀层、场层无罪 - 非确定性=浮点不可交换的结合序差异随 batch/shape 放大（non-bitwise 前向），思维链把它放大成不同答案。
+- 影响面：“resume 命中轮与冷跑字节一致”在 batch-invariant 数值层解决前物理不可达 - 与 v0.5.x 时代 RESUME/COLD 各自稳、互相不同的记录同根。可选：(a) 批不变 kernel 审计（fork 级）；(b) 验收改为“同 shape 重放字节一致”+前缀一致软指标；(c) greedy 已最紧。
+- 88K flaky 本质同上：True/False 是数值蝴蝶样本 - 机制判据应改用场层指标（needle 在场率/rank/覆盖），那些已证明确定且健康。
+- 下一步：电池判据重定义（机制指标）+ spec4×D 单独审计（那个 0/4 是系统性，不是蝴蝶）。
+- 预算：2 boots（含 crash 重启），停。
