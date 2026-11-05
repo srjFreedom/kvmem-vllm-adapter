@@ -4530,17 +4530,22 @@ class VllmSparseRuntime:
                                   "error": str(_hexc)[:200],
                                   "tb": __import__("traceback").format_exc()[-260:]})
         core = None
+        _core_src = "none"
         try:
             core = orch.core_selection_scores(
                 raw=bool(getattr(self, "d_mode", False)))
+            _core_src = "fresh" if core is not None else "fresh-none"
         except Exception:
             core = None
+            _core_src = "fresh-exc"
         if core is None:
             # the statistics field is a VALID asset for either knife (it
             # carries the information-bearing ranking that positions the
             # needle neighborhood at 88K) - reverting round-39's pin,
             # which regressed 88K by removing exactly this fallback
             core = getattr(orch, "_last_core", None)
+            if core is not None:
+                _core_src = "fallback-lastcore"
         if core is None and self.log is not None:
             self.log({"kind": "d_question_core_missing", "req": str(req)[-6:]})
         # Unified consensus protocol (helper handles D sanitize vs strict collective)
@@ -4576,6 +4581,7 @@ class VllmSparseRuntime:
                         _nb = int(tokens // 1024)  # needle-adjacent block guess
                         _core0 = [int(b) for b in order[:8]]
                         self.log({"kind": "d_final_scores", "req": req,
+                                  "core_src": _core_src,
                                   "core_len": len(core),
                                   "n_blocks": n_blocks,
                                   "top8": _core0,
