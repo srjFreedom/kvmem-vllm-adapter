@@ -2447,6 +2447,18 @@ def register():
                     path) runs after that schedule and leaves the next chunk on a stale offset.
                     """
                     cfg = _sched_cfg(getattr(core, "scheduler", None))
+                    # entry evidence (self-counted, cap 20): does the knife function                    
+                    # run AT ALL on this boot, and what do the config gates read?                    
+                    _ce = getattr(core, "_kvmem_core_entry", None)                    
+                    if _ce is None:                    
+                        _ce = core._kvmem_core_entry = [0]                    
+                    if _ce[0] < 20:                    
+                        _ce[0] += 1                    
+                        _append("/tmp/kvmem_sparse.jsonl",                    
+                                {"kind": "d_core_entry", "n": _ce[0],                    
+                                 "sched_compact": bool(cfg.get("sched_compact")),                    
+                                 "prefill_pressure": bool(cfg.get("prefill_pressure")),                    
+                                 "plan_d": bool(cfg.get("plan_d"))})
                     if not (cfg.get("sched_compact") or cfg.get("prefill_pressure")):
                         # (c) self-gates below on prefill_pressure: pressure boots reach the
                         # loop for the watermark trigger alone, WITHOUT inheriting the (a)
@@ -2827,6 +2839,12 @@ def register():
                     return result
 
                 step._kvmem_session_retire_patched = True
+                # THE MISSING LINE (design 47): the round-29 seam install
+                # replaced this assignment and silently un-installed the
+                # knife-bearing step wrapper - _quiescent_compaction, and
+                # with it the whole D trigger chain, ran zero steps while
+                # everything below still reported happily.
+                EngineCore.step = step
 
                 _inner_step = EngineCore.step
 
@@ -3287,17 +3305,42 @@ def _install(cls, module_name, probe, smoke, state):
         # identity for stock arithmetic. Delta is constant between knives.
         # REPLAY FRAMES DO NOT ADVANCE (design 44): the first run already
         # rolled the tables; double-advancing would corrupt view_lens.
-        # design 45: the view_lens advance is REMOVED - the knife is the
-        # ONLY writer of view_base (published at install), and the fork's
-        # override adds this step's query length live (seq_lens =
-        # view_lens[row] + ql). The old block advanced the SAME table by
-        # n_new each step on top of knife publishes: a double writer that
-        # silently died mid-run (its `except Exception: pass` swallowed a
-        # NameError - the fourth occurrence of that exact trap in this
-        # project; the visible symptom was vl_vec=[0] frozen tables and
-        # seq_lens regressing to ql at every step past the first knife).
-        # With one writer the invariant is mechanical: view_lens == base at
-        # last knife; attention axis = base + live writes of THIS step.
+        # view_lens ADVANCE, rebuilt (design 47). The timeline makes it
+        # single-valued, not a double writer: step k returns -> advance +q_k
+        # (table = view end after k); a knife landing at step_end OVERWRITES
+        # base (its chosen count already includes the resident tail) - the
+        # overwrite wipes the same-step add instead of stacking on it.
+        # Step k+1's fork override = table + q_{k+1}: exactly the causal
+        # length of the live view. The round-33 removal was an
+        # overcorrection from the NameError era; the actual defect was the
+        # selection cache, which the fork now only writes on fused rows -
+        # so decode steps recompute the selection from scheduler_output.
+        _vlv2 = getattr(self, "kvmem_view_lens", None)
+        if _vlv2 is not None and getattr(self, "kvmem_view_active", False):
+            try:
+                _sel2 = getattr(self, "_kvmem_adv_sel", None)
+                _ql2 = getattr(self, "_kvmem_adv_ql", None)
+                if _sel2 is None or _ql2 is None:
+                    _ns2 = getattr(scheduler_output, "num_scheduled_tokens",
+                                  None) or {}
+                    _ridx2 = getattr(getattr(self, "input_batch", None),
+                                     "req_id_to_index", None) or {}
+                    if _ns2 and _ridx2:
+                        import torch as _tt
+                        _sel2 = _tt.tensor(
+                            [_ridx2[k] for k in _ns2], dtype=_tt.int32,
+                            device=_vlv2.device)
+                        _ql2 = _tt.tensor(
+                            [int(v) for v in _ns2.values()],
+                            dtype=_vlv2.dtype, device=_vlv2.device)
+                if _sel2 is not None and _ql2 is not None:
+                    import torch as _tv
+                    with _tv.no_grad():
+                        _vlv2[_sel2] += _ql2.to(_vlv2.dtype)
+            except BaseException as _aex:
+                _append(smoke or probe or "/tmp/kvmem_sparse.jsonl",
+                        {"kind": "d_advance_error",
+                         "error": str(_aex)[:180]})
         if os.environ.get("KVMEM_EXEC_POST", "1") == "0":
             return result
         # Profiling/dummy runs are not real steps.

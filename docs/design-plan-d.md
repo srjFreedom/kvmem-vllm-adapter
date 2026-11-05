@@ -753,3 +753,10 @@ skip=不重放只装视图 - 顺路）。
   2. Core 触发链定位（d_truth 恒 0 的断点：(c)/(b) 候选循环或 collective_rpc 层）；
   3. 恢复 scheduler 页配额 guard（真窗口 + Xid 保险）；
   4. 88K/152K 在"真刀 + 活表"下落判。
+
+## 47. Round 34：D 机器真正活着的铁证 + 剩余病灶一句话
+
+- 断链史终局：round-29 seam 编辑吞了 `EngineCore.step = step` 一行——刀系统（Core 触发侧）静默停摆 5 轮，期间所有"零事件"皆源于此。修复后 88K **真刀 needle=True**（applied 含问题刀，answer 带 ZX-4417-QJ7 全串）。
+- 三件套生效：fork fuse（vl=0 行不覆盖 causal）、release 清零（跨请求毒化闭合）、advance 重建（decode 步 cache 缺失时从 scheduler_output 重算）——**kvmem_vl_mismatch 归零**（88K+152K 全程），**152K 统计账本首次写满 143135/36 步**（harvest 死亡彻底终结，advance 是真凶）。
+- 152K 仍 False，病灶收敛为一句话：**问题视图安装后会被后续 MID 视图覆盖**（终末锁只守 runtime/_c 一条路，refused×97 提示 Core 侧还有第二扇门）。下一刀：锁贯通 Core 谓词（plan_d 的 (c) 谓词已含 final_cut——查 refused 是否 MID 被拒后问题刀又被拒……读 refused 详情+applied epoch 序列）。
+- 性能现状：探针全开 163s/88K（R4 卸载后预期回到 ~80/140s）。

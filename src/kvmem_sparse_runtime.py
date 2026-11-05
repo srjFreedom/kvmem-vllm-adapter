@@ -429,6 +429,20 @@ class VllmSparseRuntime:
             self._finishing_reconstruction = False
         self._prev_n[req] = 0
         self._inflight[req] = 0
+        # lifecycle reset (design 47): give the published view_lens row
+        # back at release so the next occupant of this input-batch index
+        # starts dense-clean; the fork stale-row fuse then refuses to let
+        # any zero (unowned) row overwrite causals - cross-request
+        # poisoning by one dead knife's frozen table is closed at both
+        # ends: never inherited, never applied when stale.
+        try:
+            _rn = getattr(self.view, "runner", None)
+            _vl = getattr(_rn, "kvmem_view_lens", None) if _rn else None
+            _ri = int(getattr(_st0 := st, "row_index", -1) or -1)
+            if _vl is not None and _ri >= 0:
+                _vl.data[_ri] = 0
+        except Exception:
+            pass
         st.query_reselected = True
         self._reselect(req, probe=True, rebuild=True)
         if not st.rebuilt:
