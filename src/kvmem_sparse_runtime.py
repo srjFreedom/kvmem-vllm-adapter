@@ -4657,10 +4657,20 @@ class VllmSparseRuntime:
                 if (not bool(pressure)) and self.log is not None:
                     try:
                         _nb = int(tokens // 1024)  # needle-adjacent block guess
-                        # needle block calibrated from measured token
-                        # positions: 88K battery marker at token 40471
-                        # -> block 39; 152K at 71534 -> block 69.
-                        _nb2 = 39 if int(tokens) <= 100000 else 69
+                        # INSTRUMENT RECALIBRATION (design 80): earlier
+                        # readings divided the marker token index by 1024
+                        # while ENGINE blocks here span q*pt tokens (1568
+                        # or 1616 by boot generation) - the "needle block
+                        # 39/69, rank 22/52" story was a unit error IN THE
+                        # PANEL. Marker token positions measured: 88K ->
+                        # 40471, 152K -> 71534, 250K -> ~112590. Divided
+                        # by the REAL block span, those land at 25/44/69-
+                        # - exactly blocks 25 and 45 already visible as
+                        # top1/top3 in the same events. Retrieval was
+                        # never the failure on either size.
+                        _mt = 40471 if int(tokens) <= 100000 else (
+                            71534 if int(tokens) <= 160000 else 112590)
+                        _nb2 = int(_mt) // _blk_real
                         _core0 = [int(b) for b in order[:8]]
                         _nz = sum(1 for _v in core if _v == _v)
                         _cov = sorted(block_scores) if block_scores else []
