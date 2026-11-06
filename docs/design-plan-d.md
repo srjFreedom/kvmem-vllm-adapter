@@ -976,3 +976,11 @@ skip=不重放只装视图 - 顺路）。
 - **q24 污染实锤**：needle_rank 从 23→22 的"改善"另有真相 - KVMEM_QUERY_TAIL 同时被 **harvest 侧 capture 读取**（`_os.environ.get("KVMEM_QUERY_TAIL","0")` 出现在 fold 路径），24 行窗把统计块跨度（64 token）的 bucket fold 截成 26 桶 → **K 统计被切**，rank 漂移是污染副产物非信息增益。已从 env 移除该变量。**新泄漏点条律：env 名跨层复用，改一个层必须 grep 全仓所有读取方。**
 - 终版机制地图：①覆盖 OK（q=49 时）②rank~22 = 问句信息量天花板（clone 同文，信息论界）③答案 = 状态通道×数值蝴蝶（q24 场 False 率升高符合预期）④"spec4 缺陷"未定罪前还需在 q=49 代际复测（代际参数差异未排除）。⑤boot 代际差异（首请求 q=49 vs 后续 101?）本身待查：两值差在 engine block 1568/1616（GPU_UTIL 边界），属引擎非 D 面。
 - 电池读数（本 boot）：88K True×1（蝴蝶好面）。预算 2 boots 内，收束：恢复生产、提交判读。
+
+## 77. Round 57：spec4×D 终审平反 + env 跨层泄漏根除
+
+- 单位修复后 spec4×D 首发：场与 spec0 全等（rank23/score 1.9804），88K **x2 True**（95→86.2s）——**"spec4 系统性缺陷"终审平反**：0/4 全部是单位 bug 时代的产物。MTP×D 无专属病。三臂（spec0/spec4 × D）在同一场模型下行为一致，剩余差异纯数值蝴蝶。
+- env 泄漏根除：`KVMEM_QUERY_TAIL` 曾同时被 fold 路径（经 `index.query_tail`）与 final trim 读取 - 改 env 会串层。现 fold 读 runtime 一次性配置的 `query_tail` 属性，final 读 `_query_tail_rows` 属性，env 只在 runtime 初始化读一次。纪律固化：**跨层参数用属性传递，env 只在唯一入口读**。
+- q 代际漂移（49/32 vs 101/16）定性：pages_per_block 在 attach 时从 engine view 读死，engine block 因内存布局存在 1568/1616 两代 - 单 boot 内自洽、跨 boot 数值不同但公式已单位正确（round 53 的 len 24 腰斩 bug 与之无关，已修）。列为观察项。
+- 待办刷新：R3 resume 深度为电池后主战场；250K 未在新单位下复测；spec4×152K 复测一轮（新数据点）。
+- 预算：2 boots（battery+本次复测），停。

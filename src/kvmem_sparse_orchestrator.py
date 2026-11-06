@@ -519,8 +519,8 @@ class SparseOrchestrator:
             if _force_tail:
                 self._force_captured_tail = 0
                 frozen = True
-                limit0 = int(__import__("os").environ.get(
-                    "KVMEM_QUERY_TAIL", "0") or 0) or int(_force_tail)
+                limit0 = int(getattr(self, "_query_tail_rows", 0) or 0) \
+                    or int(_force_tail)
                 if True:  # uncapped while the wire is unproven
                     self._qt_logged = getattr(self, "_qt_logged", 0) + 1
                     try:
@@ -558,7 +558,7 @@ class SparseOrchestrator:
                 # (ninfer query_max_tokens) with the original's "query-last 64" fallback. A single
                 # huge user message otherwise dilutes the question with hundreds of repeated lines.
                 import os as _os
-                limit = int(_os.environ.get("KVMEM_QUERY_TAIL", "0") or 0)
+                limit = int(getattr(self, "_query_tail_rows", 0) or 0)
                 source = {int(k): (v[-limit:] if (limit > 0 and v.shape[0] > limit) else v, None)
                           for k, v in saved.items()}
             for layer, (q, _pos) in source.items():
