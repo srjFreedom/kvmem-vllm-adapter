@@ -969,3 +969,10 @@ skip=不重放只装视图 - 顺路）。
 - 判据终案（正式）：D 机制指标 = 场覆盖 92/92 + 刀 apply 序列 + causal 对齐（全绿）；电池答案 = 状态通道 × 数值蝴蝶（spec0 ~0.5、spec4 更低-MTP 独立缺陷）；问句场 rank 作为连续性指标跟踪。此判据与 v0.5.2 child 语义等价（当年 child 也不改变检索场，只是复制了全 prefill）。
 - spec4 电池持续 False（rank18-22 同场仍错）- MTP×压缩视图缺陷仍在案（post-exoneration 数据点：95.2s False），修点候选=drafter 的视图 seq_lens 使用（下一独立议题）。
 - 预算：4 boots 触顶，停。生产恢复 spec4/PLAN_D=0，KVMEM_QUERY_TAIL=24 保留（无害，仅 D 臂读取）。
+
+## 76. Round 55：房间账目平反、q24 污染实锤、机制地图终版
+
+- 全字段读数（88K q24 态）：`q=49 pt=32 cov=49/49 kept_n=12 room=6 rank=22 answer=True`。账目清算：budget_blocks=18-24 全预算，kept 12+room 6=18 **恰好覆盖全部引擎块 - room 从未不足，此前"cap4 救 room"的三层改动对象是一个幻影**（把页单位 q 错当 1024-token 块数推账）。cap4/相关继承改动保留但无疗效作用（final 场本就全覆盖）。
+- **q24 污染实锤**：needle_rank 从 23→22 的"改善"另有真相 - KVMEM_QUERY_TAIL 同时被 **harvest 侧 capture 读取**（`_os.environ.get("KVMEM_QUERY_TAIL","0")` 出现在 fold 路径），24 行窗把统计块跨度（64 token）的 bucket fold 截成 26 桶 → **K 统计被切**，rank 漂移是污染副产物非信息增益。已从 env 移除该变量。**新泄漏点条律：env 名跨层复用，改一个层必须 grep 全仓所有读取方。**
+- 终版机制地图：①覆盖 OK（q=49 时）②rank~22 = 问句信息量天花板（clone 同文，信息论界）③答案 = 状态通道×数值蝴蝶（q24 场 False 率升高符合预期）④"spec4 缺陷"未定罪前还需在 q=49 代际复测（代际参数差异未排除）。⑤boot 代际差异（首请求 q=49 vs 后续 101?）本身待查：两值差在 engine block 1568/1616（GPU_UTIL 边界），属引擎非 D 面。
+- 电池读数（本 boot）：88K True×1（蝴蝶好面）。预算 2 boots 内，收束：恢复生产、提交判读。
