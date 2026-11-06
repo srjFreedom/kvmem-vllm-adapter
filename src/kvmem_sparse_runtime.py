@@ -4642,7 +4642,10 @@ class VllmSparseRuntime:
                 if (not bool(pressure)) and self.log is not None:
                     try:
                         _nb = int(tokens // 1024)  # needle-adjacent block guess
-                        _nb2 = int(tokens * 0.5) // 1024 if int(tokens) > 100000 else 39
+                        # needle block calibrated from measured token
+                        # positions: 88K battery marker at token 40471
+                        # -> block 39; 152K at 71534 -> block 69.
+                        _nb2 = 39 if int(tokens) <= 100000 else 69
                         _core0 = [int(b) for b in order[:8]]
                         _nz = sum(1 for _v in core if _v == _v)
                         _cov = sorted(block_scores) if block_scores else []
