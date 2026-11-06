@@ -4620,8 +4620,23 @@ class VllmSparseRuntime:
                 # the "spec4 field collapse" that was in fact arm-neutral.
                 _sel_real = max(1, int(round(int(tokens) / max(1, len(core)))))
                 _blk_real = max(1, int(block_tokens))
+                # self-region exclusion WITH panel (design 79): the query
+                # rows sit in the prompt's FINAL blocks; those blocks' K is
+                # maximally similar BY CONSTRUCTION and must not consume
+                # selection slots (recency already keeps them in view).
+                # The panel reports the cut point, the exclusion count and
+                # each top block's token span, so the effect is verifiable
+                # rather than inferred.
+                _q_lo_b = max(0, (int(tokens) - 256) // _blk_real)
+                _excl_n = 0
                 for gi, v in enumerate(core):
                     b = (gi * _sel_real) // _blk_real
+                    # EXCLUSION RETIRED (design 79 verdict): the panel
+                    # proved needle_score == rank1_score at 88K (1.9622
+                    # vs 1.9637, a TIE at the top) - selection was never
+                    # the failure; the exclusion only cut the needle's
+                    # own tail-region blocks (48/49 at 88K) and must stay
+                    # off. Panel fields remain for observability.
                     try:
                         block_scores[b] = block_scores.get(b, 0.0) + float(v)
                     except (TypeError, ValueError):
@@ -4663,6 +4678,9 @@ class VllmSparseRuntime:
                                   "core_len": len(core),
                                   "n_blocks": n_blocks,
                                   "top8": _core0,
+                                  "qlo": int(_q_lo_b), "excl_n": int(_excl_n),
+                                  "top_spans": [f"{int(b) * _blk_real}-{(int(b) + 1) * _blk_real}"
+                                                for b in _core0[:4]],
                                   "kept_n": len(kept),
                                   "room": max(0, budget_blocks - len(kept)),
                                   "block_scores_len": len(block_scores),
